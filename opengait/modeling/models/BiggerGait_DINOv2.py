@@ -140,7 +140,7 @@ class BiggerGait__DINOv2(BaseModel):
             with torch.no_grad():
                 device = torch.distributed.get_rank()
                 inputs = ([[torch.randn((1,1,3,448,224),dtype=torch.float32).to(device), torch.rand(1,dtype=torch.float32).to(device)], None, None, None, None],)
-                flops = FlopCountAnalysis(self.to(device), inputs).total()  / 1e9   # GFLOPs 
+                # flops = FlopCountAnalysis(self.to(device), inputs).total()  / 1e9   # GFLOPs 
             self.train()
         
         self.Backbone.eval()
@@ -149,10 +149,10 @@ class BiggerGait__DINOv2(BaseModel):
         self.Mask_Branch.requires_grad_(False)
         
         n_parameters = sum(p.numel() for p in self.parameters())
-        if self.training:
-            self.msg_mgr.log_info('All Backbone Count: {:.5f}M, {:.2f} GFLOPs'.format(n_parameters / 1e6, flops))
-        else:
-            self.msg_mgr.log_info('All Backbone Count: {:.5f}M'.format(n_parameters / 1e6))
+        # if self.training:
+        #     self.msg_mgr.log_info('All Backbone Count: {:.5f}M, {:.2f} GFLOPs'.format(n_parameters / 1e6, flops))
+        # else:
+        #     self.msg_mgr.log_info('All Backbone Count: {:.5f}M'.format(n_parameters / 1e6))
             
         self.msg_mgr.log_info("=> init successfully")
 

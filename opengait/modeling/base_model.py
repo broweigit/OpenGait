@@ -143,6 +143,7 @@ class BaseModel(MetaModel, nn.Module):
                                   cfgs['model_cfg']['model'], self.engine_cfg['save_name'])
 
         self.build_network(cfgs['model_cfg'])
+        self.train(training)
         self.init_parameters()
         self.trainer_trfs = get_transform(cfgs['trainer_cfg']['transform'])
 
@@ -165,7 +166,7 @@ class BaseModel(MetaModel, nn.Module):
             self.loss_aggregator = LossAggregator(cfgs['loss_cfg'])
             self.optimizer = self.get_optimizer(self.cfgs['optimizer_cfg'])
             self.scheduler = self.get_scheduler(cfgs['scheduler_cfg'])
-        self.train(training)
+        # self.train(training)
         restore_hint = self.engine_cfg['restore_hint']
         if restore_hint != 0:
             self.resume_ckpt(restore_hint)

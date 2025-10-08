@@ -1,3 +1,12 @@
+import warnings
+warnings.filterwarnings('ignore', category=FutureWarning)
+
+# 忽略来自 torchvision.io 的特定 UserWarning
+warnings.filterwarnings(
+    "ignore", 
+    message="The video decoding and encoding capabilities of torchvision are deprecated", 
+    category=UserWarning
+)
 
 import os
 import argparse

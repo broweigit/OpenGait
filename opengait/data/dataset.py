@@ -5,6 +5,89 @@ import torch.utils.data as tordata
 import json
 from utils import get_msg_mgr
 
+import torch
+import torch.nn.functional as F
+
+def remove_black_border_batch(batch_imgs, threshold=10, target_h=256, target_w=128):
+    """
+    批量去除黑边，支持 B x C x H x W 的输入。
+    输入: batch_imgs - B x C x H x W 的 PyTorch Tensor，值范围[0,255]或[0,1]
+    输出: 去除黑边并调整大小到 target_h x target_w 的 Tensor - B x C x target_h x target_w
+    """
+    assert batch_imgs.dim() == 4, "Input must be a 4D tensor (B x C x H x W)"
+    B, C, H, W = batch_imgs.shape
+    batch_imgs = batch_imgs.float()
+
+    # 批量灰度化：对 RGB 取均值，得到 B x H x W
+    if C > 1:
+        gray = batch_imgs.mean(dim=1)  # B x H x W
+    else:
+        gray = batch_imgs.squeeze(1)  # B x H x W
+
+    # 批量生成掩码：判断非黑区域
+    mask = gray > threshold  # B x H x W
+
+    # 处理全黑图像：直接返回原始图像（或填充为目标尺寸）
+    result = torch.zeros(B, C, target_h, target_w, device=batch_imgs.device, dtype=batch_imgs.dtype)
+    for i in range(B):
+        if not mask[i].any():
+            result[i] = resize_with_padding(batch_imgs[i], target_h, target_w)
+            continue
+
+        # 批量边界检测
+        y_nonzero = torch.any(mask[i], dim=1)  # H
+        x_nonzero = torch.any(mask[i], dim=0)  # W
+
+        y_indices = torch.where(y_nonzero)[0]
+        x_indices = torch.where(x_nonzero)[0]
+
+        if y_indices.numel() == 0 or x_indices.numel() == 0:
+            result[i] = resize_with_padding(batch_imgs[i], target_h, target_w)
+            continue
+
+        y_min, y_max = y_indices[[0, -1]]
+        x_min, x_max = x_indices[[0, -1]]
+
+        # 裁剪单张图像
+        cropped = batch_imgs[i, :, y_min:y_max+1, x_min:x_max+1]
+        result[i] = resize_with_padding(cropped, target_h, target_w)
+
+    return result
+
+def resize_with_padding(img, target_h, target_w):
+    """
+    等比例缩放 + padding，支持单张或批量图像。
+    输入: img - C x H x W 或 B x C x H x W
+    输出: C x target_h x target_w 或 B x C x target_h x target_w
+    """
+    is_batch = img.dim() == 4
+    if not is_batch:
+        img = img.unsqueeze(0)  # 转换为 B x C x H x W
+
+    B, C, H, W = img.shape
+    scale = torch.min(torch.tensor([target_h / H, target_w / W], device=img.device))
+    new_h, new_w = (H * scale).long(), (W * scale).long()
+
+    # 批量缩放
+    img_resized = F.interpolate(img, size=(new_h, new_w), mode='bilinear', align_corners=False)
+
+    # 计算 padding
+    pad_h = target_h - new_h
+    pad_w = target_w - new_w
+    pad_top = pad_h // 2
+    pad_bottom = pad_h - pad_top
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left
+
+    # 批量 padding
+    img_padded = F.pad(img_resized, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0)
+
+    return img_padded.squeeze(0) if not is_batch else img_padded
+
+# 替换原来的 batch_remove_black_border
+def batch_remove_black_border(batch_imgs, threshold=10, target_h=256, target_w=128):
+    return remove_black_border_batch(batch_imgs, threshold, target_h, target_w)
+
 
 class DataSet(tordata.Dataset):
     def __init__(self, data_cfg, training):
@@ -12,6 +95,8 @@ class DataSet(tordata.Dataset):
             seqs_info: the list with each element indicating 
                             a certain gait sequence presented as [label, type, view, paths];
         """
+        self.training = training
+        self.video_sample_ratio = data_cfg['video_sample_ratio'] if 'video_sample_ratio' in data_cfg.keys() else None
         self.__dataset_parser(data_cfg, training)
         self.cache = data_cfg['cache']
         self.label_list = [seq_info[0] for seq_info in self.seqs_info]
@@ -32,6 +117,8 @@ class DataSet(tordata.Dataset):
         return len(self.seqs_info)
 
     def __loader__(self, paths):
+        from torchvision.io import read_video
+        import random
         paths = sorted(paths)
         data_list = []
         for pth in paths:
@@ -39,6 +126,17 @@ class DataSet(tordata.Dataset):
                 with open(pth, 'rb') as f:
                     _ = pickle.load(f)
                 f.close()
+            elif pth.endswith('.avi'):
+                video, _, _ = read_video(pth, output_format="TCHW", pts_unit='sec')
+
+                if self.training:
+                    random_idx = sorted(random.sample(range(video.size(0)), min(40, video.size(0))), key=int)
+                    video = video[random_idx, :, :, :]
+
+                # ratios = torch.full((video.size(0),), video.size(-1) / video.size(-2), device=video.device)
+                _ = batch_remove_black_border(video)
+                # _ = ratio_resize(_, ratios, 256, 128) # ratio-resize
+                _ = _.numpy()
             else:
                 raise ValueError('- Loader - just support .pkl !!!')
             data_list.append(_)

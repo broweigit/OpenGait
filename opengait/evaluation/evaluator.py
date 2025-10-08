@@ -415,6 +415,100 @@ def evaluate_CCPG(data, dataset, metric='euc'):
         msg_mgr.log_info('BG: {}'.format(de_diag(acc[3, :, :, i], True)))
     return result_dict
 
+import pandas as pd
+def evaluate_simple_split(data, dataset, metric='euc'):
+    """
+    一个简单的评估器，忽略序列类型和视角，仅根据人员ID进行评估。
+    对于每一个ID，将其所有样本数据随机均分为两半，分别作为 Probe 和 Gallery。
+
+    Args:
+        data (dict): 包含 'embeddings', 'labels' 等信息的字典。
+        dataset (str): 数据集名称 (此函数中未使用，为保持接口一致性)。
+        metric (str, optional): 使用的距离度量。默认为 'euc' (欧氏距离)。
+
+    Returns:
+        dict: 包含 Rank-1, Rank-5, Rank-10, mAP, mINP 的评估结果字典。
+    """
+    msg_mgr = get_msg_mgr()
+    msg_mgr.log_info("--- Starting Evaluation with Simple 50/50 Split per ID ---")
+
+    # 1. 从输入数据中提取特征和标签(人员ID)
+    features = data['embeddings']
+    pids = np.array(data['labels'])
+    
+    # 2. 使用 Pandas DataFrame 方便地按ID分组和采样
+    # 创建一个包含人员ID和其在原始特征数组中索引的DataFrame
+    df = pd.DataFrame({
+        'pid': pids,
+        'original_index': np.arange(len(pids))
+    })
+
+    probe_indices = []
+    gallery_indices = []
+
+    # 3. 对每个ID进行数据划分
+    # a. 按 'pid' 分组
+    for pid, group in df.groupby('pid'):
+        # b. 获取该ID下所有样本的原始索引
+        pid_indices = group['original_index'].values
+        
+        # c. 如果样本数少于2，则无法划分，全部放入gallery以保证gallery不为空
+        if len(pid_indices) < 2:
+            gallery_indices.extend(pid_indices)
+            continue
+            
+        # d. 随机打乱索引
+        np.random.shuffle(pid_indices)
+        
+        # e. 找到分割点，进行均分
+        split_point = len(pid_indices) // 2
+        
+        # f. 前一半作为 gallery，后一半作为 probe
+        gallery_indices.extend(pid_indices[:split_point])
+        probe_indices.extend(pid_indices[split_point:])
+
+    msg_mgr.log_info(f"Total samples processed: {len(pids)}")
+    msg_mgr.log_info(f"Gallery set size: {len(gallery_indices)}")
+    msg_mgr.log_info(f"Probe set size: {len(probe_indices)}")
+
+    if not probe_indices or not gallery_indices:
+        msg_mgr.log_error("Probe or Gallery set is empty. Evaluation cannot proceed.")
+        return {}
+        
+    # 4. 根据划分好的索引，构建 Probe 和 Gallery 集
+    probe_x = features[probe_indices]
+    probe_y = pids[probe_indices]
+    
+    gallery_x = features[gallery_indices]
+    gallery_y = pids[gallery_indices]
+
+    # 5. 计算距离矩阵 (复用您已有的函数)
+    # 注意：cuda_dist 返回的是GPU张量，需要转到CPU并变为numpy数组
+    dist = cuda_dist(probe_x, gallery_x, metric).cpu().numpy()
+
+    # 6. 计算评估指标 (复用您已有的函数)
+    cmc, all_AP, all_INP = evaluate_rank(dist, probe_y, gallery_y)
+
+    # 7. 整理并打印结果
+    mAP = np.mean(all_AP)
+    mINP = np.mean(all_INP)
+    
+    results = {}
+    msg_mgr.log_info("--- Simple Split Evaluation Results ---")
+    for r in [1, 5, 10]:
+        rank_acc = cmc[r - 1] * 100
+        results[f'scalar/test_accuracy/Rank-{r}'] = rank_acc
+        msg_mgr.log_info(f"Rank-{r:<2}: {rank_acc:.2f}%")
+        
+    results['scalar/test_accuracy/mAP'] = mAP * 100
+    results['scalar/test_accuracy/mINP'] = mINP * 100
+    
+    msg_mgr.log_info(f"mAP  : {mAP * 100:.2f}%")
+    msg_mgr.log_info(f"mINP : {mINP * 100:.2f}%")
+    msg_mgr.log_info("-" * 40)
+    
+    return results
+
 def evaluate_scoliosis(data, dataset, metric='euc'):
 
     msg_mgr = get_msg_mgr()
