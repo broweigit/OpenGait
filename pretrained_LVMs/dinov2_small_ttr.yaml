@@ -1,0 +1,6 @@
+backbone_size: vits14
+device: cuda
+detect_outliers_layer: -2
+register_norm_threshold: 5
+highest_layer: 7
+top_k: 50
