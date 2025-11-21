@@ -1,0 +1,39 @@
+# # **************** For CASIA-B ****************
+# # Baseline
+# CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.launch --nproc_per_node=2 opengait/main.py --cfgs ./configs/baseline/baseline.yaml --phase train
+
+# # GaitSet
+# CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.launch --nproc_per_node=2 opengait/main.py --cfgs ./configs/gaitset/gaitset.yaml --phase train
+
+# # GaitPart
+# CUDA_VISIBLE_DEVICES=0,1 python -m torch.distributed.launch --nproc_per_node=2 opengait/main.py --cfgs ./configs/gaitpart/gaitpart.yaml --phase train
+
+# GaitGL
+# CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.launch --nproc_per_node=4 opengait/main.py --cfgs ./configs/gaitgl/gaitgl.yaml --phase train
+
+# # GLN 
+# # Phase 1
+# CUDA_VISIBLE_DEVICES=2,5,6,7 python -m torch.distributed.launch --nproc_per_node=4 opengait/main.py --cfgs ./configs/gln/gln_phase1.yaml --phase train
+# # Phase 2
+# CUDA_VISIBLE_DEVICES=2,5,6,7 python -m torch.distributed.launch --nproc_per_node=4 opengait/main.py --cfgs ./configs/gln/gln_phase2.yaml --phase train
+
+
+# # **************** For OUMVLP ****************
+# # Baseline
+# CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m torch.distributed.launch --nproc_per_node=8 opengait/main.py --cfgs ./configs/baseline/baseline_OUMVLP.yaml --phase train
+
+# # GaitSet
+# CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m torch.distributed.launch --nproc_per_node=8 opengait/main.py --cfgs ./configs/gaitset/gaitset_OUMVLP.yaml --phase train
+
+# # GaitPart
+# CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m torch.distributed.launch --nproc_per_node=8 opengait/main.py --cfgs ./configs/gaitpart/gaitpart_OUMVLP.yaml --phase train
+
+# GaitGL
+# CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python -m torch.distributed.launch --nproc_per_node=8 opengait/main.py --cfgs ./configs/gaitgl/gaitgl_OUMVLP.yaml --phase train
+
+export NCCL_P2P_DISABLE=1
+
+# screen -dmS gait_training_ivan bash -c "CUDA_VISIBLE_DEVICES=1,2,3,4 python -m torch.distributed.launch --nproc_per_node=4 --master_port 29900 opengait/main.py --cfgs configs/deepgaitv2/DeepGaitV2_ccgr.yaml --phase train --log_to_file"
+screen -dmS gait_training_origin bash -c "CUDA_VISIBLE_DEVICES=1,2,3,4 python -u -m torch.distributed.launch --nproc_per_node=4 --master_port 29900 opengait/main.py --cfgs configs/biggergait/biggergait__DINOv2_Group_CCPG.yaml --phase train --log_to_file 2>&1 | tee training_console_log_2.log"
+
+screen -r gait_training_origin

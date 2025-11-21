@@ -33,4 +33,6 @@
 
 export NCCL_P2P_DISABLE=1
 
-CUDA_VISIBLE_DEVICES=1,2,3,4 python -m torch.distributed.launch --nproc_per_node=4 --master_port 29700 opengait/main.py --cfgs configs/biggergait/biggergait__DINOv2_Group_CCPG_Simple.yaml --phase train --log_to_file
+screen -dmS gait_training bash -c "CUDA_VISIBLE_DEVICES=1,2,3,4 python -m torch.distributed.launch --nproc_per_node=4 --master_port 29700 opengait/main.py --cfgs configs/biggergait/biggergait__DINOv2_ttreg_Group_CCPG.yaml --phase train --log_to_file 2>&1 | tee training_console_log.log"
+
+screen -r gait_training

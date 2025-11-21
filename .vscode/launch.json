@@ -16,7 +16,7 @@
                 "--nproc_per_node=1",
                 "--master_port=29600",
                 "opengait/main.py", // 您的主脚本现在是 torchrun 的一个参数
-                "--cfgs", "configs/biggait/BigGait_Simple_CCGR.yaml",
+                "--cfgs", "configs/biggergait/biggergait__DINOv2_Reg_Extra_Group_CCPG.yaml",
                 "--phase", "train",
                 "--log_to_file"
             ],

@@ -145,3 +145,11 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+
+# debug
+debug*
+logs/*
+*.dis
+
+# output
+output/*

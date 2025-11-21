@@ -1,5 +1,5 @@
 data_cfg:
-  dataset_name: CCGR
+  dataset_name: CCPG
   # TODO
   dataset_root: /data/CCPG/Released/CCPG-ratio-pkl # use datasets/pretreatment_rgb.py for data preprocessing!
   dataset_partition: ./datasets/CCPG/CCPG.json
@@ -12,7 +12,7 @@ evaluator_cfg:
   enable_float16: true
   restore_ckpt_strict: False # Rename some module name for clarity, so it is fasle.
   restore_hint: 30000 # BiggerGait__SmallDINOv2_Gaitbase_84Frame30_448224_6432HPP32_NoAlign_Sep12B_WiMask_2B_6G-30000.pt in HuggingFace
-  save_name: BiggerGait__Dinov2_Group_CCPG2CCGR
+  save_name: BiggerGait__Dinov2_Group_CCGR2CCPG
   eval_func: evaluate_CCPG
   sampler:
     batch_shuffle: false
@@ -101,7 +101,7 @@ trainer_cfg:
   find_unused_parameters: True
   enable_float16: true # half_percesion float for memory reduction and speedup
   fix_BN: false
-  log_iter: 100
+  log_iter: 50
   with_test: true
   restore_ckpt_strict: true
   restore_hint: 0

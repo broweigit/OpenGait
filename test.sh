@@ -33,4 +33,4 @@
 
 export NCCL_P2P_DISABLE=1
 
-CUDA_VISIBLE_DEVICES=1,2,3,4 python -m torch.distributed.launch --nproc_per_node=4 --master_port 29600 opengait/main.py --cfgs configs/biggergait/biggergait__DINOv2_Group_CCGR.yaml --phase test --log_to_file
+CUDA_VISIBLE_DEVICES=1,2,3,4 python -m torch.distributed.launch --nproc_per_node=4 --master_port 29600 opengait/main.py --cfgs configs/deepgaitv2/DeepGaitV2_ccgr.yaml --phase test --log_to_file

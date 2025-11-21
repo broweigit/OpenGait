@@ -12,11 +12,11 @@ evaluator_cfg:
   enable_float16: true
   restore_ckpt_strict: False # Rename some module name for clarity, so it is fasle.
   restore_hint: 30000 # BiggerGait__SmallDINOv2_Gaitbase_84Frame30_448224_6432HPP32_NoAlign_Sep12B_WiMask_2B_6G-30000.pt in HuggingFace
-  save_name: BiggerGait__Dinov2_Group
+  save_name: BiggerGait__Dinov2_large
   eval_func: evaluate_CCPG
   sampler:
     batch_shuffle: false
-    batch_size: 5 # GPUs number
+    batch_size: 4 # GPUs number
     sample_type: all_ordered # all indicates whole sequence used to test, while ordered means input sequence by its natural order; Other options:   fixed_unordered
     frames_all_limit: 250 # limit the number of sampled frames to prevent out of memory
   metric: euc # cos
@@ -37,6 +37,8 @@ loss_cfg:
 model_cfg:
   model: BiggerGait__DINOv2
   pretrained_lvm: ./pretrained_LVMs/dinov2-small                   # DINOv2-S HuggingFace Link: "git clone https://huggingface.co/facebook/dinov2-small" + "git lfs pull"
+  # pretrained_lvm: ./pretrained_LVMs/dinov2-with-registers-small
+  # pretrained_lvm: ./pretrained_LVMs/dinov2-large
   pretrained_mask_branch: ./pretrained_LVMs/MaskBranch_vits14.pt                # Using BigGait Code for pretraining at first, it is very lightly. pretrained_mask_branch: None or MaskBranch Download Link: https://drive.google.com/drive/folders/1zrWPUsrbCpwxoLgfom3d2irgxkBqtXqc?usp=sharing
   image_size: 224                                                               # 448x224
   sils_size: 32                                                                 # 64x32
@@ -112,8 +114,8 @@ trainer_cfg:
   sampler:
     batch_shuffle: true
     batch_size:
-      - 10 # TripletSampler, batch_size[0] indicates Number of Identity
-      - 5 #                 batch_size[1] indicates Samples sequqnce for each Identity
+      - 8 # TripletSampler, batch_size[0] indicates Number of Identity
+      - 4 #                 batch_size[1] indicates Samples sequqnce for each Identity
     frames_num_fixed: 30 # fixed frames number for training
     frames_skip_num: 4
     frames_num_max: 40 # max frames number for unfixed training
