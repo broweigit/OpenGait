@@ -38,9 +38,9 @@ model_cfg:
   num_registers: 1
   ttr_scale: 1.0
   ttr_normal_values: zero
-  register_neurons_path: ./pretrained_LVMs/register_neurons.pt
+  register_neurons_path: ./pretrained_LVMs/register_neurons_small.pt
   ttr_config_path: ./pretrained_LVMs/dinov2_small_ttr.yaml
-  model: BiggerGait__DINOv2_ttreg
+  model: BiggerGait__DINOv2_ttreg_Group
   pretrained_lvm: ./pretrained_LVMs/dinov2-small                   # DINOv2-S HuggingFace Link: "git clone https://huggingface.co/facebook/dinov2-small" + "git lfs pull"
   # pretrained_lvm: ./pretrained_LVMs/dinov2-with-registers-small
   # pretrained_lvm: ./pretrained_LVMs/dinov2-large
