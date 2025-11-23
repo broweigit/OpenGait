@@ -98,6 +98,7 @@ class BiggerGait__DINOv2_ttreg(BaseModel):
         self.num_FPN = self.total_layer_num // self.group_layer_num
 
         self.gradient_checkpointing = model_cfg.get("gradient_checkpointing", False)
+        self.chunk_size = model_cfg.get("chunk_size", 96)
 
         self.Gait_Net = Baseline_Share(model_cfg)
 
@@ -367,7 +368,7 @@ class BiggerGait__DINOv2_ttreg(BaseModel):
         # DINOv2-Small 原版是 96。
         # DINOv2-Large 参数量是 Small 的 4 倍以上，建议改成 8 或者 4。
         # 如果还是 OOM，就改成 1 (即作者说的“一帧一帧输入”)。
-        CHUNK_SIZE = 4 
+        CHUNK_SIZE = self.chunk_size 
         
         # 逻辑：将总帧数切分成更小的块
         rgb_chunks = torch.chunk(rgb, (rgb.size(1) // CHUNK_SIZE) + 1, dim=1)

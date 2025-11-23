@@ -35,6 +35,7 @@ loss_cfg:
     log_accuracy: true
 
 model_cfg:
+  chunk_size: 48
   gradient_checkpointing: true
   num_registers: 1
   ttr_scale: 1.0
