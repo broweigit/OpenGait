@@ -57,6 +57,10 @@ class BaseSilCuttingTransform():
             x = x[..., cutting:-cutting]
         return x / self.divsor
 
+class RatioHW():
+    def __call__(self, x):
+        x = x[:,1] * 1.0 / x[:,0]
+        return x
 
 class BaseRgbTransform():
     def __init__(self, mean=None, std=None):

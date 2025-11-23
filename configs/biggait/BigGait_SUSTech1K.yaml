@@ -22,9 +22,9 @@ data_cfg:
 
   # # dataset_name: CCPG
   # dataset_root: /4GPU/data/SUSTech1K-Released-pkl/
-  dataset_root: /lab/yusq_lab/dataset/gait/sustech1k/SUSTech1K-Released-pkl
+  dataset_root: /lab/yusq_lab/dataset/gait/sustech1k/
   dataset_partition: datasets/SUSTech1K/SUSTech1K.json
-  data_in_use: [False, False, False, False, False, True, False, False,     False, False, False, False, False, False, False, False] 
+  data_in_use: [False, False, False, False, True, True, False, False,     False, False, False, False, False, False, False, False] 
   num_workers: 8
   remove_no_gallery: false # Remove probe if no gallery for it
   test_dataset_name: SUSTech1K
@@ -63,13 +63,14 @@ evaluator_cfg:
   # # # CASIA-B /4GPU/data4/casiab-128-end2end/
   #   # - type: BaseSilCuttingTransform
   #   - type: NoOperation
-    - type: BaseRgbTransform
-      cutting: 0
+
+    # - type: BaseRgbTransform
+    #   cutting: 0
 
   # # SUSTech1K /4GPU/data/SUSTech1K-Released-pkl/
-  #   - type: RatioHW
-  #   - type: BaseRgbTransform
-  #     cutting: 0
+    - type: RatioHW
+    - type: BaseRgbTransform
+      cutting: 0
 
   # # CCPG /4GPU/data/CCPG/Released/CCPG-Multi-pkl/
   #   - type: BaseParsingCuttingTransform
@@ -200,6 +201,7 @@ trainer_cfg:
     sample_type: fixed_unordered # fixed control input frames number, unordered for controlling order of input tensor; Other options: unfixed_ordered or all_ordered
     type: TripletSampler
   transform:
+    - type: RatioHW
     - type: Compose
       trf_cfg:
         - type: RandomHorizontalFlip
