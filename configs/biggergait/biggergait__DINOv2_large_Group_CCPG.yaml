@@ -35,6 +35,7 @@ loss_cfg:
     log_accuracy: true
 
 model_cfg:
+  gradient_checkpointing: true
   model: BiggerGait__DINOv2
   pretrained_lvm: ./pretrained_LVMs/dinov2-large                  # DINOv2-S HuggingFace Link: "git clone https://huggingface.co/facebook/dinov2-small" + "git lfs pull"
   # pretrained_lvm: ./pretrained_LVMs/dinov2-with-registers-small

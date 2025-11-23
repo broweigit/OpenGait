@@ -75,6 +75,8 @@ class BiggerGait__DINOv2(BaseModel):
         assert (self.total_layer_num // self.group_layer_num) % self.head_num == 0
         self.num_FPN = self.total_layer_num // self.group_layer_num
 
+        self.gradient_checkpointing = model_cfg.get("gradient_checkpointing", False)
+
         self.Gait_Net = Baseline_Share(model_cfg)
 
         self.HumanSpace_Conv = nn.ModuleList([ 
@@ -99,6 +101,12 @@ class BiggerGait__DINOv2(BaseModel):
             self.pretrained_lvm, 
             config=config,
         )
+        # ================== 修改点：开启 Gradient Checkpointing ==================
+        if self.training and self.gradient_checkpointing:
+            # 这一行是关键，它牺牲一点计算时间换取大量显存
+            self.Backbone.gradient_checkpointing_enable()
+            self.msg_mgr.log_info("Gradient Checkpointing Enabled for DINOv2!")
+        # ======================================================================
         self.Backbone.cpu()
         self.msg_mgr.log_info(f'load model from: {self.pretrained_lvm}')
 
@@ -172,7 +180,15 @@ class BiggerGait__DINOv2(BaseModel):
         del ipts
 
         # adjust gpu
-        rgb_chunks = torch.chunk(rgb, (rgb.size(1)//96)+1, dim=1)
+        # ================== 修改点：调整 Chunk Size ==================
+        # DINOv2-Small 原版是 96。
+        # DINOv2-Large 参数量是 Small 的 4 倍以上，建议改成 8 或者 4。
+        # 如果还是 OOM，就改成 1 (即作者说的“一帧一帧输入”)。
+        CHUNK_SIZE = 4 
+        
+        # 逻辑：将总帧数切分成更小的块
+        rgb_chunks = torch.chunk(rgb, (rgb.size(1) // CHUNK_SIZE) + 1, dim=1)
+        # ==========================================================
         all_outs = []
         for _, rgb_img in enumerate(rgb_chunks):
             with torch.no_grad():
