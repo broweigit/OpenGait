@@ -211,12 +211,16 @@ class BigGait__Dinov2_Gaitbase(BaseModel):
                 self.Mask_Branch.requires_grad_(False)
 
         ipts, labs, ty, vi, seqL = inputs
-        sils = ipts[0]                      # input_images;         shape: [n,s,c,h,w];
-        ratios = ipts[1]                    # real_image_ratios     shape: [n,s,ratio];     ratio: w/h,  e.g. 112/224=0.5;
+        # sils = ipts[0]                      # input_images;         shape: [n,s,c,h,w];
+        # ratios = ipts[1]                    # real_image_ratios     shape: [n,s,ratio];     ratio: w/h,  e.g. 112/224=0.5;
+        # sils, ratios = ipts[0], ipts[1] # CCPG
+        # sils, ratios = ipts[1], ipts[0] # CASIA-B, SUSTech1K
+        sils = ipts[0] # CCGR
         del ipts
 
         with torch.no_grad():
             n,s,c,h,w = sils.size()
+            ratios = torch.ones((n*s)).to(sils.device) / 2.0
             sils = rearrange(sils, 'n s c h w -> (n s) c h w').contiguous()
             if h == 2*w:
                 outs = self.preprocess(sils, self.image_size)                                           # [ns,c,448,224]    if have used pad_resize for input images
