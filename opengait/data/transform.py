@@ -63,16 +63,30 @@ class RatioHW():
         return x
 
 class BaseRgbTransform():
-    def __init__(self, mean=None, std=None):
+    def __init__(self, mean=None, std=None, cutting=None):
         if mean is None:
             mean = [0.485*255, 0.456*255, 0.406*255]
         if std is None:
             std = [0.229*255, 0.224*255, 0.225*255]
         self.mean = np.array(mean).reshape((1, 3, 1, 1))
         self.std = np.array(std).reshape((1, 3, 1, 1))
+        self.cutting = cutting
 
     def __call__(self, x):
-        return (x - self.mean) / self.std
+        if x.shape[1] != 3:  # If input has no 3 channels, repeat across channels
+            if len(x.shape)==3:
+                x = x[:, None, ...]
+                x = np.repeat(x, repeats=3, axis=1)
+            else:
+                x = x.transpose(0,3,1,2)
+        if self.cutting is not None:
+            cutting = self.cutting
+            if cutting != 0:
+                x = x[..., cutting:-cutting]
+        elif x.shape[-1] == x.shape[-2]:
+            cutting = x.shape[-1] // 4
+            x = x[..., cutting:-cutting]
+        return (x - self.mean) / self.std  # Use subtraction here
 
 
 # **************** Data Agumentation ****************
