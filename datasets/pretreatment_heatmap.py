@@ -611,7 +611,7 @@ class TransferDataset(Dataset):
         pose_root = args.pose_data_path
         sigma = generate_heatemap_cfgs['heatmap_generator_args']['sigma']
         self.dataset_name = args.dataset_name
-        assert self.dataset_name.lower() in ["sustech1k", "grew", "ccpg", "oumvlp", "ou-mvlp", "gait3d", "casiab", "casiae"], f"Invalid dataset name: {self.dataset_name}"
+        assert self.dataset_name.lower() in ["sustech1k", "grew", "ccpg", "oumvlp", "ou-mvlp", "gait3d", "casiab", "casiae", "ccgr"], f"Invalid dataset name: {self.dataset_name}"
         self.save_root = os.path.join(args.save_root, f"{self.dataset_name}_sigma_{sigma}_{args.ext_name}")
         os.makedirs(self.save_root, exist_ok=True)
 
@@ -619,6 +619,9 @@ class TransferDataset(Dataset):
 
         if self.dataset_name.lower() == "sustech1k":
             self.all_ps_data_paths = sorted(glob(os.path.join(pose_root, "*/*/*/03*.pkl")))
+        elif self.dataset_name.lower() == "ccgr":
+            # 1/AS1/180_1.avi/1-AS1-180_1.avi-pose.pkl
+            self.all_ps_data_paths = sorted(glob(os.path.join(pose_root, "*/*/*/*-pose.pkl")))
         else:
             self.all_ps_data_paths = sorted(glob(os.path.join(pose_root, "*/*/*/*.pkl")))
 
@@ -629,6 +632,20 @@ class TransferDataset(Dataset):
         pose_path = self.all_ps_data_paths[index]
         with open(pose_path, "rb") as f:
             pose_data = pickle.load(f)
+            # ====== 修改开始：针对 CCGR (56列) 的特殊处理 ======
+            if self.dataset_name.lower() == "ccgr":
+                # 如果是 (T, 56) 的数据
+                if len(pose_data.shape) == 2 and pose_data.shape[1] == 56:
+                    # 1. 去掉前 5 列 (BBox + Instance Score)
+                    #    保留后 51 列 (Keypoints)
+                    pose_data = pose_data[:, 5:] 
+                    
+                    # 2. 获取帧数 T
+                    T = pose_data.shape[0]
+                    
+                    # 3. Reshape 为 (T, 17, 3)
+                    pose_data = pose_data.reshape(T, 17, 3)
+            # ====== 修改结束 ======
             if self.dataset_name.lower() == "grew":
                 # print(pose_data.shape)
                 pose_data = pose_data[:,2:].reshape(-1, 17, 3)
@@ -664,7 +681,7 @@ def get_args():
     parser.add_argument('--ext_name', type=str, default='', help="Extension name to be appended to the 'save_root' for identification.")
     parser.add_argument('--dataset_name', type=str, required=True, help="Name of the dataset being preprocessed.")
     parser.add_argument('--heatemap_cfg_path', type=str, default='configs/skeletongait/pretreatment_heatmap.yaml', help="Path to the heatmap generator configuration file.")
-    parser.add_argument("--local_rank", type=int, default=0, help="Local rank for distributed processing, defaults to 0 for non-distributed setups.")
+    parser.add_argument("--local-rank", type=int, default=0, help="Local rank for distributed processing, defaults to 0 for non-distributed setups.")
     opt = parser.parse_args()
     return opt
 
