@@ -90,7 +90,8 @@ model_cfg:
     out_channels: 256
     parts_num: 32
   SeparateBNNecks:
-    class_num: 100
+    # class_num: 100
+    class_num: 571
     in_channels: 256
     parts_num: 32
   bin_num:
