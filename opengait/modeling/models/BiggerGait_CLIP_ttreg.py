@@ -84,6 +84,7 @@ class BiggerGait__CLIP_ttreg(BaseModel):
         self.num_unknown = model_cfg["num_unknown"]
         self.num_FPN = model_cfg["num_FPN"]
         self.gradient_checkpointing = model_cfg.get("gradient_checkpointing", False)
+        self.chunk_size = model_cfg.get("chunk_size", 16)
 
         # 使用支持 temb 的 ShareTime_2B
         self.Gait_Net = Baseline_ShareTime_2B(model_cfg)
@@ -273,7 +274,10 @@ class BiggerGait__CLIP_ttreg(BaseModel):
         rgb = ipts[0]
         del ipts
 
-        rgb_chunks = torch.chunk(rgb, (rgb.size(1)//10)+1, dim=1)
+        CHUNK_SIZE = self.chunk_size 
+        
+        # 逻辑：将总帧数切分成更小的块
+        rgb_chunks = torch.chunk(rgb, (rgb.size(1) // CHUNK_SIZE) + 1, dim=1)
         all_outs = []
         
         for _, rgb_img in enumerate(rgb_chunks):
