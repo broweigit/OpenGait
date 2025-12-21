@@ -47,11 +47,11 @@ model_cfg:
   
   # TTR Params
   ttr_config_path: ./pretrained_LVMs/clip_vit_large_ttr.yaml 
-  register_neurons_path: ./pretrained_LVMs/clip_register_neurons.pt
+  register_neurons_path: ./pretrained_LVMs/register_neurons_clip_large.pt
   num_registers: 5
   ttr_scale: 1.0
   ttr_normal_values: zero
-  gradient_checkpointing: true
+  gradient_checkpointing: false
 
   Mask_Branch:
     source_dim: 1024

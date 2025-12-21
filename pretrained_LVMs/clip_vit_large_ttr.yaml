@@ -1,0 +1,7 @@
+model_name: ViT-L-14          # 改为 Large, Patch 14
+pretrained: openai            # 对应的官方权重
+device: cuda:0
+highest_layer: 11
+detect_outliers_layer: -1
+register_norm_threshold: 90  # 注意：Large 模型的激活值范数可能不同，这个阈值可能需要微调
+top_k: 60   # 10?
