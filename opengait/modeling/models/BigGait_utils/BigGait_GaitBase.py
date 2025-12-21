@@ -48,21 +48,167 @@ class AttentionFusion(nn.Module):
             retun += feat_list[i]*score[:,:,i]
         return retun
 
+from typing import Optional, Callable
+class BasicBlock_Time(nn.Module):
+    expansion: int = 1
+
+    def __init__(
+        self,
+        inplanes: int,
+        planes: int,
+        stride: int = 1,
+        downsample: Optional[nn.Module] = None,
+        groups: int = 1,
+        base_width: int = 64,
+        dilation: int = 1,
+        norm_layer: Optional[Callable[..., nn.Module]] = None,
+    ) -> None:
+        super().__init__()
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+        if groups != 1 or base_width != 64:
+            raise ValueError("BasicBlock only supports groups=1 and base_width=64")
+        if dilation > 1:
+            raise NotImplementedError("Dilation > 1 not supported in BasicBlock")
+        # Both self.conv1 and self.downsample layers downsample the input when stride != 1
+        self.conv1 = conv3x3(inplanes, planes, stride)
+        self.bn1 = norm_layer(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = conv3x3(planes, planes)
+        self.bn2 = norm_layer(planes)
+        self.downsample = downsample
+        self.stride = stride
+        self.temb_proj = nn.Sequential(
+            nn.ReLU(),
+            nn.Linear(256,planes),
+        )
+
+    def forward(self, x, temb, use_Time=True):
+        identity = x
+
+        out = self.conv1(x)
+
+        if temb is not None and use_Time:
+            out = out + self.temb_proj(temb)[:,:,None,None]
+
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+
+        return out
 
 from torchvision.models.resnet import BasicBlock, Bottleneck, ResNet
 from ...modules import BasicConv2d
 block_map = {'BasicBlock': BasicBlock,
-             'Bottleneck': Bottleneck}
+             'Bottleneck': Bottleneck,
+             'BasicBlock_Time': BasicBlock_Time,}
+
+# class Pre_ResNet9(ResNet):
+#     def __init__(self, type, block, channels=[32, 64, 128, 256], in_channel=1, layers=[1, 2, 2, 1], strides=[1, 2, 2, 1], maxpool=True):
+#         if block in block_map.keys():
+#             block = block_map[block]
+#         else:
+#             raise ValueError(
+#                 "Error type for -block-Cfg-, supported: 'BasicBlock' or 'Bottleneck'.")
+#         self.maxpool_flag = maxpool
+#         super(Pre_ResNet9, self).__init__(block, layers)
+
+#         # Not used #
+#         self.fc = None
+#         self.layer2 = None
+#         self.layer3 = None
+#         self.layer4 = None
+#         ############
+#         self.inplanes = channels[0]
+#         self.bn1 = nn.BatchNorm2d(self.inplanes)
+
+#         self.conv1 = BasicConv2d(in_channel, self.inplanes, 3, 1, 1)
+
+#         self.layer1 = self._make_layer(
+#             block, channels[0], layers[0], stride=strides[0], dilate=False)
+
+#     def _make_layer(self, block, planes, blocks, stride=1, dilate=False):
+#         if blocks >= 1:
+#             layer = super()._make_layer(block, planes, blocks, stride=stride, dilate=dilate)
+#         else:
+#             def layer(x): return x
+#         return layer
+
+#     def forward(self, x):
+#         x = self.conv1(x)
+#         x = self.bn1(x)
+#         x = self.relu(x)
+#         if self.maxpool_flag:
+#             x = self.maxpool(x)
+
+#         x = self.layer1(x)
+#         return x
+
+# class Post_ResNet9(ResNet):
+#     def __init__(self, type, block, channels=[32, 64, 128, 256], in_channel=1, layers=[1, 2, 2, 1], strides=[1, 2, 2, 1], maxpool=True):
+#         if block in block_map.keys():
+#             block = block_map[block]
+#         else:
+#             raise ValueError(
+#                 "Error type for -block-Cfg-, supported: 'BasicBlock' or 'Bottleneck'.")
+#         super(Post_ResNet9, self).__init__(block, layers)
+#         # Not used #
+#         self.fc = None
+#         self.conv1 = None
+#         self.bn1 = None
+#         self.relu = None
+#         self.layer1 = None
+#         ############
+#         self.inplanes = channels[0]
+#         self.layer2 = self._make_layer(
+#             block, channels[1], layers[1], stride=strides[1], dilate=False)
+#         self.layer3 = self._make_layer(
+#             block, channels[2], layers[2], stride=strides[2], dilate=False)
+#         self.layer4 = self._make_layer(
+#             block, channels[3], layers[3], stride=strides[3], dilate=False)
+
+#     def _make_layer(self, block, planes, blocks, stride=1, dilate=False):
+#         if blocks >= 1:
+#             layer = super()._make_layer(block, planes, blocks, stride=stride, dilate=dilate)
+#         else:
+#             def layer(x): return x
+#         return layer
+
+#     def forward(self, x):
+#         x = self.layer2(x)
+#         x = self.layer3(x)
+#         x = self.layer4(x)
+#         return x
+
+class FlexibleSequential(nn.Sequential):
+    def forward(self, input, *args, **kwargs):
+        for module in self:
+            try:
+                # 尝试传递额外的参数和关键字参数
+                input = module(input, *args, **kwargs)
+            except TypeError:
+                # 如果模块不需要额外参数，回退到仅传递输入
+                input = module(input)
+        return input
+
 
 class Pre_ResNet9(ResNet):
-    def __init__(self, type, block, channels=[32, 64, 128, 256], in_channel=1, layers=[1, 2, 2, 1], strides=[1, 2, 2, 1], maxpool=True):
+    def __init__(self, type, block, channels=[32, 64, 128, 256], in_channel=1, layers=[1, 2, 2, 1], strides=[1, 2, 2, 1], maxpool=True, in_groups=1):
         if block in block_map.keys():
             block = block_map[block]
         else:
             raise ValueError(
                 "Error type for -block-Cfg-, supported: 'BasicBlock' or 'Bottleneck'.")
         self.maxpool_flag = maxpool
-        super(Pre_ResNet9, self).__init__(block, layers)
+        super(Pre_ResNet9, self).__init__(BasicBlock, layers)
 
         # Not used #
         self.fc = None
@@ -73,7 +219,7 @@ class Pre_ResNet9(ResNet):
         self.inplanes = channels[0]
         self.bn1 = nn.BatchNorm2d(self.inplanes)
 
-        self.conv1 = BasicConv2d(in_channel, self.inplanes, 3, 1, 1)
+        self.conv1 = BasicConv2d(in_channel, self.inplanes, 3, 1, 1, groups=in_groups)
 
         self.layer1 = self._make_layer(
             block, channels[0], layers[0], stride=strides[0], dilate=False)
@@ -83,26 +229,27 @@ class Pre_ResNet9(ResNet):
             layer = super()._make_layer(block, planes, blocks, stride=stride, dilate=dilate)
         else:
             def layer(x): return x
-        return layer
+        # return layer
+        return FlexibleSequential(*list(layer.children()))
 
-    def forward(self, x):
+    def forward(self, x, *args, **kwargs):
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
         if self.maxpool_flag:
             x = self.maxpool(x)
 
-        x = self.layer1(x)
+        x = self.layer1(x, *args, **kwargs)
         return x
 
 class Post_ResNet9(ResNet):
-    def __init__(self, type, block, channels=[32, 64, 128, 256], in_channel=1, layers=[1, 2, 2, 1], strides=[1, 2, 2, 1], maxpool=True):
+    def __init__(self, type, block, channels=[32, 64, 128, 256], in_channel=1, layers=[1, 2, 2, 1], strides=[1, 2, 2, 1], maxpool=True, in_groups=1):
         if block in block_map.keys():
             block = block_map[block]
         else:
             raise ValueError(
                 "Error type for -block-Cfg-, supported: 'BasicBlock' or 'Bottleneck'.")
-        super(Post_ResNet9, self).__init__(block, layers)
+        super(Post_ResNet9, self).__init__(BasicBlock, layers)
         # Not used #
         self.fc = None
         self.conv1 = None
@@ -123,12 +270,13 @@ class Post_ResNet9(ResNet):
             layer = super()._make_layer(block, planes, blocks, stride=stride, dilate=dilate)
         else:
             def layer(x): return x
-        return layer
+        # return layer
+        return FlexibleSequential(*list(layer.children()))
 
-    def forward(self, x):
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
+    def forward(self, x, *args, **kwargs):
+        x = self.layer2(x, *args, **kwargs)
+        x = self.layer3(x, *args, **kwargs)
+        x = self.layer4(x, *args, **kwargs)
         return x
 
 
@@ -240,6 +388,81 @@ class Baseline_Single(nn.Module):
         embed_1 = self.FCs(outs)  # [n, c, p]
         _, logits = self.BNNecks(embed_1)  # [n, c, p]
         return embed_1, logits
+    
+import math
+def get_timestep_embedding(timesteps, embedding_dim, max_timesteps=40, frequency_scaling=10):
+    """
+    Adjusted sinusoidal embeddings for smaller timestep ranges.
+    Args:
+        timesteps: 1D tensor of shape (batch_size,)
+        embedding_dim: Target embedding dimension
+        max_timesteps: Maximum timestep value (e.g., 40)
+        frequency_scaling: Scaling factor for frequency range (e.g., 10)
+    """
+    assert len(timesteps.shape) == 1
+
+    half_dim = embedding_dim // 2
+    # 调整频率范围
+    emb = math.log(max_timesteps * frequency_scaling) / (half_dim - 1)
+    emb = torch.exp(torch.arange(half_dim, dtype=torch.float32) * -emb)
+    emb = emb.to(device=timesteps.device)
+    emb = timesteps.float()[:, None] * emb[None, :]
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)
+    if embedding_dim % 2 == 1:  # zero pad
+        emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
+    return emb
+    
+class Baseline_ShareTime_2B(nn.Module):
+    def __init__(self, model_cfg):
+        super(Baseline_ShareTime_2B, self).__init__()
+        self.num_FPN = model_cfg['num_FPN']
+        self.Gait_Net_1 = Baseline_Single(model_cfg)
+        self.Gait_Net_2 = Baseline_Single(model_cfg)
+        self.Gait_List = nn.ModuleList(
+            [self.Gait_Net_1 for _ in range(self.num_FPN - self.num_FPN//2)] +
+            [self.Gait_Net_2 for _ in range(self.num_FPN//2)]
+        )
+        # self.Gait_List = nn.ModuleList([
+        #     self.Gait_Net for _ in range(self.num_FPN)
+        # ])
+
+        self.t_channel = 256
+        self.temb_proj = nn.Sequential(
+            nn.Linear(self.t_channel, self.t_channel),
+            nn.ReLU(),
+            nn.Linear(self.t_channel, self.t_channel),
+        )
+
+    def forward(self, x, seqL):
+        x = self.test_1(x)
+        embed_list, log_list = self.test_2(x, seqL)
+        return embed_list, log_list
+
+    def test_1(self, x, *args, **kwargs):
+        # x: [n, c, s, h, w]
+        n,c,s,h,w = x.shape
+        x_list = list(torch.chunk(x, self.num_FPN, dim=1))
+        t = torch.tensor(list(range(self.num_FPN))).to(x).view(1,-1).repeat(n*s,1)
+        for i in range(self.num_FPN):
+            
+            temb = get_timestep_embedding(t[:,i], self.t_channel, max_timesteps=self.num_FPN).to(x)
+            temb = self.temb_proj(temb)
+
+            x_list[i] = self.Gait_List[i].test_1(x_list[i], temb=temb, *args, **kwargs)
+        x = torch.concat(x_list, dim=1)
+        return x
+
+    def test_2(self, x, seqL):
+        # x: [n, c, s, h, w]
+        # embed_1: [n, c, p]
+        x_list = torch.chunk(x, self.num_FPN, dim=1)
+        embed_list = []
+        log_list = []
+        for i in range(self.num_FPN):
+            embed_1, logits = self.Gait_List[i].test_2(x_list[i], seqL)
+            embed_list.append(embed_1)
+            log_list.append(logits)
+        return embed_list, log_list
 
 class Baseline_Share(nn.Module):
     def __init__(self, model_cfg):

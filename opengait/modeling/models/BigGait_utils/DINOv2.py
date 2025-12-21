@@ -341,3 +341,20 @@ def vit_large(patch_size=16, **kwargs):
         **kwargs,
     )
     return model
+
+def vit_giant(patch_size=16, **kwargs):
+    model = DinoVisionTransformer(
+        img_size=518,
+        patch_size=14,
+        init_values=1.0,
+        ffn_layer="swiglufused",
+        block_chunks=0,
+
+        embed_dim=1536,
+        depth=40,
+        num_heads=24,
+        mlp_ratio=4,
+        block_fn=partial(Block, attn_class=MemEffAttention),
+        **kwargs,
+    )
+    return model

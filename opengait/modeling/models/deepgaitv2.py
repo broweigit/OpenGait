@@ -100,6 +100,72 @@ class DeepGaitV2(BaseModel):
             sils = sils.transpose(1, 2).contiguous()
         assert sils.size(-1) in [44, 88]
 
+        # # DEBUG: visualize sils and save
+        # import matplotlib.pyplot as plt
+
+        # # DEBUG: visualize sils and save
+        # import os
+        # import time
+        # import numpy as np
+        # import cv2
+        # from PIL import Image as PILImage
+
+        # # 1. 设置保存路径和唯一ID
+        # debug_dir = './debug_vis_gifs'
+        # os.makedirs(debug_dir, exist_ok=True)
+        # # 使用当前毫秒时间戳作为唯一ID，防止覆盖
+        # unique_id = int(time.time() * 1000) 
+
+        # # 2. 获取第一个样本的数据 [C, S, H, W]
+        # # sils shape: [n, c, s, h, w]
+        # # 只取 Batch 0
+        # if sils.shape[0] > 0:
+        #     vis_data = sils[0].detach().cpu().numpy()
+        #     C, S, H, W = vis_data.shape
+
+        #     # === 打印统计信息 (Debug 关键) ===
+        #     print(f"\n[DEBUG {unique_id}] Sils Shape: {sils.shape}")
+        #     print(f"[DEBUG {unique_id}] Range: [{vis_data.min():.4f}, {vis_data.max():.4f}] | Mean: {vis_data.mean():.4f}")
+            
+        #     # 3. 归一化并转为 uint8 (0-255) 以便生成图像
+        #     # 如果输入已经是 0-255 (Max > 1.0)，则直接转
+        #     # 如果输入是 0-1 (Max <= 1.0)，则乘 255
+        #     if vis_data.max() <= 1.0:
+        #         vis_data = (vis_data * 255).astype(np.uint8)
+        #     else:
+        #         vis_data = vis_data.astype(np.uint8)
+
+        #     frames = []
+        #     # 4. 逐帧处理
+        #     for t in range(S):
+        #         # 准备 Bone (Channel 0) 和 Joint (Channel 1)
+        #         # 如果只有1个通道，就只画那一个
+        #         imgs_to_concat = []
+        #         for c in range(C):
+        #             img_gray = vis_data[c, t, :, :]
+        #             # 应用伪彩色 (INFERNO 风格: 黑->紫->红->黄)
+        #             img_color = cv2.applyColorMap(img_gray, cv2.COLORMAP_INFERNO)
+        #             # OpenCV 是 BGR，转为 RGB
+        #             img_color = cv2.cvtColor(img_color, cv2.COLOR_BGR2RGB)
+        #             imgs_to_concat.append(img_color)
+                
+        #         # 左右拼接: [Bone | Joint]
+        #         if len(imgs_to_concat) > 1:
+        #             # 中间加一条白线分割
+        #             sep = np.ones((H, 5, 3), dtype=np.uint8) * 255
+        #             canvas = np.concatenate([imgs_to_concat[0], sep, imgs_to_concat[1]], axis=1)
+        #         else:
+        #             canvas = imgs_to_concat[0]
+                
+        #         # 转为 PIL Image
+        #         frames.append(PILImage.fromarray(canvas))
+
+        #     # 5. 保存 GIF
+        #     save_path = os.path.join(debug_dir, f'vis_{unique_id}_len{S}.gif')
+        #     # duration=100ms (10fps)
+        #     frames[0].save(save_path, save_all=True, append_images=frames[1:], duration=100, loop=0)
+        #     print(f"[DEBUG {unique_id}] GIF saved to: {save_path}\n")
+
         del ipts
         out0 = self.layer0(sils)
         out1 = self.layer1(out0)

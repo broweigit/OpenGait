@@ -1,18 +1,18 @@
 data_cfg:
-  dataset_name: CCPG
-  dataset_root: /data3/SkeletonMap/CCPG/GaitMap2D/Sigma-8.0_Hot-False_Align-True
-  dataset_partition: ./datasets/CCPG/CCPG.json
+  dataset_name: CCGR-MINI
+  dataset_root: /data1/CCGR/CCGR_SIL_PAR_POSE/CCGR-MINI-merge-sil-pose
+  dataset_partition: ./datasets/CCGR-MINI/CCGR-MINI.json
   num_workers: 1
-  data_in_use: [True] # heatmap, sil
+  data_in_use: [True, False] # heatmap, sil
   remove_no_gallery: false # Remove probe if no gallery for it
-  test_dataset_name: CCPG
+  test_dataset_name: CCGR-MINI
 
 evaluator_cfg:
   enable_float16: true
   restore_ckpt_strict: true
   restore_hint: 60000
   save_name: SkeletonGait
-  eval_func: evaluate_CCPG
+  eval_func: evaluate_CCGR_MINI
   sampler:
     batch_shuffle: false
     batch_size: 4
@@ -49,7 +49,7 @@ model_cfg:
       - 256
       - 512
   SeparateBNNecks:
-    class_num: 100
+    class_num: 571
   use_emb2: true
 
 optimizer_cfg:

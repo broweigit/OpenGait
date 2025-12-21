@@ -153,3 +153,4 @@ logs/*
 
 # output
 output/*
+check_heatmap_results
