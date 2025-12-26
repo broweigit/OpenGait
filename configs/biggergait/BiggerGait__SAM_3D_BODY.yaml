@@ -1,0 +1,136 @@
+data_cfg:
+  dataset_name: CCPG
+  dataset_root: /data/CCPG/Released/CCPG-ratio-pkl
+  dataset_partition: ./datasets/CCPG/CCPG.json
+  data_in_use: [True, False]
+  num_workers: 8
+  remove_no_gallery: false
+  test_dataset_name: CCPG
+
+evaluator_cfg:
+  enable_float16: true
+  restore_ckpt_strict: False
+  restore_hint: 30000
+  save_name: BiggerGait__SAM3DBody-DINOv3_Gaitbase_Share
+  eval_func: evaluate_CCPG
+  sampler:
+    batch_shuffle: false
+    batch_size: 4
+    sample_type: all_ordered
+    frames_all_limit: 250
+  metric: euc
+  transform:
+    - type: BaseRgbTransform
+
+loss_cfg:
+  - loss_term_weight: 1.0
+    margin: 0.2
+    type: TripletLoss
+    log_prefix: triplet
+  - loss_term_weight: 1.0
+    scale: 16
+    type: CrossEntropyLoss
+    log_prefix: softmax
+    log_accuracy: true
+
+model_cfg:
+  model: BiggerGait__SAM3DBody_Gaitbase_Share
+  # 这里填写 sam-3d-body 源码的绝对路径，代码会自动添加到 sys.path
+  pretrained_lvm: pretrained_LVMs/sam-3d-body
+  pretrained_mask_branch: BYPASS
+  
+  # SAM 3D Body (DINOv3) 必须使用 512x512
+  image_size: 512                                                                 
+  sils_size: 32                                                                   
+  
+  # DINOv3 ViT-Huge 维度
+  source_dim: 1280
+  
+  # DINOv3 有 32 层，为了整除每组 4 层 (32/4 = 8)，FPN 设为 8
+  num_FPN: 8
+  
+  num_unknown: 16
+  
+  Mask_Branch:
+    source_dim: 1280  # 注意：这里也要改成 1280，因为 MaskBranch 也是接在 Backbone 后面
+    target_dim: 2
+    p: 0.
+    softmax: True
+    Relu: False
+    Up: True
+
+  backbone_cfg:
+    type: ResNet9
+    block: BasicBlock_Time
+    in_channel: 16
+    channels:
+      - 64
+      - 128
+      - 256
+      - 512
+    layers:
+      - 1
+      - 1
+      - 1
+      - 1
+    strides:
+      - 1
+      - 2
+      - 1
+      - 1
+    maxpool: false
+  SeparateFCs:
+    in_channels: 512
+    out_channels: 256
+    parts_num: 32
+  SeparateBNNecks:
+    class_num: 100
+    in_channels: 256
+    parts_num: 32
+  bin_num:
+    - 32
+
+optimizer_cfg:
+  lr: 0.1
+  momentum: 0.9
+  solver: SGD
+  weight_decay: 0.0005
+
+scheduler_cfg:
+  gamma: 0.1
+  milestones:
+    - 15000
+    - 25000
+  scheduler: MultiStepLR
+
+trainer_cfg:
+  find_unused_parameters: True
+  enable_float16: true
+  fix_BN: false
+  log_iter: 100
+  with_test: true
+  restore_ckpt_strict: true
+  restore_hint: 0
+  save_iter: 10000
+  save_name: BiggerGait__SAM3DBody-DINOv3_Gaitbase_Share
+  sync_BN: true
+  total_iter: 30000
+  sampler:
+    batch_shuffle: true
+    batch_size:
+      - 8
+      - 4 # 显存警告：SAM 3D Body 很大，如果 OOM，请将此值减小到 2
+    frames_num_fixed: 30
+    frames_skip_num: 4
+    frames_num_max: 40
+    frames_num_min: 20
+    sample_type: fixed_unordered
+    type: TripletSampler
+  transform:
+    - type: Compose
+      trf_cfg:
+        - type: RandomHorizontalFlip
+        - type: BaseRgbTransform
+          # DINOv3 使用标准的 ImageNet 均值和方差 (0-255 RGB)
+          mean: [123.675, 116.28, 103.53] 
+          std: [58.395, 57.12, 57.375]
