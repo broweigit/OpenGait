@@ -69,6 +69,15 @@ def run_model(cfgs, training):
 
 if __name__ == '__main__':
     torch.distributed.init_process_group('nccl', init_method='env://')
+    # ================= [核心修复 START] =================
+    # 必须在任何模型加载或 CUDA 操作之前执行！
+    # 优先从环境变量获取 LOCAL_RANK (torchrun/slurm 标准)，如果没有则使用参数中的
+    local_rank = int(os.environ.get("LOCAL_RANK", opt.local_rank))
+    
+    # 强制将当前进程的视角“锁定”到对应的 GPU 上
+    # 这样 Rank 1 执行 .cuda() 时，其实是在操作物理 GPU 1
+    torch.cuda.set_device(local_rank)
+    # ================= [核心修复 END] ===================
     if torch.distributed.get_world_size() != torch.cuda.device_count():
         raise ValueError("Expect number of available GPUs({}) equals to the world size({}).".format(
             torch.cuda.device_count(), torch.distributed.get_world_size()))
