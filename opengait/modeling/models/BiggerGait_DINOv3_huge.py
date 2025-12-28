@@ -242,24 +242,36 @@ class BiggerGait__DINOv3_Huge(BaseModel):
                 ).contiguous()
                 intermediates = list(torch.chunk(intermediates, self.total_layer_num, dim=1))
 
-                # human_mask = partial(nn.LayerNorm, eps=1e-6)(self.f4_dim, elementwise_affine=False)(outs[-1])[:,1:].contiguous()
-                # human_mask, _ = self.Mask_Branch(human_mask.view(-1, self.f4_dim), mse=False)
-                # ================== [修改 2] Mask Branch 适配 ==================
-                # outs[-1] 现在是 Huge 的最后一层 (1280维)
-                human_mask_feat = partial(nn.LayerNorm, eps=1e-6)(self.f4_dim, elementwise_affine=False)(outs[-1])[:,1:]
+                # # human_mask = partial(nn.LayerNorm, eps=1e-6)(self.f4_dim, elementwise_affine=False)(outs[-1])[:,1:].contiguous()
+                # # human_mask, _ = self.Mask_Branch(human_mask.view(-1, self.f4_dim), mse=False)
+                # # ================== [修改 2] Mask Branch 适配 ==================
+                # # outs[-1] 现在是 Huge 的最后一层 (1280维)
+                # human_mask_feat = partial(nn.LayerNorm, eps=1e-6)(self.f4_dim, elementwise_affine=False)(outs[-1])[:,1:]
                 
-                # [新增] 维度压缩 1280 -> 384
-                # 注意 view 的操作，先压扁喂给 Linear，再处理
-                # 输入: [B*S*L, 1280]
-                human_mask_feat = self.mask_adapter(human_mask_feat.reshape(-1, self.f4_dim)) 
+                # # [新增] 维度压缩 1280 -> 384
+                # # 注意 view 的操作，先压扁喂给 Linear，再处理
+                # # 输入: [B*S*L, 1280]
+                # human_mask_feat = self.mask_adapter(human_mask_feat.reshape(-1, self.f4_dim)) 
                 
-                # 现在的 human_mask_feat 是 [B*S*L, 384]，完美喂给原始 MaskBranch
-                human_mask, _ = self.Mask_Branch(human_mask_feat, mse=False)
-                # ==============================================================
-                human_mask = (human_mask[:,1] > 0.5).float() # check which is the foreground at first!!!   0 or 1; 50%;
-                # human_mask = human_mask.view(n*s, 1, self.image_size//7, self.image_size//14)
-                human_mask = human_mask.view(n*s, 1, h_feat, w_feat)
+                # # 现在的 human_mask_feat 是 [B*S*L, 384]，完美喂给原始 MaskBranch
+                # human_mask, _ = self.Mask_Branch(human_mask_feat, mse=False)
+                # # ==============================================================
+                # human_mask = (human_mask[:,1] > 0.5).float() # check which is the foreground at first!!!   0 or 1; 50%;
+                # # human_mask = human_mask.view(n*s, 1, self.image_size//7, self.image_size//14)
+                # human_mask = human_mask.view(n*s, 1, h_feat, w_feat)
+                # human_mask = self.preprocess(human_mask, self.sils_size).detach().clone()
+
+                # ================== [修改点] 全 1 Mask ==================
+                # 不再计算 outs[-1]，不再跑 Mask_Adapter 和 Mask_Branch
+                human_mask = torch.ones(
+                    (n * s, 1, h_feat, w_feat),
+                    dtype=intermediates[0].dtype,
+                    device=intermediates[0].device
+                )
+                
+                # Resize 到 (64, 32)
                 human_mask = self.preprocess(human_mask, self.sils_size).detach().clone()
+                # =======================================================
 
             intermediates = [torch.cat(intermediates[i:i+self.group_layer_num], dim=1).contiguous() for i in range(0, self.total_layer_num, self.group_layer_num)]
             for i in range(self.num_FPN):
