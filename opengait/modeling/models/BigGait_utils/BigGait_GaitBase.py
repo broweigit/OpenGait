@@ -411,6 +411,46 @@ def get_timestep_embedding(timesteps, embedding_dim, max_timesteps=40, frequency
     if embedding_dim % 2 == 1:  # zero pad
         emb = torch.nn.functional.pad(emb, (0, 1, 0, 0))
     return emb
+
+class Baseline_2B(nn.Module):
+    def __init__(self, model_cfg):
+        super(Baseline_2B, self).__init__()
+        self.num_FPN = model_cfg['num_FPN']
+        self.Gait_Net_1 = Baseline_Single(model_cfg)
+        self.Gait_Net_2 = Baseline_Single(model_cfg)
+        self.Gait_List = nn.ModuleList(
+            [self.Gait_Net_1 for _ in range(self.num_FPN - self.num_FPN//2)] +
+            [self.Gait_Net_2 for _ in range(self.num_FPN//2)]
+        )
+        # self.Gait_List = nn.ModuleList([
+        #     self.Gait_Net for _ in range(self.num_FPN)
+        # ])
+
+    def forward(self, x, seqL):
+        x = self.test_1(x)
+        embed_list, log_list = self.test_2(x, seqL)
+        return embed_list, log_list
+
+    def test_1(self, x, *args, **kwargs):
+        # x: [n, c, s, h, w]
+        n,c,s,h,w = x.shape
+        x_list = list(torch.chunk(x, self.num_FPN, dim=1))
+        for i in range(self.num_FPN):
+            x_list[i] = self.Gait_List[i].test_1(x_list[i], *args, **kwargs)
+        x = torch.concat(x_list, dim=1)
+        return x
+
+    def test_2(self, x, seqL):
+        # x: [n, c, s, h, w]
+        # embed_1: [n, c, p]
+        x_list = torch.chunk(x, self.num_FPN, dim=1)
+        embed_list = []
+        log_list = []
+        for i in range(self.num_FPN):
+            embed_1, logits = self.Gait_List[i].test_2(x_list[i], seqL)
+            embed_list.append(embed_1)
+            log_list.append(logits)
+        return embed_list, log_list
     
 class Baseline_ShareTime_2B(nn.Module):
     def __init__(self, model_cfg):

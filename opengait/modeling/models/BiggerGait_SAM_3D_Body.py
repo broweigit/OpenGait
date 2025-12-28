@@ -319,9 +319,8 @@ class BiggerGait__SAM3DBody_Gaitbase_Share(BaseModel):
         
         all_outs = []
         
-        # DINOv3 固定输入分辨率
-        target_h, target_w = self.image_size, self.image_size
-        h_feat = target_h // 16 
+        target_h, target_w = self.image_size, self.image_size // 2
+        h_feat, w_feat = target_h // 16, target_w // 16
 
         for _, rgb_img in enumerate(rgb_chunks):
             n, s, c, h, w = rgb_img.size()
@@ -331,25 +330,25 @@ class BiggerGait__SAM3DBody_Gaitbase_Share(BaseModel):
             # 1. Backbone 前向 (必须加 no_grad 以节省显存)
             # =======================================================
             with torch.no_grad():
-                outs = self.preprocess(rgb_img, target_h, target_w)
+                outs = self.preprocess(rgb_img, target_h, target_w) # ns c H W -> B 3 512 256
                 
                 # 清空 Hook 缓存
                 self.intermediate_features = {}
                 
                 # DINOv3 推理
-                _ = self.Backbone(outs)
+                _ = self.Backbone(outs) # lay B L C -> 16 B 32*16+1+4=517 1280
                 
                 # 收集被 Hook 的层
-                num_layers = len(self.hook_handles)
+                num_layers = len(self.hook_handles) # 16
                 features_to_use = []
-                target_tokens = h_feat * h_feat 
+                target_tokens = h_feat * w_feat # 512
                 
                 for i in range(num_layers):
-                    feat = self.intermediate_features[i]
+                    feat = self.intermediate_features[i] # B L C -> B 517 1280
                     # 去除 CLS Token 等多余部分，只保留 Spatial Tokens
                     if feat.shape[1] > target_tokens:
                         feat = feat[:, -target_tokens:, :]
-                    features_to_use.append(feat)
+                    features_to_use.append(feat) # lay B L C -> 16 B 512 1280
 
             # =======================================================
             # 2. FPN 组处理 (Group Processing)
@@ -358,7 +357,7 @@ class BiggerGait__SAM3DBody_Gaitbase_Share(BaseModel):
             
             # 自动计算步长：例如 Hook了16层，FPN有4个，则 step=4 (即每组4层)
             # 这与 build_network 中的 input_dim 计算逻辑是完全对应的
-            step = len(features_to_use) // self.num_FPN
+            step = len(features_to_use) // self.num_FPN # 16 / 4 = 4
             
             for i in range(self.num_FPN):
                 # A. 切片：取出当前 Head 负责的那几层
@@ -368,33 +367,33 @@ class BiggerGait__SAM3DBody_Gaitbase_Share(BaseModel):
                 
                 # B. 拼接：将这几层拼在一起
                 # 维度变化: [B, N, 1280] x step -> [B, N, 1280*step]
-                sub_app = torch.concat(sub_feats, dim=-1)
+                sub_app = torch.concat(sub_feats, dim=-1) # B 512 1280*4=5120
                 
                 # C. 调整形状以进行卷积 [B, C, H, W]
-                sub_app = rearrange(sub_app, 'b (h w) c -> b c h w', h=h_feat).contiguous()
+                sub_app = rearrange(sub_app, 'b (h w) c -> b c h w', h=h_feat).contiguous() # B 5120 32 16
                 
                 # D. Pre_Conv (Identity)
                 sub_app = self.Pre_Conv(sub_app)
                 
                 # E. 局部 LayerNorm (针对当前组的维度进行归一化)
-                sub_app = rearrange(sub_app, 'b c h w -> b (h w) c')
+                sub_app = rearrange(sub_app, 'b c h w -> b (h w) c') # B 512 5120
                 # 计算当前组的通道数，例如 1280 * 2 = 2560
-                curr_dim = self.f4_dim * len(sub_feats)
+                curr_dim = self.f4_dim * len(sub_feats) # 1280 * 4 = 5120
                 sub_app = partial(nn.LayerNorm, eps=1e-6)(curr_dim, elementwise_affine=False)(sub_app)
-                sub_app = rearrange(sub_app, 'b (h w) c -> b c h w', h=h_feat).contiguous()
+                sub_app = rearrange(sub_app, 'b (h w) c -> b c h w', h=h_feat).contiguous() # B 5120 32 16
                 
                 # F. 喂给第 i 个独立的 FPN Head
                 # self.HumanSpace_Conv[i] 的输入维度在 build_network 里已经按 step 算好了
-                reduced_feat = self.HumanSpace_Conv[i](sub_app)
+                reduced_feat = self.HumanSpace_Conv[i](sub_app) # B num_unknown -> B 16 64 32
                 
-                processed_feat_list.append(reduced_feat)
+                processed_feat_list.append(reduced_feat) # *4
                 
                 # 释放显存
                 del sub_app
                 del sub_feats
 
             # 3. 拼接所有 Head 的输出
-            human_feat = torch.concat(processed_feat_list, dim=1)
+            human_feat = torch.concat(processed_feat_list, dim=1) # B num_unknown*num_FPN H W -> B 16*4=64 64 32
             
             # =======================================================
             # 3. 后处理 (Mask & GaitNet)
