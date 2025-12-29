@@ -107,10 +107,10 @@ class BiggerGait__DINOv3_Huge(BaseModel):
         # =======================================================
 
     def init_DINOv2(self):
-        from transformers import Dinov2Config, Dinov2Model
+        from transformers import DINOv3ViTConfig, DINOv3ViTModel
         from transformers.modeling_outputs import BaseModelOutputWithPooling
-        config = Dinov2Config.from_pretrained(self.pretrained_lvm + "/config.json")
-        self.Backbone = Dinov2Model.from_pretrained(
+        config = DINOv3ViTConfig.from_pretrained(self.pretrained_lvm + "/config.json")
+        self.Backbone = DINOv3ViTModel.from_pretrained(
             self.pretrained_lvm, 
             config=config,
             ignore_mismatched_sizes=True
