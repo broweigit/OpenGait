@@ -231,7 +231,16 @@ class BiggerGait__DINOv3_Huge(BaseModel):
                 w_feat = self.image_size // patch_size        # 256 // 16 = 16
                 # =============================================================
 
-                intermediates = partial(nn.LayerNorm, eps=1e-6)(self.f4_dim*len(outs), elementwise_affine=False)(torch.concat(outs, dim=-1))[:,1:]
+                # intermediates = partial(nn.LayerNorm, eps=1e-6)(self.f4_dim*len(outs), elementwise_affine=False)(torch.concat(outs, dim=-1))[:,1:]
+                # 1. 先拼接
+                intermediates = partial(nn.LayerNorm, eps=1e-6)(self.f4_dim*len(outs), elementwise_affine=False)(torch.concat(outs, dim=-1))
+
+                # 2. [关键修正] 强制只取最后 h_feat*w_feat 个 Token (即 512 个)
+                # 这样会自动丢弃前面的 CLS Token 和 Register Tokens (如果有的话)
+                target_tokens = h_feat * w_feat
+                intermediates = intermediates[:, -target_tokens:]
+
+
                 # intermediates = rearrange(intermediates.view(n, s, self.image_size//7, self.image_size//14, -1), 'n s h w c -> (n s) c h w').contiguous()
                 # ================== [修正 2] 使用正确的尺寸 Reshape ==================
                 # 原代码: self.image_size//7, self.image_size//14
