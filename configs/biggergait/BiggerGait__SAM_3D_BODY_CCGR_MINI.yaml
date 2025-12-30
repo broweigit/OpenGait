@@ -1,11 +1,11 @@
 data_cfg:
-  dataset_name: CCPG
-  dataset_root: /data/CCPG/Released/CCPG-ratio-pkl
-  dataset_partition: ./datasets/CCPG/CCPG.json
-  data_in_use: [True, False]
-  num_workers: 8
-  remove_no_gallery: false
-  test_dataset_name: CCPG
+  dataset_name: CCGR-MINI
+  dataset_root: /lab/yusq_lab/dataset/rgb/CCGR-MINI-RGB-V1 # use datasets/pretreatment_rgb.py for data preprocessing!
+  dataset_partition: ./datasets/CCGR-MINI/CCGR-MINI.json
+  data_in_use: [True] # images / real_ratios
+  num_workers: 10
+  remove_no_gallery: false # Remove probe if no gallery for it
+  test_dataset_name: CCGR-MINI
 
 evaluator_cfg:
   enable_float16: true

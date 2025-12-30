@@ -153,6 +153,8 @@ class BiggerGait__SAM3DBody_Gaitbase_Share(BaseModel):
         self.msg_mgr.log_info(f"          |-> Conv Input Dim: {input_dim}")
         # ====================================================
 
+        self.chunk_size = model_cfg.get("chunk_size", 96)
+
         # 初始化下游网络
         self.Gait_Net = Baseline_ShareTime_2B(model_cfg)
         self.Pre_Conv = nn.Sequential(nn.Identity())
@@ -314,12 +316,12 @@ class BiggerGait__SAM3DBody_Gaitbase_Share(BaseModel):
         del ipts
 
         # 显存优化：如果依然 OOM，将此值改为 2
-        CHUNK_SIZE = 4 
+        CHUNK_SIZE = self.chunk_size
         rgb_chunks = torch.chunk(rgb, (rgb.size(1)//CHUNK_SIZE)+1, dim=1)
         
         all_outs = []
         
-        target_h, target_w = self.image_size, self.image_size // 2
+        target_h, target_w = self.image_size * 2, self.image_size
         h_feat, w_feat = target_h // 16, target_w // 16
 
         for _, rgb_img in enumerate(rgb_chunks):
