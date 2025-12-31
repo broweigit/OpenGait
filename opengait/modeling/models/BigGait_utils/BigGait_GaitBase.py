@@ -541,3 +541,93 @@ class Baseline_Share(nn.Module):
             embed_list.append(embed_1)
             log_list.append(logits)
         return embed_list, log_list
+
+class Baseline_Semantic_2B(Baseline_ShareTime_2B):
+    """
+    A variant of Baseline_ShareTime_2B that uses Semantic Attention Pooling 
+    instead of Horizontal Pyramid Pooling (HPP).
+    
+    Logic:
+    1. Input: Features [N, C, S, H, W] & Attention Maps [N, P, S, H, W]
+    2. Per-Frame Semantic Pooling: Weighted Sum using Attn Map -> [N, C, S, P]
+    3. Temporal Pooling: Aggregate over S -> [N, C, P]
+    4. Heads: FCs & BNNecks
+    """
+    def __init__(self, model_cfg):
+        super(Baseline_Semantic_2B, self).__init__(model_cfg)
+        # 初始化逻辑完全复用父类，因为它已经包含了我们需要的 sub-networks (Gait_List)
+        # Gait_List 中的每个 Baseline_Single 包含了 FCs, BNNecks 和 TP 模块，我们可以直接借用
+
+    def forward(self, x, attn_map, seqL):
+        # 注意：这里签名变了，增加了 attn_map
+        x = self.test_1(x)
+        embed_list, log_list = self.test_2(x, attn_map, seqL)
+        return embed_list, log_list
+
+    def test_2(self, x, attn_map, seqL):
+        """
+        Args:
+            x: [n, c_total, s, h, w] - FPN Features
+            attn_map: [n, p, s, h, w] - Semantic Attention Maps (P=70)
+            seqL: Sequence Lengths for TP
+        """
+        n, c_total, s, h, w = x.shape
+        n_attn, p, s_attn, h_attn, w_attn = attn_map.shape
+        
+        # 简单校验维度
+        assert n == n_attn and s == s_attn, "Feature and AttnMap batch/time dims mismatch"
+        
+        # 将 Feature 切分为 FPN Heads
+        x_list = torch.chunk(x, self.num_FPN, dim=1)
+        
+        embed_list = []
+        log_list = []
+        
+        for i in range(self.num_FPN):
+            # 1. 获取当前 FPN Head 的特征
+            # feat: [n, c_sub, s, h, w]
+            feat = x_list[i]
+            
+            # =======================================================
+            # 🌟 Step 1: Frame-level Semantic Pooling
+            # =======================================================
+            # 我们需要对每一帧 (n*s) 进行加权求和
+            # Feat: [B_total, C, HW]
+            # Map:  [B_total, P, HW]
+            
+            # 展平 Batch*Time 和 Spatial 维度
+            feat_flat = rearrange(feat, 'n c s h w -> (n s) c (h w)')
+            map_flat = rearrange(attn_map, 'n p s h w -> (n s) p (h w)')
+            
+            # 语义聚合 (Weighted Sum)
+            # 公式: Output = Feat @ Map^T
+            # [N*S, C, HW] @ [N*S, HW, P] -> [N*S, C, P]
+            # 结果含义: 每一帧图像中，P 个关键点对应的 C 维特征
+            sp_feat = torch.matmul(feat_flat, map_flat.transpose(1, 2))
+            
+            # =======================================================
+            # 🌟 Step 2: Temporal Pooling (TP)
+            # =======================================================
+            # 还原维度以进行 TP: [N, S, C, P] -> Permute to [N, C, S, P]
+            # OpenGait 的 TP (PackSequenceWrapper) 默认在 dim=2 (序列维度) 上操作
+            sp_feat = rearrange(sp_feat, '(n s) c p -> n c s p', n=n, s=s)
+            
+            # 调用 Baseline_Single 里的 TP 模块 (通常是 Max Pooling)
+            # Input: [N, C, S, P], Output: [N, C, P]
+            # 注意：这里的 P (Parts) 相当于原来的 H/W 空间维度，TP 对它不敏感，只聚合 S
+            tp_feat = self.Gait_List[i].TP(sp_feat, seqL, options={"dim": 2})[0]
+            
+            # =======================================================
+            # 🌟 Step 3: Classification Heads
+            # =======================================================
+            # 直接调用子网的 FC 和 BNNeck
+            # Input: [N, C, P] -> Output: [N, C, P]
+            embed_1 = self.Gait_List[i].FCs(tp_feat)
+            
+            # Input: [N, C, P] -> Output: [N, ClassNum, P]
+            _, logits = self.Gait_List[i].BNNecks(embed_1)
+            
+            embed_list.append(embed_1)
+            log_list.append(logits)
+            
+        return embed_list, log_list

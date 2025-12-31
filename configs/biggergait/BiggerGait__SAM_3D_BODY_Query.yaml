@@ -1,18 +1,18 @@
 data_cfg:
-  dataset_name: CCGR-MINI
-  dataset_root: /lab/yusq_lab/dataset/rgb/CCGR-MINI-RGB-V1 # use datasets/pretreatment_rgb.py for data preprocessing!
-  dataset_partition: ./datasets/CCGR-MINI/CCGR-MINI.json
-  data_in_use: [True] # images / real_ratios
-  num_workers: 10
-  remove_no_gallery: false # Remove probe if no gallery for it
-  test_dataset_name: CCGR-MINI
+  dataset_name: CCPG
+  dataset_root: /data/CCPG/Released/CCPG-ratio-pkl
+  dataset_partition: ./datasets/CCPG/CCPG.json
+  data_in_use: [True, False]
+  num_workers: 8
+  remove_no_gallery: false
+  test_dataset_name: CCPG
 
 evaluator_cfg:
   enable_float16: true
   restore_ckpt_strict: False
   restore_hint: 30000
-  save_name: BiggerGait__SAM3DBody-DINOv3_Gaitbase_Share
-  eval_func: evaluate_CCGR_MINI
+  save_name: BiggerGait__SAM3DBody-DINOv3_Query_Gaitbase_Share
+  eval_func: evaluate_CCPG
   sampler:
     batch_shuffle: false
     batch_size: 4
@@ -35,7 +35,7 @@ loss_cfg:
 
 model_cfg:
   chunk_size: 8
-  model: BiggerGait__SAM3DBody_Gaitbase_Share
+  model: BiggerGait__SAM3DBody__Query_Gaitbase_Share
   # 这里填写 sam-3d-body 源码的绝对路径，代码会自动添加到 sys.path
   pretrained_lvm: pretrained_LVMs/sam-3d-body
   pretrained_mask_branch: BYPASS
@@ -126,13 +126,13 @@ model_cfg:
   SeparateFCs:
     in_channels: 512
     out_channels: 256
-    parts_num: 32
+    parts_num: 70
   SeparateBNNecks:
     class_num: 100
     in_channels: 256
-    parts_num: 32
+    parts_num: 70
   bin_num:
-    - 32
+    - 70
 
 optimizer_cfg:
   lr: 0.1
@@ -156,7 +156,7 @@ trainer_cfg:
   restore_ckpt_strict: true
   restore_hint: 0
   save_iter: 10000
-  save_name: BiggerGait__SAM3DBody-DINOv3_Gaitbase_Share
+  save_name: BiggerGait__SAM3DBody-DINOv3_Query_Gaitbase_Share
   sync_BN: true
   total_iter: 30000
   sampler:
