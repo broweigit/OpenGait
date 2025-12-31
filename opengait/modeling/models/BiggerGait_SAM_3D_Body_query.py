@@ -552,7 +552,7 @@ class BiggerGait__SAM3DBody__Query_Gaitbase_Share(BaseModel):
         #     torch.cat(all_outs, dim=2),
         #     seqL,
         # )
-        
+
         # 1. 拼接特征 (在时间维度 s 上, dim=2)
         # [n, c, S_total, h, w]
         feat_total = torch.cat(all_outs, dim=2)
@@ -569,6 +569,55 @@ class BiggerGait__SAM3DBody__Query_Gaitbase_Share(BaseModel):
             seqL,
         )
 
+        # =======================================================
+        # 🌟 可视化逻辑 (Visualization Logic)
+        # =======================================================
+        
+        vis_dict = {}
+        if self.training:
+            # 1. 准备基础数据
+            # 取第一个样本 (Batch=0) 的前 5 帧进行可视化
+            # rgb: [N, S, C, H, W] -> [S, C, H, W]
+            vis_n = 0 # 查看第0个样本
+            vis_frames = 5 # 查看前5帧
+            
+            # 原始 RGB 图像 (反归一化以便显示，这里简化为 min-max)
+            raw_img = rgb_img.view(n, s, c, target_h, target_w)[vis_n, :vis_frames]
+            vis_dict['image/original_rgb'] = self.min_max_norm(raw_img)
+
+            # 2. Attention Maps 可视化
+            # map_total: [N, P, S, H, W] -> [P, S, H, W] (P=70)
+            attn_maps = map_total[vis_n, :, :vis_frames, :, :]
+            
+            # 挑选几个有代表性的 Part
+            # 假设 0-10 是头，11-20 是躯干... 我们取间隔的几个来看看
+            selected_parts = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65]
+            
+            for part_idx in selected_parts:
+                # 获取单张热力图: [S, H, W] -> [S, 1, H, W]
+                # 归一化到 0-1 以便显示
+                part_map = attn_maps[part_idx].unsqueeze(1)
+                part_map = self.min_max_norm(part_map)
+                
+                # A. 纯热力图 (Grayscale)
+                vis_dict[f'attn_map/part_{part_idx}_gray'] = part_map
+                
+                # B. 叠加图 (Overlay) - 这一步最直观！
+                # 将热力图叠加在 RGB 上 (简单加权)
+                # alpha blend: 0.6 * img + 0.4 * heatmap
+                # 注意：raw_img 和 part_map 都在 0-1 之间
+                heatmap_overlay = 0.6 * vis_dict['image/original_rgb'] + 0.4 * part_map.repeat(1, 3, 1, 1)
+                vis_dict[f'attn_overlay/part_{part_idx}'] = heatmap_overlay.clamp(0, 1)
+
+            # 3. 特征热力图 (Feature Heatmap)
+            # embed_list: [N, C, P] (List of tensors) -> 取最后一次 FPN 的结果
+            # 这展示了每个 Part 最终提取到的特征向量的“强度”或“模式”
+            final_feat = embed_list[-1][vis_n] # [C, P]
+            
+            # 转置以便 x轴=Parts(70), y轴=Channels(256)
+            # [1, 1, C, P] -> 视为一张单通道图片
+            feat_img = final_feat.unsqueeze(0).unsqueeze(0) # [1, 1, C, P]
+            vis_dict['feature/final_embedding_heatmap'] = self.min_max_norm(feat_img)
 
         # 组装返回值
         if self.training:
@@ -577,10 +626,11 @@ class BiggerGait__SAM3DBody__Query_Gaitbase_Share(BaseModel):
                     'triplet': {'embeddings': torch.concat(embed_list, dim=-1), 'labels': labs},
                     'softmax': {'logits': torch.concat(log_list, dim=-1), 'labels': labs},
                 },
-                'visual_summary': {
-                    'image/rgb_img': rgb_img.view(n*s, c, h, w)[:5].float(),
-                    'image/human_mask': self.min_max_norm(human_mask.view(n*s, -1, self.sils_size*2, self.sils_size)[:5].float()).clamp(0,1),
-                },
+                # 'visual_summary': {
+                #     'image/rgb_img': rgb_img.view(n*s, c, h, w)[:5].float(),
+                #     'image/human_mask': self.min_max_norm(human_mask.view(n*s, -1, self.sils_size*2, self.sils_size)[:5].float()).clamp(0,1),
+                # },
+                'visual_summary': vis_dict,
                 'inference_feat': {
                     'embeddings': torch.concat(embed_list, dim=-1),
                     **{f'embeddings_{i}': embed_list[i] for i in range(self.num_FPN)}
