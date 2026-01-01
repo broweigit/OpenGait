@@ -358,7 +358,7 @@ class BiggerGait__SAM3DBody__Query_Gaitbase_Share(BaseModel):
                 # Condition Info (Cliff / None) TODO ???
                 cond_info = None
                 if self.SAM_Engine.cfg.MODEL.DECODER.CONDITION_TYPE != "none":
-                    self.msg_mgr.log_warning(f"Warning: CONDITION_TYPE is {self.SAM_Engine.cfg.MODEL.DECODER.CONDITION_TYPE}, but cond_info is not implemented yet.")
+                    # self.msg_mgr.log_warning(f"Warning: CONDITION_TYPE is {self.SAM_Engine.cfg.MODEL.DECODER.CONDITION_TYPE}, but cond_info is not implemented yet.")
                     cond_info = torch.zeros(image_embeddings.shape[0], 3, device=image_embeddings.device).float()
 
                 # 必须传入 keypoints 才能触发 decoder 内部的 token 初始化逻辑
@@ -383,19 +383,18 @@ class BiggerGait__SAM3DBody__Query_Gaitbase_Share(BaseModel):
 
                 # Compute Attention Map
                 chunk_layer_maps = []
-                num_heads = self.SAM_Engine.cfg.MODEL.DECODER.HEADS
+                num_heads = self.SAM_Engine.cfg.MODEL.DECODER.HEADS # 8
                 sorted_layer_keys = sorted(self.hook_data.keys())
 
-                for l_idx in sorted_layer_keys:
-                    q_proj = self.hook_data[l_idx]['q'] # [B, 70, 1024]
-                    k_proj = self.hook_data[l_idx]['k'] # [B, 512, 1024]
+                for l_idx in sorted_layer_keys: # Layer num: 6
+                    q_proj = self.hook_data[l_idx]['q'] # [B, 145, 1024] 1 + 1 + 1 + 2 + 70 + 70
+                    k_proj = self.hook_data[l_idx]['k'] # [B, 512, 1024] 32x16
                     
-                    # 计算原始 Attention Map -> [B, 145, HW]
+                    # 计算原始 Attention Map -> Q @ K.T  [B, 145, 512]
                     attn_map_full = self.compute_attention_map(q_proj, k_proj, num_heads) 
                     
                     # 截取 70 个 Body Parts
                     # Token 结构推测: [Init(1), Prev(1), Prompt(1), Hand(2), Body2D(70), Body3D(70)]
-                    # 我们需要 Body2D 部分，即索引 5 到 75
                     attn_map = attn_map_full[:, 5:75, :] # [B, 70, HW]
 
                     # Reshape to Spatial [B, 70, H, W]
@@ -417,28 +416,22 @@ class BiggerGait__SAM3DBody__Query_Gaitbase_Share(BaseModel):
                 # Group & Concat
                 sub_feats = features_to_use[i*step : (i+1)*step]
                 
-                # 我们要在通道维度拼接
                 # [B, 1280, H, W] x 4 -> [B, 5120, H, W]
                 sub_app = torch.cat(sub_feats, dim=1) 
                 
-                # PreConv & Norm
+                # PreConv (Identity)
                 sub_app = self.Pre_Conv(sub_app)
-                curr_dim = self.f4_dim * len(sub_feats)
                 
-                # 换位到最后进行 Norm: [B, 5120, H, W] -> [B, H, W, 5120]
+                # LayerNorm [B, 5120, H, W] -> [B, H, W, 5120] -> LN -> [B, 5120, H, W]
                 sub_app = sub_app.permute(0, 2, 3, 1) 
-                
-                # LayerNorm (input last dim 5120 == normalized_shape 5120) -> OK!
-                sub_app = partial(nn.LayerNorm, eps=1e-6)(curr_dim, elementwise_affine=False)(sub_app)
-                
-                # 换回: [B, H, W, 5120] -> [B, 5120, H, W]
+                sub_app = partial(nn.LayerNorm, eps=1e-6)(self.f4_dim * len(sub_feats), elementwise_affine=False)(sub_app)
                 sub_app = sub_app.permute(0, 3, 1, 2).contiguous()
                 
-                # Reduce Dim
+                # Reduce Dim  [B, 5120, 32, 16] -> [B, 16(num_unknown), 64, 32(ResizeToHW)]
                 reduced_feat = self.HumanSpace_Conv[i](sub_app) 
                 processed_feat_list.append(reduced_feat)
 
-            # Concat FPN Heads
+            # Concat FPN Heads * 4 Groups
             human_feat = torch.concat(processed_feat_list, dim=1) # [B, 64, H, W]
 
             # Mask (Apply dummy full mask)
@@ -454,21 +447,21 @@ class BiggerGait__SAM3DBody__Query_Gaitbase_Share(BaseModel):
             outs = self.Gait_Net.test_1(human_feat)
             all_outs.append(outs)
 
-        # 1. Concat Features [n, c, S_total, h, w]
+        # 1. Concat Chunks [n, c, S_total, h, w]
         feat_total = torch.cat(all_outs, dim=2)
         
         # 2. Concat Attention Maps
         # List of [n, l, p, s, h, w] -> Concat on s (dim=3)
-        # Result: [n, l, p, S_total, h, w]
+        # [N, Layers, 70, S_total, 32, 16]
         map_total_layers = torch.cat(all_attn_maps, dim=3)
         
         # 选择需要的层喂给 GaitNet
 
         # 策略一：只取最后一层 (Last Layer)
         # map_total: [n, p, S_total, h, w]
-        map_total = map_total_layers[:, -1, ...] 
+        map_total = map_total_layers[:, -3, ...] 
 
-        # 3. GaitNet Test 2 (Semantic + Temporal Pooling)
+        # 3. GaitNet Test 2 (Semantic + Temporal Pooling + FC) [N, 256, 70]
         embed_list, log_list = self.Gait_Net.test_2(
             feat_total,
             map_total.to(feat_total.device), 
@@ -492,7 +485,7 @@ class BiggerGait__SAM3DBody__Query_Gaitbase_Share(BaseModel):
                 vis_map = map_total[0, :, 0].detach().cpu() 
                 
                 # 挑选几个关键点
-                parts_to_show = [0, 9, 12, 15, 20, 25, 30, 33, 36, 39, 42, 45, 50, 55, 60, 65]
+                parts_to_show = [0, 10, 20, 30, 40, 50, 60, 69]
                 
                 for pid in parts_to_show:
                     if pid < vis_map.shape[0]:
