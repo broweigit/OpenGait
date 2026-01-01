@@ -151,7 +151,7 @@ trainer_cfg:
   find_unused_parameters: True
   enable_float16: true
   fix_BN: false
-  log_iter: 100
+  log_iter: 50
   with_test: true
   restore_ckpt_strict: true
   restore_hint: 0
@@ -175,6 +175,3 @@ trainer_cfg:
       trf_cfg:
         - type: RandomHorizontalFlip
         - type: BaseRgbTransform
-          # DINOv3 使用标准的 ImageNet 均值和方差 (0-255 RGB)
-          mean: [123.675, 116.28, 103.53] 
-          std: [58.395, 57.12, 57.375]

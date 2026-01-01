@@ -175,6 +175,3 @@ trainer_cfg:
       trf_cfg:
         - type: RandomHorizontalFlip
         - type: BaseRgbTransform
-          # DINOv3 使用标准的 ImageNet 均值和方差 (0-255 RGB)
-          mean: [123.675, 116.28, 103.53] 
-          std: [58.395, 57.12, 57.375]
