@@ -158,14 +158,13 @@ class BiggerGait__SAM3DBody__Query_Gaitbase_Share(BaseModel):
         estimator = setup_sam_3d_body(hf_repo_id="facebook/sam-3d-body-dinov3", device='cpu')
 
         self.SAM_Engine = estimator.model
-        self.SAM_Engine.eval()
-
         # 1. 开启中间层输出
         self.SAM_Engine.decoder.do_interm_preds = True
 
         # 2. 冻结所有参数
         for param in self.SAM_Engine.parameters():
             param.requires_grad = False
+        self.SAM_Engine.eval()
         
 
         self.Backbone = self.SAM_Engine.backbone
@@ -283,7 +282,7 @@ class BiggerGait__SAM3DBody__Query_Gaitbase_Share(BaseModel):
 
     def compute_attention_map(self, q_proj, k_proj, num_heads):
         """
-        手动计算 Attention Map
+        手动计算 Attention Map(保留Multihead)
         """
         B, N_q, C = q_proj.shape
         _, N_k, _ = k_proj.shape
@@ -298,12 +297,12 @@ class BiggerGait__SAM3DBody__Query_Gaitbase_Share(BaseModel):
         attn_logits = (q @ k.transpose(-2, -1)) * scale
 
         # 3. Softmax
-        attn_weights = F.softmax(attn_logits, dim=-1)
+        attn_weights = F.softmax(attn_logits, dim=-1) # [B, H, N_q, N_k]
 
-        # 4. Average over Heads
-        attn_weights_mean = attn_weights.mean(dim=1) # [B, N_q, N_k]
+        # # 4. Average over Heads
+        # attn_weights_mean = attn_weights.mean(dim=1) # [B, N_q, N_k]
         
-        return attn_weights_mean
+        return attn_weights
 
     def forward(self, inputs):
         # 冻结 Mask Branch
@@ -318,7 +317,7 @@ class BiggerGait__SAM3DBody__Query_Gaitbase_Share(BaseModel):
         rgb_chunks = torch.chunk(rgb, (rgb.size(1)//CHUNK_SIZE)+1, dim=1)
         
         all_outs = []       # GaitNet Test1 输出
-        all_attn_maps = []  # Decoder Attention Maps
+        all_attn_maps = [] # Attention Maps 输出
         
         target_h, target_w = self.image_size * 2, self.image_size
         h_feat, w_feat = target_h // 16, target_w // 16 # DINOv3 Patch Size = 16
@@ -355,11 +354,12 @@ class BiggerGait__SAM3DBody__Query_Gaitbase_Share(BaseModel):
                 # 告诉模型：没有 Hand 需要处理
                 self.SAM_Engine.hand_batch_idx = []
                 
-                # Condition Info (Cliff / None) TODO ???
+                # Condition Info (Cliff / None)
                 cond_info = None
                 if self.SAM_Engine.cfg.MODEL.DECODER.CONDITION_TYPE != "none":
                     # self.msg_mgr.log_warning(f"Warning: CONDITION_TYPE is {self.SAM_Engine.cfg.MODEL.DECODER.CONDITION_TYPE}, but cond_info is not implemented yet.")
                     cond_info = torch.zeros(image_embeddings.shape[0], 3, device=image_embeddings.device).float()
+                    cond_info[:, 2] = 1.25
 
                 # 必须传入 keypoints 才能触发 decoder 内部的 token 初始化逻辑
                 # 格式: [Batch, Num_Points, 3] -> [Batch, 1, 3]
@@ -378,7 +378,7 @@ class BiggerGait__SAM3DBody__Query_Gaitbase_Share(BaseModel):
                         keypoints=dummy_keypoints,
                         prev_estimate=None,
                         condition_info=cond_info,
-                        batch=dummy_batch
+                        batch=dummy_batch # TODO CHECK
                     )
 
                 # Compute Attention Map
@@ -390,21 +390,22 @@ class BiggerGait__SAM3DBody__Query_Gaitbase_Share(BaseModel):
                     q_proj = self.hook_data[l_idx]['q'] # [B, 145, 1024] 1 + 1 + 1 + 2 + 70 + 70
                     k_proj = self.hook_data[l_idx]['k'] # [B, 512, 1024] 32x16
                     
-                    # 计算原始 Attention Map -> Q @ K.T  [B, 145, 512]
-                    attn_map_full = self.compute_attention_map(q_proj, k_proj, num_heads) 
+                    # 计算原始 Attention Map Multihead -> Q @ K.T [B, H, 145, 512]
+                    attn_map_full = self.compute_attention_map(q_proj, k_proj, num_heads)
                     
-                    # 截取 70 个 Body Parts
+                    # 截取 第一 个 Body Parts
                     # Token 结构推测: [Init(1), Prev(1), Prompt(1), Hand(2), Body2D(70), Body3D(70)]
-                    attn_map = attn_map_full[:, 5:75, :] # [B, 70, HW]
+                    # self.msg_mgr.log_info(f'Layer {l_idx}: attn_map_full shape: {attn_map_full.shape}, head num: {attn_map_full.shape[1]}, total query tokens: {attn_map_full.shape[2]}')
+                    attn_map_multihead = attn_map_full[:, :, :1, :] # [B, H, 70, HW]
 
-                    # Reshape to Spatial [B, 70, H, W]
-                    attn_spatial = rearrange(attn_map, 'b p (h w) -> b p h w', h=h_feat, w=w_feat)
+                    # Reshape [B, 8, H, W]
+                    attn_spatial = rearrange(attn_map_multihead, 'b H p (h w) -> b (H p) h w', h=h_feat, w=w_feat)
                     chunk_layer_maps.append(attn_spatial.cpu())
 
-                # chunk_maps: [n*s, Layers, 70, h, w]
+                # chunk_maps: [n*s, Layers, 8, h, w]
                 chunk_maps = torch.stack(chunk_layer_maps, dim=1)
                 
-                # 还原 Batch 维度: [n, s, Layers, 70, h, w]
+                # 还原 Batch 维度: [n, s, Layers, 8, h, w]
                 chunk_maps = rearrange(chunk_maps, '(n s) l p h w -> n l p s h w', n=n, s=s)
                 all_attn_maps.append(chunk_maps)
 
@@ -452,16 +453,19 @@ class BiggerGait__SAM3DBody__Query_Gaitbase_Share(BaseModel):
         
         # 2. Concat Attention Maps
         # List of [n, l, p, s, h, w] -> Concat on s (dim=3)
-        # [N, Layers, 70, S_total, 32, 16]
+        # [N, Layers, 8, S_total, 32, 16]
         map_total_layers = torch.cat(all_attn_maps, dim=3)
         
         # 选择需要的层喂给 GaitNet
 
-        # 策略一：只取最后一层 (Last Layer)
-        # map_total: [n, p, S_total, h, w]
-        map_total = map_total_layers[:, -3, ...] 
+        # 取前4层 Attention Maps并各自做part
+        # map_total: [n, 4p, S_total, h, w] num_FPN=4*8=32
+        map_total = rearrange(
+            map_total_layers[:, :self.num_FPN, :, :, :, :], 
+            'n l p s h w -> n (l p) s h w'
+        )
 
-        # 3. GaitNet Test 2 (Semantic + Temporal Pooling + FC) [N, 256, 70]
+        # 3. GaitNet Test 2 (Semantic + Temporal Pooling + FC) [N, 256, 4*8=32]
         embed_list, log_list = self.Gait_Net.test_2(
             feat_total,
             map_total.to(feat_total.device), 
@@ -469,40 +473,62 @@ class BiggerGait__SAM3DBody__Query_Gaitbase_Share(BaseModel):
         )
 
         # -------------------------------------------------------
-        # Visualization (基于计算好的 Attention Map)
+        # Visualization (可视化所有层 + Jet 热力图)
         # -------------------------------------------------------
         vis_dict = {}
         if self.training and torch.distributed.get_rank() == 0:
             try:
-                # 取第一个样本，第一帧
+                import matplotlib.cm as cm  # 引入 colormap
+                
+                # 1. 准备原图 (取第一个样本，第一帧)
+                # vis_img: [3, H, W]
                 vis_img = inputs[0][0][0, 0].detach().cpu()
                 vis_img = (vis_img - vis_img.min()) / (vis_img.max() - vis_img.min() + 1e-6)
-                
                 vis_dict['image/0_original'] = vis_img
                 
-                # 取对应 Attention Map (最后一层)
-                # map_total: [n, p, S, h, w] -> [70, h, w]
-                vis_map = map_total[0, :, 0].detach().cpu() 
+                # 2. 准备 Attention Maps
+                # map_total_layers: [n, l, p, S, h, w]
+                # 我们取第一个样本(n=0)，第一帧(S=0) -> [l, p, h, w]
+                vis_layers_data = map_total_layers[0, :, :, 0].detach().cpu()
                 
-                # 挑选几个关键点
-                parts_to_show = [0, 10, 20, 30, 40, 50, 60, 69]
+                # 查看前4层
+                num_layers = 4
+
+                # show all parts
+                parts_to_show = list(range(vis_layers_data.shape[1]))
                 
-                for pid in parts_to_show:
-                    if pid < vis_map.shape[0]:
-                        att = vis_map[pid] # [h, w]
-                        att = F.interpolate(att[None, None], size=vis_img.shape[1:], mode='bilinear')[0,0]
-                        
-                        # 归一化热力图
-                        att = (att - att.min()) / (att.max() - att.min() + 1e-6)
-                        
-                        # 简单的红色叠加
-                        heatmap = torch.zeros_like(vis_img)
-                        heatmap[0] = att
-                        overlay = vis_img * 0.5 + heatmap * 0.5
-                        vis_dict[f'image/attn_part_{pid}'] = overlay.clamp(0,1)
+                # 3. 遍历每一层 (Layer Loop)
+                for l_idx in range(num_layers):
+                    
+                    for pid in parts_to_show:
+                        if pid < vis_layers_data.shape[1]:
+                            # 获取 raw attention map [h, w]
+                            att = vis_layers_data[l_idx, pid] 
+                            
+                            # 插值到原图大小 [H, W]
+                            att = F.interpolate(att[None, None], size=vis_img.shape[1:], mode='bilinear')[0,0]
+                            
+                            # 🌟 归一化 (对于 Jet 可视化非常重要)
+                            # 将值映射到 0-1 之间，以便应用 colormap
+                            att_norm = (att - att.min()) / (att.max() - att.min() + 1e-6)
+                            
+                            # 🌟 应用 Jet Colormap
+                            # cm.jet(x) 返回 [H, W, 4] (RGBA)，我们需要前3个通道 (RGB)
+                            # numpy -> tensor [3, H, W]
+                            heatmap_np = cm.jet(att_norm.numpy())[..., :3]
+                            heatmap = torch.from_numpy(heatmap_np).permute(2, 0, 1).float()
+                            
+                            # 叠加 (Overlay): 原图 0.4 + 热力图 0.6 (让热力图更明显一点)
+                            overlay = vis_img * 0.4 + heatmap * 0.6
+                            
+                            # 命名格式: layer_{层号}/part_{部位号}
+                            key_name = f'image/layer_{l_idx:02d}part_{pid:02d}'
+                            vis_dict[key_name] = overlay.clamp(0, 1)
 
             except Exception as e:
                 self.msg_mgr.log_warning(f'Visualization Error: {e}')
+                import traceback
+                traceback.print_exc()
 
         # 组装返回值
         if self.training:

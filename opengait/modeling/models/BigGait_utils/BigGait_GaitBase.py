@@ -601,16 +601,16 @@ class Baseline_Semantic_2B(Baseline_ShareTime_2B):
             
             # 语义聚合 (Weighted Sum)
             # 公式: Output = Feat @ Map^T
-            # [N*S, C, HW] @ [N*S, HW, P] -> [N*S, C, P]
+            # [N*S, P, HW] @ [N*S, HW, C] -> [N*S, P, C]
             # 结果含义: 每一帧图像中，P 个关键点对应的 C 维特征
-            sp_feat = torch.matmul(feat_flat, map_flat.transpose(1, 2))
+            sp_feat = torch.matmul(map_flat, feat_flat.transpose(1, 2))
             
             # =======================================================
             # 🌟 Step 2: Temporal Pooling (TP)
             # =======================================================
-            # 还原维度以进行 TP: [N, S, C, P] -> Permute to [N, C, S, P]
+            # 还原维度以进行 TP: [N, S, P, C] -> Permute to [N, C, S, P]
             # OpenGait 的 TP (PackSequenceWrapper) 默认在 dim=2 (序列维度) 上操作
-            sp_feat = rearrange(sp_feat, '(n s) c p -> n c s p', n=n, s=s)
+            sp_feat = rearrange(sp_feat, '(n s) p c -> n c s p', n=n, s=s)
             
             # 调用 Baseline_Single 里的 TP 模块 (通常是 Max Pooling)
             # Input: [N, C, S, P], Output: [N, C, P]

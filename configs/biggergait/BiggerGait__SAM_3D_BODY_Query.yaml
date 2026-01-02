@@ -126,13 +126,13 @@ model_cfg:
   SeparateFCs:
     in_channels: 512
     out_channels: 256
-    parts_num: 70
+    parts_num: 32
   SeparateBNNecks:
     class_num: 100
     in_channels: 256
-    parts_num: 70
+    parts_num: 32
   bin_num:
-    - 70
+    - 32
 
 optimizer_cfg:
   lr: 0.1
@@ -151,11 +151,11 @@ trainer_cfg:
   find_unused_parameters: True
   enable_float16: true
   fix_BN: false
-  log_iter: 50
+  log_iter: 100
   with_test: true
   restore_ckpt_strict: true
   restore_hint: 0
-  save_iter: 10000
+  save_iter: 5000
   save_name: BiggerGait__SAM3DBody-DINOv3_Query_Gaitbase_Share
   sync_BN: true
   total_iter: 30000
