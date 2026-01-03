@@ -415,6 +415,122 @@ def evaluate_CCPG(data, dataset, metric='euc'):
         msg_mgr.log_info('BG: {}'.format(de_diag(acc[3, :, :, i], True)))
     return result_dict
 
+import torch
+def evaluate_CCPG_part(data, dataset, metric='euc'):
+    msg_mgr = get_msg_mgr()
+    
+    # ================= [结构配置区] =================
+    TEST_PARTS = True
+    NUM_FPN_HEADS = 4       
+    PARTS_PER_HEAD = 32     
+    EXPECTED_TOTAL_P = NUM_FPN_HEADS * PARTS_PER_HEAD # 128
+    # ===============================================
+
+    # 1. 数据解包
+    feature = data['embeddings']
+    label = data['labels']
+    seq_type = data['types']
+    view = data['views']
+
+    if isinstance(feature, torch.Tensor): feature = feature.detach().cpu().numpy()
+    if isinstance(label, torch.Tensor): label = label.detach().cpu().numpy()
+    else: label = np.array(label)
+
+    # 2. View 处理
+    view = [v.split("_")[0] for v in view]
+    view_np = np.array(view)
+    view_list = sorted(list(set(view))) 
+    
+    # 3. 序列定义
+    probe_seq_dict = {'CCPG': [["U0_D0_BG", "U0_D0"], ["U3_D3"], ["U1_D0"], ["U0_D0_BG"]]}
+    gallery_seq_dict = {'CCPG': [["U1_D1", "U2_D2", "U3_D3"], ["U0_D3"], ["U1_D1"], ["U0_D0"]]}
+    
+    # 4. 形状检查
+    try:
+        N, C, P = feature.shape
+        msg_mgr.log_info(f"Detected Feature Shape: [N={N}, C={C}, P={P}]")
+        if P != EXPECTED_TOTAL_P:
+            msg_mgr.log_warning(f"Warning: Expected {EXPECTED_TOTAL_P} parts, got {P}.")
+    except ValueError:
+        msg_mgr.log_info(f"Error: Feature shape {feature.shape} is not [N, C, P]!")
+        return {}
+
+    # === 定义评测核心 ===
+    def run_evaluation_core(feat_input, title_suffix=""):
+        # [FIX] 再次确保输入是 3D [N, C, 1] 或 [N, C, P]
+        # 如果不小心传了 2D，在这里补救
+        if feat_input.ndim == 2:
+            feat_input = feat_input[:, :, np.newaxis]
+
+        ap_save, cmc_save = [], []
+        
+        for p, probe_seq in enumerate(probe_seq_dict[dataset]):
+            gallery_seq = gallery_seq_dict[dataset][p]
+            
+            g_mask = np.isin(seq_type, gallery_seq)
+            p_mask = np.isin(seq_type, probe_seq)
+            
+            gal_x, gal_y, gal_v = feat_input[g_mask], label[g_mask], view_np[g_mask]
+            prob_x, prob_y, prob_v = feat_input[p_mask], label[p_mask], view_np[p_mask]
+
+            if len(prob_x) == 0 or len(gal_x) == 0:
+                cmc_save.append(0); ap_save.append(0); continue
+
+            # cuda_dist 内部需要 [N, C, P]，所以我们必须保证 feat_input 是 3D
+            distmat = cuda_dist(prob_x, gal_x, metric).cpu().numpy()
+            
+            try:
+                cmc, ap, _ = evaluate_many(distmat, prob_y, gal_y, prob_v, gal_v)
+                cmc_save.append(cmc[0]); ap_save.append(ap)
+            except:
+                cmc_save.append(0); ap_save.append(0)
+
+        r1_str = ', '.join([f'{x*100:.1f}' for x in cmc_save])
+        msg_mgr.log_info(f'{title_suffix:<25} | Rank-1: {r1_str}')
+
+    # 5. 执行评估
+
+    # (A) Full Feature (128维度拼接)
+    msg_mgr.log_info("\n" + "="*40)
+    msg_mgr.log_info("1. Full Feature Evaluation (Concatenated 128)")
+    msg_mgr.log_info("="*40)
+    # [FIX] 展平并增加一个维度 -> [N, C*P, 1]
+    feature_flat = feature.reshape(N, -1, 1)
+    run_evaluation_core(feature_flat, title_suffix="[ALL Combined]")
+
+    # (B) FPN Head & Part Evaluation
+    if TEST_PARTS:
+        msg_mgr.log_info("\n" + "="*40)
+        msg_mgr.log_info(f"2. FPN Branch Evaluation")
+        msg_mgr.log_info("="*40)
+        
+        for head_idx in range(NUM_FPN_HEADS):
+            msg_mgr.log_info(f"\n>>> [FPN Head {head_idx}]")
+            
+            start = head_idx * PARTS_PER_HEAD
+            end = start + PARTS_PER_HEAD
+            
+            # 1. 测 Head 整体 (拼接该 Head 下的 32 Part)
+            head_feat_chunk = feature[:, :, start:end] 
+            # [FIX] 展平并增加维度 -> [N, C*32, 1]
+            run_evaluation_core(head_feat_chunk.reshape(N, -1, 1), title_suffix=f"[Head-{head_idx} Full]")
+
+            # 2. 测每个 Part
+            for part_idx in range(PARTS_PER_HEAD):
+                abs_idx = start + part_idx
+                # [FIX] 使用切片 start:end 保持维度 -> [N, C, 1]
+                # 不要用 feature[:, :, abs_idx] 因为那会降维
+                part_feat = feature[:, :, abs_idx : abs_idx+1]
+                run_evaluation_core(part_feat, title_suffix=f"  - Part {part_idx:02d}")
+
+    acc = np.zeros([4, len(view_list), len(view_list), 5]) 
+    return {
+        "scalar/test_accuracy/CL": acc[0, :, :, 0],
+        "scalar/test_accuracy/UP": acc[1, :, :, 0],
+        "scalar/test_accuracy/DN": acc[2, :, :, 0],
+        "scalar/test_accuracy/BG": acc[3, :, :, 0]
+    }
+
 import pandas as pd
 def evaluate_simple_split(data, dataset, metric='euc'):
     """

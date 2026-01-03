@@ -436,6 +436,38 @@ class BaseModel(MetaModel, nn.Module):
             if model.iteration >= model.engine_cfg['total_iter']:
                 break
 
+    # @ staticmethod
+    # def run_test(model):
+    #     """Accept the instance object(model) here, and then run the test loop."""
+    #     evaluator_cfg = model.cfgs['evaluator_cfg']
+    #     if torch.distributed.get_world_size() != evaluator_cfg['sampler']['batch_size']:
+    #         raise ValueError("The batch size ({}) must be equal to the number of GPUs ({}) in testing mode!".format(
+    #             evaluator_cfg['sampler']['batch_size'], torch.distributed.get_world_size()))
+    #     rank = torch.distributed.get_rank()
+    #     with torch.no_grad():
+    #         info_dict = model.inference(rank)
+    #     if rank == 0:
+    #         loader = model.test_loader
+    #         label_list = loader.dataset.label_list
+    #         types_list = loader.dataset.types_list
+    #         views_list = loader.dataset.views_list
+
+    #         info_dict.update({
+    #             'labels': label_list, 'types': types_list, 'views': views_list})
+
+    #         if 'eval_func' in evaluator_cfg.keys():
+    #             eval_func = evaluator_cfg["eval_func"]
+    #         else:
+    #             eval_func = 'identification'
+    #         eval_func = getattr(eval_functions, eval_func)
+    #         valid_args = get_valid_args(
+    #             eval_func, evaluator_cfg, ['metric'])
+    #         try:
+    #             dataset_name = model.cfgs['data_cfg']['test_dataset_name']
+    #         except:
+    #             dataset_name = model.cfgs['data_cfg']['dataset_name']
+    #         return eval_func(info_dict, dataset_name, **valid_args)
+
     @ staticmethod
     def run_test(model):
         """Accept the instance object(model) here, and then run the test loop."""
@@ -444,26 +476,64 @@ class BaseModel(MetaModel, nn.Module):
             raise ValueError("The batch size ({}) must be equal to the number of GPUs ({}) in testing mode!".format(
                 evaluator_cfg['sampler']['batch_size'], torch.distributed.get_world_size()))
         rank = torch.distributed.get_rank()
-        with torch.no_grad():
-            info_dict = model.inference(rank)
-        if rank == 0:
-            loader = model.test_loader
-            label_list = loader.dataset.label_list
-            types_list = loader.dataset.types_list
-            views_list = loader.dataset.views_list
 
-            info_dict.update({
-                'labels': label_list, 'types': types_list, 'views': views_list})
+        tensor_save_dir = osp.join(model.save_path, "tensors")
+        mkdir(tensor_save_dir)
 
-            if 'eval_func' in evaluator_cfg.keys():
-                eval_func = evaluator_cfg["eval_func"]
+        is_training_mode = hasattr(model, 'train_loader')
+
+        if is_training_mode:
+            USE_CACHE = False
+            cache_name = f"test_features_iter{model.iteration}.pt"
+        else:
+            USE_CACHE = True
+            cache_name = "test_features_cache.pt"
+
+        cache_path = osp.join(tensor_save_dir, cache_name)
+        info_dict = None
+
+        # 3. 尝试读取缓存
+        if USE_CACHE and osp.exists(cache_path):
+            if rank == 0:
+                model.msg_mgr.log_info(f"==> [Loader] Cache found at {cache_path}")
+                model.msg_mgr.log_info(f"==> Skipping inference & Loading...")
+                loaded_dict = torch.load(cache_path)
+                
+                info_dict = {k: (v.cpu().numpy() if isinstance(v, torch.Tensor) else np.array(v) if isinstance(v, list) else v) 
+                             for k, v in loaded_dict.items()}
             else:
-                eval_func = 'identification'
-            eval_func = getattr(eval_functions, eval_func)
-            valid_args = get_valid_args(
-                eval_func, evaluator_cfg, ['metric'])
-            try:
-                dataset_name = model.cfgs['data_cfg']['test_dataset_name']
-            except:
-                dataset_name = model.cfgs['data_cfg']['dataset_name']
+                info_dict = None
+        else:
+            if USE_CACHE and rank == 0:
+                 model.msg_mgr.log_info(f"==> [Loader] Cache not found at {cache_path}. Running Inference...")
+            
+            with torch.no_grad():
+                info_dict = model.inference(rank)
+
+        if rank == 0:
+            if 'labels' not in (info_dict or {}):
+                loader = model.test_loader
+                info_dict.update({
+                    'labels': loader.dataset.label_list,
+                    'types': loader.dataset.types_list,
+                    'views': loader.dataset.views_list
+                })
+                if isinstance(info_dict['embeddings'], torch.Tensor):
+                    info_dict['embeddings'] = info_dict['embeddings'].cpu().numpy()
+
+            should_save = False
+            if is_training_mode:
+                should_save = True
+            elif not osp.exists(cache_path):
+                should_save = True
+
+            if should_save:
+                model.msg_mgr.log_info(f"==> [Saver] Saving features to {cache_path}...")
+                torch.save(info_dict, cache_path)
+
+            eval_func_name = evaluator_cfg.get("eval_func", "identification")
+            eval_func = getattr(eval_functions, eval_func_name)
+            valid_args = get_valid_args(eval_func, evaluator_cfg, ['metric'])
+            dataset_name = model.cfgs['data_cfg'].get('test_dataset_name', model.cfgs['data_cfg']['dataset_name'])
+            
             return eval_func(info_dict, dataset_name, **valid_args)
