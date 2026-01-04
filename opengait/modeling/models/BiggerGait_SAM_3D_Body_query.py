@@ -105,26 +105,22 @@ class BiggerGait__SAM3DBody__Query_Gaitbase_Share(BaseModel):
         self.sils_size = model_cfg["sils_size"]
         self.f4_dim = model_cfg["source_dim"]
         self.num_unknown = model_cfg["num_unknown"]
-        self.num_FPN = model_cfg["num_FPN"] # 4
+        self.num_FPN = model_cfg["num_FPN"]
+        self.chunk_size = model_cfg.get("chunk_size", 96)
 
         layer_cfg = model_cfg.get("layer_config", {})
 
-        self.layers_per_group = layer_cfg.get("layers_per_group", 2)
-
         self.hook_mask = layer_cfg["hook_mask"] if "hook_mask" in layer_cfg else [False]*16 + [True]*16
         assert len(self.hook_mask) == 32, "hook_mask length must be 32."
+        assert self.hook_mask.count(True) % self.num_FPN == 0, "Number of hook layers must be divisible by num_FPN."
 
-        self.total_hooked_layers = sum(self.hook_mask) # 16
-        assert self.total_hooked_layers > 0, "At least one layer must be hooked."
-        assert self.total_hooked_layers % self.layers_per_group == 0, "Total hooked layers must be divisible by layers_per_group."
+        total_hooked_layers = sum(self.hook_mask) # 16
+        assert total_hooked_layers > 0, "At least one layer must be hooked."
 
-        self.total_groups = self.total_hooked_layers // self.layers_per_group
-        assert self.total_groups % self.num_FPN == 0, "Total groups must be divisible by num_FPN."
+        human_conv_input_dim = self.f4_dim * (total_hooked_layers // self.num_FPN) # 1280 * 4 = 5120
 
-        self.layers_per_head = self.total_hooked_layers // self.num_FPN # 16 / 4 = 4
-        human_conv_input_dim = self.f4_dim * self.layers_per_head # 1280 * 4 = 5120
-
-        self.chunk_size = model_cfg.get("chunk_size", 96)
+        self.trans_layer_mask = layer_cfg["trans_layer_mask"] if "trans_layer_mask" in layer_cfg else [False]*2 + [True]*4
+        assert len(self.trans_layer_mask) == 6, "trans_layer_mask length must be 6."
 
         # 初始化下游网络
         self.Gait_Net = Baseline_Semantic_2B(model_cfg)
@@ -322,6 +318,9 @@ class BiggerGait__SAM3DBody__Query_Gaitbase_Share(BaseModel):
         target_h, target_w = self.image_size * 2, self.image_size
         h_feat, w_feat = target_h // 16, target_w // 16 # DINOv3 Patch Size = 16
 
+        # 定义一个变量用于存储可视化用的 Mesh 数据
+        vis_pose_output = None
+
         for _, rgb_img in enumerate(rgb_chunks):
             n, s, c, h, w = rgb_img.size()
             rgb_img = rearrange(rgb_img, 'n s c h w -> (n s) c h w').contiguous()
@@ -357,7 +356,6 @@ class BiggerGait__SAM3DBody__Query_Gaitbase_Share(BaseModel):
                 # Condition Info (Cliff / None)
                 cond_info = None
                 if self.SAM_Engine.cfg.MODEL.DECODER.CONDITION_TYPE != "none":
-                    # self.msg_mgr.log_warning(f"Warning: CONDITION_TYPE is {self.SAM_Engine.cfg.MODEL.DECODER.CONDITION_TYPE}, but cond_info is not implemented yet.")
                     cond_info = torch.zeros(image_embeddings.shape[0], 3, device=image_embeddings.device).float()
                     cond_info[:, 2] = 1.25
 
@@ -370,16 +368,20 @@ class BiggerGait__SAM3DBody__Query_Gaitbase_Share(BaseModel):
                 
                 # ====================================
 
-                # 运行 Decoder (我们主要为了触发 Hook)
                 with torch.amp.autocast(enabled=False, device_type='cuda'):
-                    _, _ = self.SAM_Engine.forward_decoder(
+                    # 1. 捕获返回值：tokens_out 是 hidden states, pose_outs 是每一层的预测结果列表
+                    tokens_out, pose_outs = self.SAM_Engine.forward_decoder(
                         image_embeddings=image_embeddings,
                         init_estimate=None,
                         keypoints=dummy_keypoints,
                         prev_estimate=None,
                         condition_info=cond_info,
-                        batch=dummy_batch # TODO CHECK
+                        batch=dummy_batch
                     )
+                    
+                    if vis_pose_output is None:
+                        # pose_outs[-1] 包含当前 chunk 所有帧的 mesh 数据 [BS, 10475, 3]
+                        vis_pose_output = pose_outs[-1]
 
                 # Compute Attention Map
                 chunk_layer_maps = []
@@ -411,13 +413,13 @@ class BiggerGait__SAM3DBody__Query_Gaitbase_Share(BaseModel):
 
             # FPN 组处理 (Group Processing)
             processed_feat_list = []
-            step = len(features_to_use) // self.num_FPN 
+            step = len(features_to_use) // self.num_FPN
             
             for i in range(self.num_FPN):
                 # Group & Concat
                 sub_feats = features_to_use[i*step : (i+1)*step]
                 
-                # [B, 1280, H, W] x 4 -> [B, 5120, H, W]
+                # [B, 1280, H, W] x step -> [B, 5120, H, W] if step = 4
                 sub_app = torch.cat(sub_feats, dim=1) 
                 
                 # PreConv (Identity)
@@ -432,8 +434,8 @@ class BiggerGait__SAM3DBody__Query_Gaitbase_Share(BaseModel):
                 reduced_feat = self.HumanSpace_Conv[i](sub_app) 
                 processed_feat_list.append(reduced_feat)
 
-            # Concat FPN Heads * 4 Groups
-            human_feat = torch.concat(processed_feat_list, dim=1) # [B, 64, H, W]
+            # Concat FPN Heads
+            human_feat = torch.concat(processed_feat_list, dim=1) # [B, 64(FPN * 16), H, W]
 
             # Mask (Apply dummy full mask)
             human_mask_ori = torch.ones((n*s, 1, h_feat, h_feat), dtype=human_feat.dtype, device=human_feat.device)
@@ -458,10 +460,10 @@ class BiggerGait__SAM3DBody__Query_Gaitbase_Share(BaseModel):
         
         # 选择需要的层喂给 GaitNet
 
-        # 取前4层 Attention Maps并各自做part
-        # map_total: [n, 4p, S_total, h, w] num_FPN=4*8=32
+        # 取指定层 Attention Maps并各自做part
+        # map_total: [n, 4p, S_total, h, w]
         map_total = rearrange(
-            map_total_layers[:, :self.num_FPN, :, :, :, :], 
+            map_total_layers[:, self.trans_layer_mask, :, :, :, :], 
             'n l p s h w -> n (l p) s h w'
         )
 
@@ -529,6 +531,74 @@ class BiggerGait__SAM3DBody__Query_Gaitbase_Share(BaseModel):
                 self.msg_mgr.log_warning(f'Visualization Error: {e}')
                 import traceback
                 traceback.print_exc()
+
+            # =======================================================
+            # 新增: 3D Mesh 可视化渲染
+            # =======================================================
+            try:
+                import matplotlib.pyplot as plt
+                plt.switch_backend('Agg')
+                import numpy as np
+                from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+                # 1. 获取第一个样本的数据
+                # Vertices: [18439, 3] (注意: mhr_forward 内部可能已经做了坐标系翻转，通常 Y 轴向下)
+                mesh_verts = vis_pose_output["pred_vertices"][0].detach().cpu().numpy()
+
+                # [B, 3]
+                cam_t = vis_pose_output["pred_cam_t"][0].detach().cpu().numpy()
+                mesh_verts = mesh_verts + cam_t
+
+                # 2. 创建 Matplotlib 画布
+                fig = plt.figure(figsize=(4, 4), dpi=100)
+                ax = fig.add_subplot(111, projection='3d')
+
+                # 3. 渲染 (推荐使用散点图 scatter，速度快且不易崩)
+                # 降采样：每 5 个点画 1 个
+                step = 5 
+                # c=mesh_verts[::step, 2]: 根据深度(Z轴)设置颜色深浅，增加立体感
+                ax.scatter(mesh_verts[::step, 0], mesh_verts[::step, 1], mesh_verts[::step, 2], 
+                           s=1, c=mesh_verts[::step, 2], cmap='viridis', alpha=0.5)
+
+                # 4. 强制坐标轴比例一致 (Fix Aspect Ratio)
+                # 否则Matplotlib 会自动拉伸坐标轴，导致人变形
+                x_min, x_max = mesh_verts[:, 0].min(), mesh_verts[:, 0].max()
+                y_min, y_max = mesh_verts[:, 1].min(), mesh_verts[:, 1].max()
+                z_min, z_max = mesh_verts[:, 2].min(), mesh_verts[:, 2].max()
+
+                max_range = np.array([x_max-x_min, y_max-y_min, z_max-z_min]).max() / 2.0
+
+                mid_x = (x_max + x_min) * 0.5
+                mid_y = (y_max + y_min) * 0.5
+                mid_z = (z_max + z_min) * 0.5
+
+                ax.set_xlim(mid_x - max_range, mid_x + max_range)
+                ax.set_ylim(mid_y - max_range, mid_y + max_range)
+                ax.set_zlim(mid_z - max_range, mid_z + max_range)
+
+                # 5. 设置视角
+                # elev=-90, azim=-90 是为了配合 vert[..., 1,2] *= -1 后的坐标系
+                # 如果你发现人是倒着的，可以尝试改成 elev=90
+                ax.view_init(elev=-90, azim=-90) 
+                ax.set_axis_off() # 隐藏坐标轴
+
+                # 6. Canvas 转 Tensor (修复版 API)
+                fig.canvas.draw()
+                
+                # 使用 buffer_rgba 获取数据
+                buf = np.array(fig.canvas.renderer.buffer_rgba())
+                
+                # 去掉 Alpha 通道并归一化 [H, W, 4] -> [3, H, W]
+                mesh_img_tensor = torch.from_numpy(buf[..., :3]).float().permute(2, 0, 1) / 255.0
+                
+                vis_dict['image/3d_mesh_preview'] = mesh_img_tensor
+                
+                plt.close(fig)
+
+            except Exception as e:
+                import traceback
+                err_msg = traceback.format_exc()
+                self.msg_mgr.log_warning(f'Mesh Vis Error:\n{err_msg}')
 
         # 组装返回值
         if self.training:

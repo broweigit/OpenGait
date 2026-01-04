@@ -478,7 +478,8 @@ class BaseModel(MetaModel, nn.Module):
         rank = torch.distributed.get_rank()
 
         tensor_save_dir = osp.join(model.save_path, "tensors")
-        mkdir(tensor_save_dir)
+        if rank == 0:
+            mkdir(tensor_save_dir)
 
         is_training_mode = hasattr(model, 'train_loader')
 

@@ -53,12 +53,8 @@ model_cfg:
   num_FPN: 4  # [要求3] FPN 数量
   
   layer_config:
-    # [要求2] 每几层算一个原子组 (用于逻辑验证，例如 2 层一组)
-    layers_per_group: 2 
-    
-    # [要求1] 32层的布尔列表。
-    # 如果不写这行，代码默认生成 [False]*16 + [True]*16 (即只取最后16层)
-    # 示例：隔一层取一层 -> [False, True, False, True, ...]
+    trans_layer_mask: [False, False, True, True, True, True]
+
     hook_mask: 
       - False # 0
       - False # 1
@@ -151,7 +147,7 @@ trainer_cfg:
   find_unused_parameters: True
   enable_float16: true
   fix_BN: false
-  log_iter: 100
+  log_iter: 1
   with_test: true
   restore_ckpt_strict: true
   restore_hint: 0
