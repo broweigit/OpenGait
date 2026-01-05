@@ -147,7 +147,7 @@ trainer_cfg:
   find_unused_parameters: True
   enable_float16: true
   fix_BN: false
-  log_iter: 1
+  log_iter: 100
   with_test: true
   restore_ckpt_strict: true
   restore_hint: 0
