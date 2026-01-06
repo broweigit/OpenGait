@@ -341,81 +341,81 @@ class BiggerGait__SAM3DBody__Foundation_Gaitbase_Share(BaseModel):
                 del all_layers
 
 
-                self.hook_data.clear() # 清空 Hook 缓存
-                dummy_batch = self._prepare_dummy_batch(image_embeddings)
+                # self.hook_data.clear() # 清空 Hook 缓存
+                # dummy_batch = self._prepare_dummy_batch(image_embeddings)
 
-                # ======= 设置 SAM Engine 状态 =======
-                batch_size = image_embeddings.shape[0]
+                # # ======= 设置 SAM Engine 状态 =======
+                # batch_size = image_embeddings.shape[0]
 
-                self.SAM_Engine._batch_size = batch_size
+                # self.SAM_Engine._batch_size = batch_size
                 
-                # 告诉模型：当前 Batch 中每个样本只有 1 个人
-                self.SAM_Engine._max_num_person = 1 
+                # # 告诉模型：当前 Batch 中每个样本只有 1 个人
+                # self.SAM_Engine._max_num_person = 1 
                 
-                # 告诉模型：所有样本都是 Body，都要处理
-                # 这对于 camera_project 里的索引至关重要
-                self.SAM_Engine.body_batch_idx = torch.arange(batch_size, device=image_embeddings.device)
+                # # 告诉模型：所有样本都是 Body，都要处理
+                # # 这对于 camera_project 里的索引至关重要
+                # self.SAM_Engine.body_batch_idx = torch.arange(batch_size, device=image_embeddings.device)
                 
-                # 告诉模型：没有 Hand 需要处理
-                self.SAM_Engine.hand_batch_idx = []
+                # # 告诉模型：没有 Hand 需要处理
+                # self.SAM_Engine.hand_batch_idx = []
                 
-                # Condition Info (Cliff / None)
-                cond_info = None
-                if self.SAM_Engine.cfg.MODEL.DECODER.CONDITION_TYPE != "none":
-                    cond_info = torch.zeros(image_embeddings.shape[0], 3, device=image_embeddings.device).float()
-                    cond_info[:, 2] = 1.25
+                # # Condition Info (Cliff / None)
+                # cond_info = None
+                # if self.SAM_Engine.cfg.MODEL.DECODER.CONDITION_TYPE != "none":
+                #     cond_info = torch.zeros(image_embeddings.shape[0], 3, device=image_embeddings.device).float()
+                #     cond_info[:, 2] = 1.25
 
-                # 必须传入 keypoints 才能触发 decoder 内部的 token 初始化逻辑
-                # 格式: [Batch, Num_Points, 3] -> [Batch, 1, 3]
-                # 最后一个维度 3 代表 [x, y, label]
-                # label = -2 表示 "Invalid Point" (仅用于占位，不产生实际提示效果)
-                dummy_keypoints = torch.zeros(batch_size, 1, 3, device=image_embeddings.device)
-                dummy_keypoints[:, :, -1] = -2
+                # # 必须传入 keypoints 才能触发 decoder 内部的 token 初始化逻辑
+                # # 格式: [Batch, Num_Points, 3] -> [Batch, 1, 3]
+                # # 最后一个维度 3 代表 [x, y, label]
+                # # label = -2 表示 "Invalid Point" (仅用于占位，不产生实际提示效果)
+                # dummy_keypoints = torch.zeros(batch_size, 1, 3, device=image_embeddings.device)
+                # dummy_keypoints[:, :, -1] = -2
                 
-                # ====================================
+                # # ====================================
 
-                with torch.amp.autocast(enabled=False, device_type='cuda'):
-                    # 1. 捕获返回值：tokens_out 是 hidden states, pose_outs 是每一层的预测结果列表
-                    tokens_out, pose_outs = self.SAM_Engine.forward_decoder(
-                        image_embeddings=image_embeddings,
-                        init_estimate=None,
-                        keypoints=dummy_keypoints,
-                        prev_estimate=None,
-                        condition_info=cond_info,
-                        batch=dummy_batch
-                    )
+                # with torch.amp.autocast(enabled=False, device_type='cuda'):
+                #     # 1. 捕获返回值：tokens_out 是 hidden states, pose_outs 是每一层的预测结果列表
+                #     tokens_out, pose_outs = self.SAM_Engine.forward_decoder(
+                #         image_embeddings=image_embeddings,
+                #         init_estimate=None,
+                #         keypoints=dummy_keypoints,
+                #         prev_estimate=None,
+                #         condition_info=cond_info,
+                #         batch=dummy_batch
+                #     )
                     
-                    if vis_pose_output is None:
-                        # pose_outs[-1] 包含当前 chunk 所有帧的 mesh 数据 [BS, 10475, 3]
-                        vis_pose_output = pose_outs[-1]
+                #     if vis_pose_output is None:
+                #         # pose_outs[-1] 包含当前 chunk 所有帧的 mesh 数据 [BS, 10475, 3]
+                #         vis_pose_output = pose_outs[-1]
 
-                # Compute Attention Map
-                chunk_layer_maps = []
-                num_heads = self.SAM_Engine.cfg.MODEL.DECODER.HEADS # 8
-                sorted_layer_keys = sorted(self.hook_data.keys())
+                # # Compute Attention Map
+                # chunk_layer_maps = []
+                # num_heads = self.SAM_Engine.cfg.MODEL.DECODER.HEADS # 8
+                # sorted_layer_keys = sorted(self.hook_data.keys())
 
-                for l_idx in sorted_layer_keys: # Layer num: 6
-                    q_proj = self.hook_data[l_idx]['q'] # [B, 145, 1024] 1 + 1 + 1 + 2 + 70 + 70
-                    k_proj = self.hook_data[l_idx]['k'] # [B, 512, 1024] 32x16
+                # for l_idx in sorted_layer_keys: # Layer num: 6
+                #     q_proj = self.hook_data[l_idx]['q'] # [B, 145, 1024] 1 + 1 + 1 + 2 + 70 + 70
+                #     k_proj = self.hook_data[l_idx]['k'] # [B, 512, 1024] 32x16
                     
-                    # 计算原始 Attention Map Multihead -> Q @ K.T [B, H, 145, 512]
-                    attn_map_full = self.compute_attention_map(q_proj, k_proj, num_heads)
+                #     # 计算原始 Attention Map Multihead -> Q @ K.T [B, H, 145, 512]
+                #     attn_map_full = self.compute_attention_map(q_proj, k_proj, num_heads)
                     
-                    # 截取 第一 个 Body Parts
-                    # Token 结构推测: [Init(1), Prev(1), Prompt(1), Hand(2), Body2D(70), Body3D(70)]
-                    # self.msg_mgr.log_info(f'Layer {l_idx}: attn_map_full shape: {attn_map_full.shape}, head num: {attn_map_full.shape[1]}, total query tokens: {attn_map_full.shape[2]}')
-                    attn_map_multihead = attn_map_full[:, :, :1, :] # [B, H, 70, HW]
+                #     # 截取 第一 个 Body Parts
+                #     # Token 结构推测: [Init(1), Prev(1), Prompt(1), Hand(2), Body2D(70), Body3D(70)]
+                #     # self.msg_mgr.log_info(f'Layer {l_idx}: attn_map_full shape: {attn_map_full.shape}, head num: {attn_map_full.shape[1]}, total query tokens: {attn_map_full.shape[2]}')
+                #     attn_map_multihead = attn_map_full[:, :, :1, :] # [B, H, 70, HW]
 
-                    # Reshape [B, 8, H, W]
-                    attn_spatial = rearrange(attn_map_multihead, 'b H p (h w) -> b (H p) h w', h=h_feat, w=w_feat)
-                    chunk_layer_maps.append(attn_spatial.cpu())
+                #     # Reshape [B, 8, H, W]
+                #     attn_spatial = rearrange(attn_map_multihead, 'b H p (h w) -> b (H p) h w', h=h_feat, w=w_feat)
+                #     chunk_layer_maps.append(attn_spatial.cpu())
 
-                # chunk_maps: [n*s, Layers, 8, h, w]
-                chunk_maps = torch.stack(chunk_layer_maps, dim=1)
+                # # chunk_maps: [n*s, Layers, 8, h, w]
+                # chunk_maps = torch.stack(chunk_layer_maps, dim=1)
                 
-                # 还原 Batch 维度: [n, s, Layers, 8, h, w]
-                chunk_maps = rearrange(chunk_maps, '(n s) l p h w -> n l p s h w', n=n, s=s)
-                all_attn_maps.append(chunk_maps)
+                # # 还原 Batch 维度: [n, s, Layers, 8, h, w]
+                # chunk_maps = rearrange(chunk_maps, '(n s) l p h w -> n l p s h w', n=n, s=s)
+                # all_attn_maps.append(chunk_maps)
 
             # FPN 组处理 (Group Processing)
             step = len(features_to_use) // self.num_FPN
@@ -471,18 +471,18 @@ class BiggerGait__SAM3DBody__Foundation_Gaitbase_Share(BaseModel):
         for p_idx in range(self.num_parts):
             part_feat_total = torch.cat([chunk_outs[p_idx] for chunk_outs in all_outs], dim=2) # [n, c, s_chunk, h_p, w]
             
-            # B. 独立的 GaitNet Test_2 bin(4) * [N, 256]
+            # B. 独立的 GaitNet Test_2 num_FPN(4) * [N, 256, bin(4)]
             embed, logit = self.Gait_Nets[p_idx].test_2(
                 part_feat_total,
                 seqL
             )
 
-            final_embeds.extend(embed)
-            final_logits.extend(logit)
+            final_embeds.append(embed)
+            final_logits.append(logit)
 
-        # 组装 Embedding 和 Logits
-        embed_list = final_embeds # List of 8 tensors -> part(8) * bin(4) * [N, 256]
-        logits_list = final_logits # List of 8 tensors -> part(8) * bin(4) * [N, num_classes]
+        # 组装 Embedding 和 Logits(num_FPN长的list，在 dim=-1 上拼接) 4 * [N, 256, bin(4)*part(8)]
+        embed_list = [torch.cat([final_embeds[p_idx][bin_idx] for p_idx in range(self.num_parts)], dim=-1) for bin_idx in range(self.num_FPN)]
+        logits_list = [torch.cat([final_logits[p_idx][bin_idx] for p_idx in range(self.num_parts)], dim=-1) for bin_idx in range(self.num_FPN)]
 
         # -------------------------------------------------------
         # Visualization (可视化所有层 + Jet 热力图)
