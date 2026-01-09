@@ -18,6 +18,8 @@ from .BigGait_utils.BigGait_GaitBase import *
 from .BigGait_utils.save_img import save_image, pca_image
 from ..modules import GaitAlign
 
+from torch.utils.checkpoint import checkpoint
+
 # =========================================================================
 # Helper Functions (Keep same as CLIP version)
 # =========================================================================
@@ -514,7 +516,13 @@ class BiggerGait__SAM3DBody__Foundation_Gaitbase_Share(BaseModel):
                 # Reshape: [n, c, s, h, w]
                 part_feat = rearrange(part_feat.view(n, s, -1, part_feat.shape[2], part_feat.shape[3]), 
                                       'n s c h w -> n c s h w').contiguous()
-                out = self.Gait_Nets[p_idx].test_1(part_feat)
+                # Checkpoint 要求输入必须 requires_grad=True 才能触发
+                # 通常 part_feat 来自 backbone，已经具备 grad_fn，但为了保险起见可以检查一下
+                if part_feat.requires_grad:
+                    out = checkpoint(self.Gait_Nets[p_idx].test_1, part_feat, use_reentrant=False)
+                else:
+                    # 如果是在 eval 模式或者第一层就被截断，则不需要 checkpoint
+                    out = self.Gait_Nets[p_idx].test_1(part_feat)
                 chunk_parts_outputs.append(out)
 
             # -> Soft Stream Forward
@@ -523,7 +531,10 @@ class BiggerGait__SAM3DBody__Foundation_Gaitbase_Share(BaseModel):
                 part_feat = rearrange(part_feat.view(n, s, -1, part_feat.shape[2], part_feat.shape[3]), 
                                       'n s c h w -> n c s h w').contiguous()
                 # 使用 Soft Stream 的网络
-                out = self.Soft_Gait_Nets[p_idx].test_1(part_feat)
+                if part_feat.requires_grad:
+                    out = checkpoint(self.Soft_Gait_Nets[p_idx].test_1, part_feat, use_reentrant=False)
+                else:
+                    out = self.Soft_Gait_Nets[p_idx].test_1(part_feat)
                 chunk_parts_outputs.append(out)
 
             all_chunk_outs.append(chunk_parts_outputs)
