@@ -29,19 +29,6 @@ def gradient_hook(grad, name, step, log):
         log.log_info('[{}] Gradient={:.6f}'.format(step, grad.abs().mean().item()))
     return grad
 
-def center_masked_kernel(K, mask_flat):
-    N, HW, _ = K.shape
-    M = mask_flat.sum(dim=1, keepdim=True).unsqueeze(2).float()
-    M = torch.where(M == 0, torch.ones_like(M), M)
-    sum_rows = torch.sum(K, dim=2, keepdim=True)
-    sum_cols = torch.sum(K, dim=1, keepdim=True)
-    row_means = (sum_rows / M) * mask_flat.unsqueeze(2)
-    col_means = (sum_cols / M) * mask_flat.unsqueeze(1)
-    total_mean = torch.sum(K, dim=(1, 2), keepdim=True) / (M ** 2)
-    K_centered = K - row_means - col_means + total_mean
-    mask_matrix = mask_flat.unsqueeze(2) * mask_flat.unsqueeze(1)
-    return K_centered * mask_matrix.float()
-
 class infoDistillation(nn.Module):
     def __init__(self, source_dim, target_dim, p, softmax, Relu, Up=True):
         super(infoDistillation, self).__init__()
@@ -114,7 +101,7 @@ class BiggerGait__SAM3DBody__Foundation_Gaitbase_Share(BaseModel):
 
         self.hook_mask = layer_cfg["hook_mask"] if "hook_mask" in layer_cfg else [False]*16 + [True]*16
         assert len(self.hook_mask) == 32, "hook_mask length must be 32."
-        assert self.hook_mask.count(True) % self.num_FPN == 0, "Number of hook layers must be divisible by num_FPN."
+        assert 32 % self.num_FPN == 0, "num_FPN must divide layer count 32."
 
         total_hooked_layers = sum(self.hook_mask) # 16
         assert total_hooked_layers > 0, "At least one layer must be hooked."
@@ -125,66 +112,27 @@ class BiggerGait__SAM3DBody__Foundation_Gaitbase_Share(BaseModel):
         assert len(self.trans_layer_mask) == 6, "trans_layer_mask length must be 6."
         self.total_attn_layers = self.trans_layer_mask.count(True)
 
-        self.num_hard_parts = model_cfg["num_hard_parts"] # 水平硬切分
-        self.num_soft_parts = model_cfg["num_soft_parts"] # 软分割部分
-        assert self.num_soft_parts == self.total_attn_layers * 8
-        self.total_parts = self.num_hard_parts + self.num_soft_parts
+        self.num_parts = model_cfg["num_parts"] # 水平硬切分
 
         # A. Hard Stream Modules (8 Parts)
         self.Gait_Nets = nn.ModuleList([
-            Baseline_ShareTime_2B(model_cfg) for _ in range(self.num_hard_parts)
+            Baseline_ShareTime_2B(model_cfg) for _ in range(self.num_parts)
         ])
 
-        # B. Soft Stream Modules (layers * 8 Parts)
-        self.Soft_Gait_Nets = nn.ModuleList([
-            Baseline_ShareTime_2B(model_cfg) for _ in range(self.num_soft_parts)
-        ])
-
-        part_target_h = (self.sils_size * 2) // self.num_hard_parts # e.g. 64 // 8 = 8
+        part_target_h = (self.sils_size * 2) // self.num_parts # e.g. 64 // 8 = 8
         part_target_w = self.sils_size # 32
 
-        # =======================================================
-        # 1. 定义公共降维层 (Common Reducer) - Hard 和 Soft 共享
-        # =======================================================
-        # 输入 5120 -> 输出 640
-        # 数量: num_FPN (4个)
-        self.Common_HumanSpace_Reducer = nn.ModuleList([
+        self.HumanSpace_Conv = nn.ModuleList([
             nn.Sequential(
                 nn.BatchNorm2d(human_conv_input_dim, affine=False),
-                nn.Conv2d(human_conv_input_dim, self.f4_dim//2, kernel_size=1), # 5120 -> 640
+                nn.Conv2d(human_conv_input_dim, self.f4_dim//2, kernel_size=1),
                 nn.BatchNorm2d(self.f4_dim//2, affine=False),
                 nn.GELU(),
-            ) for _ in range(self.num_FPN)
-        ])
-
-        # =======================================================
-        # 2. Hard Stream Heads (Lightweight)
-        # =======================================================
-        # 输入 640 -> 输出 16
-        # 数量: num_FPN * num_hard_parts (4 * 8 = 32)
-        # 以前这里是 Heavy Conv，现在只是一个小小的 640->16 投影
-        self.Hard_Part_Heads = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(self.f4_dim//2, self.num_unknown, kernel_size=1), # 640 -> 16
-                ResizeToHW((part_target_h, part_target_w)), 
+                nn.Conv2d(self.f4_dim//2, self.num_unknown, kernel_size=1),
+                ResizeToHW((part_target_h, part_target_w)), # 强制统一尺寸
                 nn.BatchNorm2d(self.num_unknown, affine=False),
                 nn.Sigmoid()
-            ) for _ in range(self.num_FPN * self.num_hard_parts)
-        ])
-
-        # =======================================================
-        # 3. Soft Stream Heads (Lightweight)
-        # =======================================================
-        # 这里的 num_soft_convs = num_FPN * total_attn_layers (4 * 1 = 4)
-        self.num_soft_convs = self.num_FPN * self.total_attn_layers
-        
-        self.Soft_Part_Heads = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(self.f4_dim//2, self.num_unknown, kernel_size=1), # 640 -> 16
-                ResizeToHW((part_target_h, part_target_w)), 
-                nn.BatchNorm2d(self.num_unknown, affine=False),
-                nn.Sigmoid()
-            ) for _ in range(self.num_soft_convs)
+            ) for _ in range(self.num_FPN * self.num_parts)
         ])
         
         self.Mask_Branch = infoDistillation(**model_cfg["Mask_Branch"])
@@ -429,6 +377,9 @@ class BiggerGait__SAM3DBody__Foundation_Gaitbase_Share(BaseModel):
                 sorted_layer_keys = sorted(self.hook_data.keys())
 
                 for l_idx in sorted_layer_keys: # Layer num: 6
+                    if not self.trans_layer_mask[l_idx]:
+                        continue
+
                     q_proj = self.hook_data[l_idx]['q'] # [B, 145, 1024] 1 + 1 + 1 + 2 + 70 + 70
                     k_proj = self.hook_data[l_idx]['k'] # [B, 512, 1024] 32x16
                     
@@ -446,23 +397,15 @@ class BiggerGait__SAM3DBody__Foundation_Gaitbase_Share(BaseModel):
 
                 # chunk_maps: [n*s, Layers, 8, h, w]
                 chunk_maps = torch.stack(chunk_layer_maps, dim=1)
-                
                 # 还原 Batch 维度: [n, s, Layers, 8, h, w]
                 # 把 s 放在 dim=1，方便后续 torch.cat(dim=1)
                 chunk_maps = rearrange(chunk_maps, '(n s) l p h w -> n s l p h w', n=n, s=s)
                 all_attn_maps.append(chunk_maps)
 
-            # 这里的 chunk_maps 是在 CPU 上的 (因为 append 时用了 .cpu())
-            # 我们需要把它放回 GPU 并 reshape
-            # [n, s, l, p, h, w] -> [n*s, l*p(48), h, w]
-            current_chunk_masks = rearrange(chunk_maps.to(rgb_img.device), 'n s l p h w -> (n s) (l p) h w')
-
             # FPN 组处理 (Group Processing)
             step = len(features_to_use) // self.num_FPN
-
             # 准备存储当前 Chunk 的处理结果 [Part_Idx][FPN_Idx]
-            current_chunk_hard_inputs = [[] for _ in range(self.num_hard_parts)]
-            current_chunk_soft_inputs = [[] for _ in range(self.num_soft_parts)]
+            current_chunk_inputs = [[] for _ in range(self.num_parts)]
             
             for i in range(self.num_FPN):
                 # Group & Concat
@@ -476,43 +419,22 @@ class BiggerGait__SAM3DBody__Foundation_Gaitbase_Share(BaseModel):
                 sub_app = partial(nn.LayerNorm, eps=1e-6)(self.f4_dim * len(sub_feats), elementwise_affine=False)(sub_app)
                 sub_app = sub_app.permute(0, 3, 1, 2).contiguous()
 
-                # 🌟 [关键步骤] 全局统一降维 (5120 -> 640)
-                # 这一步现在处理整张图，Hard 和 Soft 都用这个结果
-                sub_app_reduced = self.Common_HumanSpace_Reducer[i](sub_app)
-
-                # --- B. Stream 1: Hard Parts (水平切分) ---
-                # 🌟 现在切分的是降维后的特征 [B, 640, H, W]
-                reduced_hard_parts = torch.chunk(sub_app_reduced, self.num_hard_parts, dim=2)
+                # --- Parts (水平切分) ---
+                parts_feat = torch.chunk(sub_app, self.num_parts, dim=2)
                 
-                for p_idx in range(self.num_hard_parts):
-                    conv_idx = i * self.num_hard_parts + p_idx
-                    
-                    # 通过轻量级 Head: [B, 640, h_part, w] -> [B, 16, h_target, w_target]
-                    processed = self.Hard_Part_Heads[conv_idx](reduced_hard_parts[p_idx])
-                    current_chunk_hard_inputs[p_idx].append(processed)
-
-                # --- C. Stream 2: Soft Parts (Attention Masking) ---
-                # 逻辑保持上次优化后的样子，使用 sub_app_reduced
-                for p_idx in range(self.num_soft_parts):
-                    layer_idx = p_idx // 8 
-                    conv_idx = i * self.total_attn_layers + layer_idx
-                    
-                    mask = current_chunk_masks[:, p_idx:p_idx+1, :, :]
-                    
-                    # [B, 640, H, W] * Mask -> [B, 640, H, W]
-                    masked_feat = sub_app_reduced * mask 
-                    
-                    processed = self.Soft_Part_Heads[conv_idx](masked_feat)
-                    current_chunk_soft_inputs[p_idx].append(processed)
+                for p_idx in range(self.num_parts):
+                    conv_idx = i * self.num_parts + p_idx
+                    processed = self.HumanSpace_Conv[conv_idx](parts_feat[p_idx])
+                    current_chunk_inputs[p_idx].append(processed)
 
             # =======================================================
             # 4. GaitNet Test 1 (Frame Level)
             # =======================================================
-            chunk_parts_outputs = [] # length = num_hard_parts + num_soft_parts
+            chunk_parts_outputs = [] # length = num_parts
 
             # -> Hard Stream Forward
-            for p_idx in range(self.num_hard_parts):
-                part_feat = torch.cat(current_chunk_hard_inputs[p_idx], dim=1) # Concat FPN
+            for p_idx in range(self.num_parts):
+                part_feat = torch.cat(current_chunk_inputs[p_idx], dim=1) # Concat FPN
                 # Reshape: [n, c, s, h, w]
                 part_feat = rearrange(part_feat.view(n, s, -1, part_feat.shape[2], part_feat.shape[3]), 
                                       'n s c h w -> n c s h w').contiguous()
@@ -523,18 +445,7 @@ class BiggerGait__SAM3DBody__Foundation_Gaitbase_Share(BaseModel):
                 else:
                     # 如果是在 eval 模式或者第一层就被截断，则不需要 checkpoint
                     out = self.Gait_Nets[p_idx].test_1(part_feat)
-                chunk_parts_outputs.append(out)
 
-            # -> Soft Stream Forward
-            for p_idx in range(self.num_soft_parts):
-                part_feat = torch.cat(current_chunk_soft_inputs[p_idx], dim=1) # Concat FPN
-                part_feat = rearrange(part_feat.view(n, s, -1, part_feat.shape[2], part_feat.shape[3]), 
-                                      'n s c h w -> n c s h w').contiguous()
-                # 使用 Soft Stream 的网络
-                if part_feat.requires_grad:
-                    out = checkpoint(self.Soft_Gait_Nets[p_idx].test_1, part_feat, use_reentrant=False)
-                else:
-                    out = self.Soft_Gait_Nets[p_idx].test_1(part_feat)
                 chunk_parts_outputs.append(out)
 
             all_chunk_outs.append(chunk_parts_outputs)
@@ -548,20 +459,12 @@ class BiggerGait__SAM3DBody__Foundation_Gaitbase_Share(BaseModel):
         final_embeds_per_fpn = [[] for _ in range(self.num_FPN)]
         final_logits_per_fpn = [[] for _ in range(self.num_FPN)]
 
-        for p_idx in range(self.total_parts):
+        for p_idx in range(self.num_parts):
             # 5.1 拼接时间维度 (dim=2) -> [n, c, S_total, h, w]
             part_feat_total = torch.cat([chunk[p_idx] for chunk in all_chunk_outs], dim=2)
             
-            # 5.2 选择对应的网络
-            if p_idx < self.num_hard_parts:
-                net = self.Gait_Nets[p_idx]
-            else:
-                net = self.Soft_Gait_Nets[p_idx - self.num_hard_parts]
-
-            # 5.3 Test 2: Temporal Pooling + HPP + FCs
-            embed_sub, logit_sub = net.test_2(part_feat_total, seqL)
+            embed_sub, logit_sub = self.Gait_Nets[p_idx].test_2(part_feat_total, seqL)
             
-            # 5.4 按 FPN 层级收集 num_FPN(4) * [N, 256, bin(4)]
             for fpn_idx in range(self.num_FPN):
                 final_embeds_per_fpn[fpn_idx].append(embed_sub[fpn_idx])
                 final_logits_per_fpn[fpn_idx].append(logit_sub[fpn_idx])
@@ -569,7 +472,7 @@ class BiggerGait__SAM3DBody__Foundation_Gaitbase_Share(BaseModel):
         # =======================================================
         # 6. Final Concatenation
         # =======================================================
-        # 组装 Embedding 和 Logits(num_FPN长的list，在 dim=-1 上拼接) 4 * [N, 256, bin(4)*(num_hard_parts+num_soft_parts)]
+        # 组装 Embedding 和 Logits(num_FPN长的list，在 dim=-1 上拼接) 4 * [N, 256, bin(4)*num_parts]
         embed_list = [torch.cat(parts, dim=-1) for parts in final_embeds_per_fpn]
         log_list = [torch.cat(parts, dim=-1) for parts in final_logits_per_fpn]
 

@@ -44,8 +44,7 @@ model_cfg:
   image_size: 256                                                                 
   sils_size: 32                 
 
-  num_hard_parts: 8            
-  num_soft_parts: 8                                      
+  num_parts: 8                                     
   
   # DINOv3 ViT-Huge 维度
   source_dim: 1280
@@ -56,8 +55,8 @@ model_cfg:
   num_FPN: 4  # [要求3] FPN 数量
   
   layer_config:
-    # trans_layer_mask: [True, True, True, True, True, True]
-    trans_layer_mask: [False, False, True, False, False, False]
+    trans_layer_mask: [True, True, True, True, True, True]
+    # trans_layer_mask: [False, False, True, True, False, False]
 
     hook_mask: 
       - False # 0
