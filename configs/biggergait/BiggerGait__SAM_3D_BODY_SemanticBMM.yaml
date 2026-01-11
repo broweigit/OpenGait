@@ -11,7 +11,7 @@ evaluator_cfg:
   enable_float16: true
   restore_ckpt_strict: False
   restore_hint: 10000
-  save_name: BiggerGait__SAM3DBody__Foundation_Gaitbase_Share
+  save_name: BiggerGait__SAM3DBody__SemanticBMM_Gaitbase_Share
   eval_func: evaluate_CCPG_part
   sampler:
     batch_shuffle: false
@@ -35,7 +35,7 @@ loss_cfg:
 
 model_cfg:
   chunk_size: 8
-  model: BiggerGait__SAM3DBody__Foundation_Gaitbase_Share
+  model: BiggerGait__SAM3DBody__SemanticBMM
   # 这里填写 sam-3d-body 源码的绝对路径，代码会自动添加到 sys.path
   pretrained_lvm: pretrained_LVMs/sam-3d-body
   pretrained_mask_branch: BYPASS
@@ -49,10 +49,9 @@ model_cfg:
   # DINOv3 ViT-Huge 维度
   source_dim: 1280
   
-  # =========================================================
-  # 🌟 新增：精确层控制配置
-  # =========================================================
-  num_FPN: 4  # [要求3] FPN 数量
+  num_FPN: 4 
+
+  semantic_layer_idx: 2  # 🌟 新增：选择用于 Semantic Pooling 的层索引
   
   layer_config:
     trans_layer_mask: [True, True, True, True, True, True]
@@ -155,7 +154,7 @@ trainer_cfg:
   restore_ckpt_strict: true
   restore_hint: 0
   save_iter: 5000
-  save_name: BiggerGait__SAM3DBody__Foundation_Gaitbase_Share
+  save_name: BiggerGait__SAM3DBody__SemanticBMM_Gaitbase_Share
   sync_BN: true
   total_iter: 30000
   sampler:
