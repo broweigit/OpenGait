@@ -434,13 +434,6 @@ def evaluate_CCPG_part(data, dataset, metric='euc'):
     msg_mgr.log_info(">>> Running Part-based Evaluation (Strict Alignment: 3D Input)...")
     msg_mgr.log_info("#" * 60)
 
-    # ================= [结构配置区] =================
-    TEST_PARTS = True
-    NUM_FPN_HEADS = 4       
-    PARTS_PER_HEAD = 32     
-    EXPECTED_TOTAL_P = NUM_FPN_HEADS * PARTS_PER_HEAD # 128
-    # ===============================================
-
     # 1. 数据解包
     feature = data['embeddings']
     label = data['labels']
@@ -450,6 +443,28 @@ def evaluate_CCPG_part(data, dataset, metric='euc'):
     if isinstance(feature, torch.Tensor): feature = feature.detach().cpu().numpy()
     if isinstance(label, torch.Tensor): label = label.detach().cpu().numpy()
     else: label = np.array(label)
+
+    # 4. 形状检查与动态配置 (合并到这里)
+    try:
+        if feature.ndim != 3:
+            msg_mgr.log_info(f"Error: Feature shape {feature.shape} is not [N, C, P]!")
+            return {}
+        N, C, P = feature.shape
+    except ValueError:
+        return {}
+
+    # ================= [结构配置区] =================
+    TEST_PARTS = True
+    NUM_FPN_HEADS = 4  
+    # ===============================================
+
+    # [关键修改]：动态计算每个 Head 的 Part 数量
+    if P % NUM_FPN_HEADS != 0:
+        msg_mgr.log_warning(f"Warning: Total parts {P} cannot be evenly divided by {NUM_FPN_HEADS} heads!")
+    
+    PARTS_PER_HEAD = P // NUM_FPN_HEADS  # 动态计算，例如 128->32, 240->60
+    
+    msg_mgr.log_info(f"Dynamic Config: Total Parts={P}, Heads={NUM_FPN_HEADS}, Parts/Head={PARTS_PER_HEAD}")
 
     # 2. View 处理
     if len(view) > 0 and "_" in view[0]:
@@ -462,15 +477,6 @@ def evaluate_CCPG_part(data, dataset, metric='euc'):
     # 3. 序列定义
     probe_seq_dict = {'CCPG': [["U0_D0_BG", "U0_D0"], ["U3_D3"], ["U1_D0"], ["U0_D0_BG"]]}
     gallery_seq_dict = {'CCPG': [["U1_D1", "U2_D2", "U3_D3"], ["U0_D3"], ["U1_D1"], ["U0_D0"]]}
-    
-    # 4. 形状检查
-    try:
-        N, C, P = feature.shape
-        if P != EXPECTED_TOTAL_P:
-            msg_mgr.log_warning(f"Warning: Expected {EXPECTED_TOTAL_P} parts, got {P}.")
-    except ValueError:
-        msg_mgr.log_info(f"Error: Feature shape {feature.shape} is not [N, C, P]!")
-        return {}
 
     # === [关键修改 1] 动态 de_diag (不硬编码除以10) ===
     def de_diag(acc, each_angle=False):

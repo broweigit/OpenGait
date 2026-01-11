@@ -149,9 +149,11 @@ class BiggerGait__SAM3DBody__SemanticBMM(BaseModel):
 
         # 2. 语义 GaitNet
         # 关键修改：我们需要一个独立的 TP 模块处理语义向量
-        # 这里的输入将是 [B, C, K, 1]，其中 K=28 是 Semantic Parts
+        # 这里的输入将是 [B, C, K, 1]，其中 K=14 是 Semantic Parts
         semantic_cfg = model_cfg.copy()
-        semantic_cfg['bin_num'] = [28] 
+        semantic_cfg['bin_num'] = [14]
+        semantic_cfg['SeparateFCs']['parts_num'] = sum(semantic_cfg['bin_num'])
+        semantic_cfg['SeparateBNNecks']['parts_num'] = sum(semantic_cfg['bin_num'])
         self.Semantic_Gait_Net = Baseline_ShareTime_2B(semantic_cfg)
 
         # 保持 Mask Branch 结构以免报错，但在 BMM 方案中主要用于辅助或直接跳过
@@ -332,7 +334,7 @@ class BiggerGait__SAM3DBody__SemanticBMM(BaseModel):
                 # 计算 Attn: [B, H, N_query(145), N_key(HW)]
                 attn_map_full = self.compute_attention_map(q_proj, k_proj, num_heads)
                 
-                # 提取 Body Tokens (28-42=28)不包含左右手部分对应的 Attention
+                # 提取 Body Tokens (70-42=28)不包含左右手部分对应的 Attention
                 # Token Index: 5 (Init+Prompt等) : 5+28 (Body2D)
                 # 我们取 Body 2D/3D tokens。通常 Body 2D tokens (index 5:75) 对特征图响应最强
                 KEY_HAND = list(range(21, 63))
@@ -426,18 +428,13 @@ class BiggerGait__SAM3DBody__SemanticBMM(BaseModel):
             all_chunk_outs_hard.append(chunk_hard_res)
 
             # --- Semantic Parts GaitNet Call 🌟 ---
-            # chunk_semantic_out 是个 list [FPN_0, FPN_1...]
-            # 我们需要 Concat FPN: [B, 256, 28, 1] x 4 -> [B, 1024, 28, 1] -> Split back inside?
-            # 不，GaitBase 习惯输入是 [n, c, s, h, w]。这里 c 是 FPN 后的 concat 维度吗？
-            # 这里的逻辑参考上面 Hard Parts: 
-            # HumanSpace_Conv 输出的是 [B, 256, H, W]，然后 concat FPN -> [B, 1024, H, W] -> View -> GaitNet
             
             semantic_feat_total = torch.cat(chunk_semantic_out, dim=1) # [B, 1024, 28, 1]
             semantic_feat_total = rearrange(semantic_feat_total.view(n, s, -1, semantic_feat_total.shape[2], semantic_feat_total.shape[3]),
                                             'n s c h w -> n c s h w').contiguous()
             
             # 使用 Semantic GaitNet 处理
-            # 输入: [n, 1024, s, 28, 1]
+            # semantic_feat_total: [n, c, S_chunk, 14, 1]
             if semantic_feat_total.requires_grad:
                 sem_out = checkpoint(self.Semantic_Gait_Net.test_1, semantic_feat_total, use_reentrant=False)
             else:
@@ -461,12 +458,12 @@ class BiggerGait__SAM3DBody__SemanticBMM(BaseModel):
                 final_logits_per_fpn[fpn_idx].append(logit_sub[fpn_idx])
 
         # 2. Process Semantic Parts (BMM) 🌟
-        # [n, c, S_total, 28, 1]
+        # [n, c, S_total, 14, 1]
         sem_feat_total = torch.cat(all_chunk_outs_semantic, dim=2)
         sem_embed, sem_logit = self.Semantic_Gait_Net.test_2(sem_feat_total, seqL)
         
         # 将语义特征合并到列表中
-        # 此时 sem_embed 是 [num_FPN] 列表，每个元素是 [n, c, 28] (因为 bin_num=28)
+        # 此时 sem_embed 是 [num_FPN] 列表，每个元素是 [n, c, 14] (因为 bin_num=14)
         for fpn_idx in range(self.num_FPN):
             final_embeds_per_fpn[fpn_idx].append(sem_embed[fpn_idx])
             final_logits_per_fpn[fpn_idx].append(sem_logit[fpn_idx])
