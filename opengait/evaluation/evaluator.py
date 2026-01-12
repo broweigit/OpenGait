@@ -598,6 +598,188 @@ def evaluate_CCPG_part(data, dataset, metric='euc'):
 
     return {}
 
+def evaluate_CCPG_part_FPN6(data, dataset, metric='euc'):
+    msg_mgr = get_msg_mgr()
+    
+    # =======================================================
+    # 0. 先跑一次标准评测 (以便对比 Baseline: 82.560%)
+    # =======================================================
+    msg_mgr.log_info("\n" + "#" * 60)
+    msg_mgr.log_info(">>> Running Standard CCPG Evaluation First...")
+    msg_mgr.log_info("#" * 60)
+    try:
+        evaluate_CCPG(data.copy(), dataset, metric)
+    except Exception as e:
+        msg_mgr.log_warning(f"Standard evaluate_CCPG failed: {e}")
+
+    msg_mgr.log_info("\n" + "#" * 60)
+    msg_mgr.log_info(">>> Running Part-based Evaluation (Strict Alignment: 3D Input)...")
+    msg_mgr.log_info("#" * 60)
+
+    # 1. 数据解包
+    feature = data['embeddings']
+    label = data['labels']
+    seq_type = data['types']
+    view = data['views']
+
+    if isinstance(feature, torch.Tensor): feature = feature.detach().cpu().numpy()
+    if isinstance(label, torch.Tensor): label = label.detach().cpu().numpy()
+    else: label = np.array(label)
+
+    # 4. 形状检查与动态配置 (合并到这里)
+    try:
+        if feature.ndim != 3:
+            msg_mgr.log_info(f"Error: Feature shape {feature.shape} is not [N, C, P]!")
+            return {}
+        N, C, P = feature.shape
+    except ValueError:
+        return {}
+
+    # ================= [结构配置区] =================
+    TEST_PARTS = True
+    NUM_FPN_HEADS = 6  
+    # ===============================================
+
+    # [关键修改]：动态计算每个 Head 的 Part 数量
+    if P % NUM_FPN_HEADS != 0:
+        msg_mgr.log_warning(f"Warning: Total parts {P} cannot be evenly divided by {NUM_FPN_HEADS} heads!")
+    
+    PARTS_PER_HEAD = P // NUM_FPN_HEADS  # 动态计算，例如 128->32, 240->60
+    
+    msg_mgr.log_info(f"Dynamic Config: Total Parts={P}, Heads={NUM_FPN_HEADS}, Parts/Head={PARTS_PER_HEAD}")
+
+    # 2. View 处理
+    if len(view) > 0 and "_" in view[0]:
+        view = [v.split("_")[0] for v in view]
+    
+    view_np = np.array(view)
+    view_list = sorted(list(set(view))) 
+    view_num = len(view_list)
+    
+    # 3. 序列定义
+    probe_seq_dict = {'CCPG': [["U0_D0_BG", "U0_D0"], ["U3_D3"], ["U1_D0"], ["U0_D0_BG"]]}
+    gallery_seq_dict = {'CCPG': [["U1_D1", "U2_D2", "U3_D3"], ["U0_D3"], ["U1_D1"], ["U0_D0"]]}
+
+    # === [关键修改 1] 动态 de_diag (不硬编码除以10) ===
+    def de_diag(acc, each_angle=False):
+        # 1. 标记有效数据 (非 -1)
+        valid_mask = (acc != -1)
+        # 2. 排除对角线
+        diag_indices = np.diag_indices_from(acc)
+        valid_mask[diag_indices] = False
+        
+        # 3. 计算分子和分母
+        sum_acc = np.sum(acc * valid_mask, axis=1)
+        count_valid = np.sum(valid_mask, axis=1)
+        
+        # 防止除以0
+        count_valid[count_valid == 0] = 1.0
+        result = sum_acc / count_valid
+        
+        if not each_angle:
+            # 同样只对有有效数据的行求平均
+            valid_rows = (count_valid > 0)
+            if np.sum(valid_rows) > 0:
+                result = np.mean(result[valid_rows])
+            else:
+                result = 0.0
+        return result
+
+    # === [关键修改 2] 评测核心 (支持 3D 输入，不 Flatten) ===
+    def run_evaluation_core(feat_input, title_suffix=""):
+        # feat_input: 期望是 [N, C, P]
+        
+        # 如果是单 Part [N, C]，需要增加维度变成 [N, C, 1] 以适配 cuda_dist
+        if feat_input.ndim == 2:
+            feat_input = feat_input[:, :, np.newaxis]
+
+        final_results = []
+
+        for p, probe_seq in enumerate(probe_seq_dict[dataset]):
+            gallery_seq = gallery_seq_dict[dataset][p]
+            
+            g_seq_mask = np.isin(seq_type, gallery_seq)
+            p_seq_mask = np.isin(seq_type, probe_seq)
+            
+            if np.sum(g_seq_mask) == 0 or np.sum(p_seq_mask) == 0:
+                final_results.append(0.0)
+                continue
+
+            feat_p = feat_input[p_seq_mask]
+            feat_g = feat_input[g_seq_mask]
+            
+            # [关键点] 传入 3D Tensor，cuda_dist 计算 Sum(L2)，与 Standard 对齐
+            distmat = cuda_dist(feat_p, feat_g, metric).cpu().numpy()
+
+            view_p_sub = view_np[p_seq_mask]
+            view_g_sub = view_np[g_seq_mask]
+            label_p_sub = label[p_seq_mask]
+            label_g_sub = label[g_seq_mask]
+
+            # [关键修改 3] 初始化为 -1
+            acc_matrix = np.full((view_num, view_num), -1.0)
+
+            for v1, probe_view in enumerate(view_list):
+                for v2, gallery_view in enumerate(view_list):
+                    p_idx = np.where(view_p_sub == probe_view)[0]
+                    g_idx = np.where(view_g_sub == gallery_view)[0]
+                    
+                    if len(p_idx) == 0 or len(g_idx) == 0:
+                        continue 
+
+                    dist_subset = distmat[np.ix_(p_idx, g_idx)]
+                    
+                    sorted_indices = np.argsort(dist_subset, axis=1)
+                    rank1_idx = sorted_indices[:, 0]
+                    
+                    pred_labels = label_g_sub[g_idx][rank1_idx]
+                    gt_labels = label_p_sub[p_idx]
+                    
+                    correct = (pred_labels == gt_labels)
+                    acc_val = np.mean(correct) * 100
+                    acc_matrix[v1, v2] = acc_val
+
+            avg_acc = de_diag(acc_matrix)
+            final_results.append(avg_acc)
+
+        r1_str = ', '.join([f'{x:.1f}' for x in final_results])
+        msg_mgr.log_info(f'{title_suffix:<25} | Rank-1: {r1_str}')
+
+    # 5. 执行评估
+
+    # (A) Full Feature [N, C, 128] -> 3D Input -> Sum Logic
+    msg_mgr.log_info("\n" + "="*40)
+    msg_mgr.log_info("1. Full Feature Evaluation (Sum of Parts)")
+    msg_mgr.log_info("="*40)
+    # [FIX] 不要 reshape! 直接传 3D Tensor
+    run_evaluation_core(feature, title_suffix="[ALL Combined]")
+
+    # (B) FPN Head & Part Evaluation
+    if TEST_PARTS:
+        msg_mgr.log_info("\n" + "="*40)
+        msg_mgr.log_info(f"2. FPN Branch Evaluation")
+        msg_mgr.log_info("="*40)
+        
+        for head_idx in range(NUM_FPN_HEADS):
+            msg_mgr.log_info(f"\n>>> [FPN Head {head_idx}]")
+            
+            start = head_idx * PARTS_PER_HEAD
+            end = start + PARTS_PER_HEAD
+            
+            # [FIX] Head 整体 [N, C, 32] -> 3D Input -> Sum Logic
+            # 同样不要 flatten
+            head_feat_chunk = feature[:, :, start:end] 
+            run_evaluation_core(head_feat_chunk, title_suffix=f"[Head-{head_idx} Full]")
+
+            # 单个 Part [N, C, 1]
+            for part_idx in range(PARTS_PER_HEAD):
+                abs_idx = start + part_idx
+                # 切片保持 3D 维度
+                part_feat = feature[:, :, abs_idx : abs_idx+1]
+                run_evaluation_core(part_feat, title_suffix=f"  - Part {part_idx:02d}")
+
+    return {}
+
 import pandas as pd
 def evaluate_simple_split(data, dataset, metric='euc'):
     """
