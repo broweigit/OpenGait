@@ -80,13 +80,13 @@ model_cfg:
   SeparateFCs:
     in_channels: 512
     out_channels: 256
-    parts_num: 28
+    parts_num: 29
   SeparateBNNecks:
     class_num: 100
     in_channels: 256
-    parts_num: 28
+    parts_num: 29
   bin_num:
-    - 28
+    - 29
 
 optimizer_cfg:
   lr: 0.1

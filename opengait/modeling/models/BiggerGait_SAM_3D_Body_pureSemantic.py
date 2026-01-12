@@ -155,7 +155,7 @@ class BiggerGait__SAM3DBody__PureSemantic(BaseModel):
         
         # 提前定义好需要保留的 Body Token 索引
         KEY_HAND = list(range(21, 63))
-        self.body_indices = torch.tensor([i for i in range(5, 5 + 70) if i not in KEY_HAND], dtype=torch.long)
+        self.body_indices = torch.tensor([0] + [i for i in range(5, 5 + 70) if i not in KEY_HAND], dtype=torch.long)
         
         def get_layer_output_hook(layer_idx):
             def hook(module, input, output):
