@@ -122,7 +122,7 @@ class BiggerGait__SAM3DBody__AttnMask(BaseModel):
                 nn.BatchNorm2d(self.f4_dim//2, affine=False),
                 nn.GELU(),
                 nn.Conv2d(self.f4_dim//2, self.num_unknown, kernel_size=1),
-                ResizeToHW((part_target_h, part_target_w)),
+                # ResizeToHW((part_target_h, part_target_w)),
                 nn.BatchNorm2d(self.num_unknown, affine=False),
                 nn.Sigmoid()
             ) for _ in range(self.num_FPN)
@@ -323,7 +323,7 @@ class BiggerGait__SAM3DBody__AttnMask(BaseModel):
 
             # semantic_attn [B, 29, 2048]
             semantic_attn = rearrange(semantic_attn, 'b k (c h w) -> (b k) c h w', h=h_feat, w=w_feat, c=1)
-            semantic_attn = F.interpolate(semantic_attn, (h_feat * 2, w_feat * 2), mode='bilinear')
+            # semantic_attn = F.interpolate(semantic_attn, (h_feat * 2, w_feat * 2), mode='bilinear')
             min_val = semantic_attn.amin(dim=(2, 3), keepdim=True) # [B, K, 1, 1]
             max_val = semantic_attn.amax(dim=(2, 3), keepdim=True)
             semantic_attn = (semantic_attn - min_val) / (max_val - min_val + 1e-6)
