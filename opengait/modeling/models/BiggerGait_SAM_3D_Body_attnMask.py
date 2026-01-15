@@ -122,6 +122,7 @@ class BiggerGait__SAM3DBody__AttnMask(BaseModel):
                 nn.BatchNorm2d(self.f4_dim//2, affine=False),
                 nn.GELU(),
                 nn.Conv2d(self.f4_dim//2, self.num_unknown, kernel_size=1),
+                # 取消插值操作
                 # ResizeToHW((part_target_h, part_target_w)),
                 nn.BatchNorm2d(self.num_unknown, affine=False),
                 nn.Sigmoid()
@@ -323,11 +324,13 @@ class BiggerGait__SAM3DBody__AttnMask(BaseModel):
 
             # semantic_attn [B, 29, 2048]
             semantic_attn = rearrange(semantic_attn, 'b k (c h w) -> (b k) c h w', h=h_feat, w=w_feat, c=1)
+            # 取消插值操作
             # semantic_attn = F.interpolate(semantic_attn, (h_feat * 2, w_feat * 2), mode='bilinear')
-            min_val = semantic_attn.amin(dim=(2, 3), keepdim=True) # [B, K, 1, 1]
-            max_val = semantic_attn.amax(dim=(2, 3), keepdim=True)
-            semantic_attn = (semantic_attn - min_val) / (max_val - min_val + 1e-6)
-            semantic_attn = (semantic_attn > 0.3).float()
+            # 取消归一化与二值化操作，直接使用 soft attention
+            # min_val = semantic_attn.amin(dim=(2, 3), keepdim=True) # [B, K, 1, 1]
+            # max_val = semantic_attn.amax(dim=(2, 3), keepdim=True)
+            # semantic_attn = (semantic_attn - min_val) / (max_val - min_val + 1e-6)
+            # semantic_attn = (semantic_attn > 0.3).float()
             semantic_attn = rearrange(semantic_attn, '(b k) c h w -> b k c h w', b=n*s, k=29) # [B, 29, 1, 64, 32]
 
             # ========================================================
@@ -358,7 +361,8 @@ class BiggerGait__SAM3DBody__AttnMask(BaseModel):
                 out = self.Gait_Net.test_1(part_feat) # [(n p), 16*4, s, 32, 16]
 
             out = rearrange(out, '(n p) c s h w -> n p c s h w', n=n, p=29).contiguous()
-            out = out.sum(dim=1) # [n, 16*4, s, 32, 16]
+            # out = out.sum(dim=1) # [n, 16*4, s, 32, 16]
+            out = out.max(dim=1)[0] # [n, 16*4, s, 32, 16]
             all_chunk_outs.append(out) # chunks * [n, 16*4, s, 32, 16]
 
         # =======================================================
