@@ -318,20 +318,25 @@ class BiggerGait__SAM3DBody__AttnMask(BaseModel):
                 # 我们需要 [B, 29, HW] 的权重用于 BMM
                 semantic_attn = semantic_attn_heads.mean(dim=1) 
                 
-                # 保存用于可视化 (Reshape back to spatial)
-                attn_spatial_vis = rearrange(semantic_attn[:, :, :], 'b p (h w) -> b p h w', h=h_feat, w=w_feat)
-                all_attn_maps.append(rearrange(attn_spatial_vis.detach().cpu(), '(n s) p h w -> n s p h w', n=n, s=s))
+                # # 保存用于可视化 (Reshape back to spatial)
+                # attn_spatial_vis = rearrange(semantic_attn[:, :, :], 'b p (h w) -> b p h w', h=h_feat, w=w_feat)
+                # all_attn_maps.append(rearrange(attn_spatial_vis.detach().cpu(), '(n s) p h w -> n s p h w', n=n, s=s))
 
             # semantic_attn [B, 29, 2048]
             semantic_attn = rearrange(semantic_attn, 'b k (c h w) -> (b k) c h w', h=h_feat, w=w_feat, c=1)
-            # 取消插值操作
+            # # 取消插值操作
             # semantic_attn = F.interpolate(semantic_attn, (h_feat * 2, w_feat * 2), mode='bilinear')
             # 取消归一化与二值化操作，直接使用 soft attention
-            # min_val = semantic_attn.amin(dim=(2, 3), keepdim=True) # [B, K, 1, 1]
-            # max_val = semantic_attn.amax(dim=(2, 3), keepdim=True)
-            # semantic_attn = (semantic_attn - min_val) / (max_val - min_val + 1e-6)
-            # semantic_attn = (semantic_attn > 0.3).float()
+            min_val = semantic_attn.amin(dim=(2, 3), keepdim=True) # [B, K, 1, 1]
+            max_val = semantic_attn.amax(dim=(2, 3), keepdim=True)
+            semantic_attn = (semantic_attn - min_val) / (max_val - min_val + 1e-6)
+            semantic_attn = (semantic_attn > 0.4).float()
             semantic_attn = rearrange(semantic_attn, '(b k) c h w -> b k c h w', b=n*s, k=29) # [B, 29, 1, 64, 32]
+
+            # 在这里收集 Attention Maps 以便可视化
+            # semantic_attn: [B, 29, 1, H, W] -> squeeze(2) -> [B, 29, H, W] -> rearrange -> [n, s, 29, H, W]
+            if self.training and torch.distributed.get_rank() == 0:
+                 all_attn_maps.append(rearrange(semantic_attn.squeeze(2).detach().cpu(), '(n s) p h w -> n s p h w', n=n, s=s))
 
             # ========================================================
             # FPN Feature Aggregation
@@ -385,6 +390,16 @@ class BiggerGait__SAM3DBody__AttnMask(BaseModel):
                 # all_attn_maps: List of [n, s, P=8, h, w]
                 map_total = torch.cat(all_attn_maps, dim=1) # [n, S, P, h, w]
                 vis_data = map_total[0, 0].detach().cpu() # [P, h, w]
+
+                # 3. 🌟 新增：可视化 "Max Combined" (全身覆盖情况)
+                # 把 29 张图取 Max，看看拼起来是不是完整的人体
+                max_combined, _ = vis_data.max(dim=0) # [h, w]
+                max_combined = F.interpolate(max_combined[None, None], size=vis_img.shape[1:], mode='bilinear')[0,0]
+                max_norm = (max_combined - max_combined.min()) / (max_combined.max() - max_combined.min() + 1e-6)
+                heatmap_np = cm.magma(max_norm.numpy())[..., :3] # 使用 magma 配色区分
+                heatmap = torch.from_numpy(heatmap_np).permute(2, 0, 1).float()
+                overlay = vis_img * 0.3 + heatmap * 0.7
+                vis_dict['image/1_combined_parts'] = overlay.clamp(0, 1)
 
                 for pid in range(vis_data.shape[0]):
                     att = vis_data[pid]
