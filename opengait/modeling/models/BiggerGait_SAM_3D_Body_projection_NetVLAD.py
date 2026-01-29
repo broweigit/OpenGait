@@ -453,7 +453,13 @@ class BiggerGait_SAM3D_NetVLAD(BaseModel):
                         fpn_feats_for_this_sample.append(feats)
                     
                     combined_feats_b = torch.cat(fpn_feats_for_this_sample, dim=1)
-                    features_per_person[person_idx].append(combined_feats_b)
+                    # features_per_person[person_idx].append(combined_feats_b) # memory cost: 4 人 x 8 帧 x ~2000 点 x 2048 维
+
+                    # 注意：虽然我们在 with torch.no_grad() 下，但 dim_reduce 需要训练。我们需要手动 set_grad_enabled
+                    with torch.set_grad_enabled(self.training):
+                        combined_feats_b = self.dim_reduce(combined_feats_b) # [1, 2048, N]
+
+                    features_per_person[person_idx].append(combined_feats_b) # 存的是小张量
 
                     # =======================================================
                     # 🌟 [插入] 可视化逻辑 (只在 Rank 0 的第一帧触发一次)
@@ -468,69 +474,68 @@ class BiggerGait_SAM3D_NetVLAD(BaseModel):
                             vis_rgb = (vis_rgb - vis_rgb.min()) / (vis_rgb.max() - vis_rgb.min() + 1e-6)
                             vis_dict['image/00_original'] = vis_rgb
 
-                            # 2. 特征图对齐检查 (PCA)
-                            # 使用 FPN 第一组特征 sub_feats_list[0] 的第 b 个样本
-                            # shape: [1280, Hf, Wf]
-                            feat_raw = features_to_use[0][b].detach().cpu().float()
-                            _, Hf, Wf = feat_raw.shape
+                            # # 2. 特征图对齐检查 (PCA)
+                            # # 使用 FPN 第一组特征 sub_feats_list[0] 的第 b 个样本
+                            # # shape: [1280, Hf, Wf]
+                            # feat_raw = features_to_use[0][b].detach().cpu().float()
+                            # _, Hf, Wf = feat_raw.shape
                             
-                            # PCA
-                            feat_rgb = compute_pca_rgb(feat_raw.permute(1, 2, 0)) # [H, W, 3]
-                            feat_rgb_np = feat_rgb.numpy().astype(np.float32)
+                            # # PCA
+                            # feat_rgb = compute_pca_rgb(feat_raw.permute(1, 2, 0)) # [H, W, 3]
+                            # feat_rgb_np = feat_rgb.numpy().astype(np.float32)
 
-                            # 重算坐标用于画点
-                            # 注意：我们需要过滤后的点 filtered_verts 在特征图上的位置
-                            # 这里需要重新做一次 grid_sample 前的坐标计算步骤
-                            _v_cam = filtered_verts[0] + cur_cam_t.unsqueeze(0)
-                            _x, _y, _z = _v_cam[:, 0], _v_cam[:, 1], _v_cam[:, 2].clamp(min=1e-3)
-                            _u = (_x / _z) * cur_cam_int[0, 0] + cur_cam_int[0, 2]
-                            _v = (_y / _z) * cur_cam_int[1, 1] + cur_cam_int[1, 2]
+                            # # 重算坐标用于画点
+                            # # 注意：我们需要过滤后的点 filtered_verts 在特征图上的位置
+                            # # 这里需要重新做一次 grid_sample 前的坐标计算步骤
+                            # _v_cam = filtered_verts[0] + cur_cam_t.unsqueeze(0)
+                            # _x, _y, _z = _v_cam[:, 0], _v_cam[:, 1], _v_cam[:, 2].clamp(min=1e-3)
+                            # _u = (_x / _z) * cur_cam_int[0, 0] + cur_cam_int[0, 2]
+                            # _v = (_y / _z) * cur_cam_int[1, 1] + cur_cam_int[1, 2]
                             
-                            # 归一化坐标转特征图坐标
-                            # u_norm = 2 * u / W - 1 -> feat = (u_norm + 1)/2 * Wf - 0.5
-                            # 简化: feat = u / W * Wf - 0.5 (不考虑 align_corners 的细微差别，可视化够用了)
-                            feat_u = (_u / target_w * Wf - 0.5).detach().cpu().numpy()
-                            feat_v = (_v / target_h * Hf - 0.5).detach().cpu().numpy()
+                            # # 归一化坐标转特征图坐标
+                            # # u_norm = 2 * u / W - 1 -> feat = (u_norm + 1)/2 * Wf - 0.5
+                            # # 简化: feat = u / W * Wf - 0.5 (不考虑 align_corners 的细微差别，可视化够用了)
+                            # feat_u = (_u / target_w * Wf - 0.5).detach().cpu().numpy()
+                            # feat_v = (_v / target_h * Hf - 0.5).detach().cpu().numpy()
 
-                            # 绘图 PCA
-                            fig = plt.figure(figsize=(8, 8))
-                            ax = fig.add_subplot(111)
-                            ax.imshow(feat_rgb_np, extent=[-0.5, Wf-0.5, Hf-0.5, -0.5], interpolation='nearest', origin='upper')
+                            # # 绘图 PCA
+                            # fig = plt.figure(figsize=(8, 8))
+                            # ax = fig.add_subplot(111)
+                            # ax.imshow(feat_rgb_np, extent=[-0.5, Wf-0.5, Hf-0.5, -0.5], interpolation='nearest', origin='upper')
                             
-                            # 绘制红点
-                            mask = (feat_u >= -0.5) & (feat_u < Wf-0.5) & (feat_v >= -0.5) & (feat_v < Hf-0.5)
-                            ax.scatter(feat_u[mask], feat_v[mask], s=12, c='red', alpha=0.6, edgecolors='none')
-                            ax.set_title("Feature Alignment (FPN Layer 0)")
+                            # # 绘制红点
+                            # mask = (feat_u >= -0.5) & (feat_u < Wf-0.5) & (feat_v >= -0.5) & (feat_v < Hf-0.5)
+                            # ax.scatter(feat_u[mask], feat_v[mask], s=12, c='red', alpha=0.6, edgecolors='none')
+                            # ax.set_title("Feature Alignment (FPN Layer 0)")
 
-                            # DEBUG保存文件(时间戳命名）
-                            import time
-                            time_stamp = int(time.time())
-                            plt.savefig(f"debug_feature_pca_align_{time_stamp}.png", bbox_inches='tight', pad_inches=0)
+                            # # # DEBUG保存文件(时间戳命名）
+                            # # import time
+                            # # time_stamp = int(time.time())
+                            # # plt.savefig(f"debug_feature_pca_align_{time_stamp}.png", bbox_inches='tight', pad_inches=0)
                             
-                            # 转 Tensor
-                            # --- [修复] Matplotlib 3.8+ 兼容写法 ---
-                            fig.canvas.draw()
+                            # # 转 Tensor
+                            # # --- [修复] Matplotlib 3.8+ 兼容写法 ---
+                            # fig.canvas.draw()
                             
-                            # 1. 获取 RGBA buffer
-                            data = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+                            # # 1. 获取 RGBA buffer
+                            # data = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
                             
-                            # 2. Reshape [H, W, 4]
-                            data = data.reshape(fig.canvas.get_width_height()[::-1] + (4,))
+                            # # 2. Reshape [H, W, 4]
+                            # data = data.reshape(fig.canvas.get_width_height()[::-1] + (4,))
                             
-                            # 3. Drop Alpha -> [H, W, 3]
-                            data_rgb = data[..., :3]
+                            # # 3. Drop Alpha -> [H, W, 3]
+                            # data_rgb = data[..., :3]
                             
-                            plt.close(fig)
+                            # plt.close(fig)
                             
-                            vis_dict['image/02_feature_pca_align'] = torch.from_numpy(data_rgb.copy()).float().permute(2, 0, 1) / 255.0
+                            # vis_dict['image/02_feature_pca_align'] = torch.from_numpy(data_rgb.copy()).float().permute(2, 0, 1) / 255.0
 
-                            # 3. 3D 投影对齐检查
-                            vis_dict['image/01_projection_align'] = self.debug_project_and_viz(
-                                batch_rgb[b], filtered_verts[0], cur_cam_t, cur_cam_int, "debug_proj_latest.png"
-                            )
+                            # # 3. 3D 投影对齐检查
+                            # vis_dict['image/01_projection_align'] = self.debug_project_and_viz(
+                            #     batch_rgb[b], filtered_verts[0], cur_cam_t, cur_cam_int, "debug_proj_latest.png"
+                            # )
                             
                             has_captured_vis = True
-                            print("[DEBUG] Visualization captured successfully.")
 
                         except Exception as e:
                             print(f"[DEBUG ERROR] Visualization failed: {e}")
@@ -545,10 +550,9 @@ class BiggerGait_SAM3D_NetVLAD(BaseModel):
             if len(p_list) > 0:
                 person_merged_feats = torch.cat(p_list, dim=2)
             else:
-                person_merged_feats = torch.zeros(1, self.total_input_dim, 1, device=rgb.device)
+                person_merged_feats = torch.zeros(1, self.total_target_dim, 1, device=rgb.device)
             
-            proj_feats = self.dim_reduce(person_merged_feats)
-            vlad_out = self.net_vlad(proj_feats) # [1, 2048, K]
+            vlad_out = self.net_vlad(person_merged_feats) # [1, 2048, K]
             parts_features_list.append(vlad_out)
             
         parts_features = torch.cat(parts_features_list, dim=0) # [n, 2048, K]
