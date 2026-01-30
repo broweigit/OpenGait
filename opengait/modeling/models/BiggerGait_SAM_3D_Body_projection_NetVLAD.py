@@ -313,13 +313,14 @@ class BiggerGait_SAM3D_NetVLAD(BaseModel):
 
         view_dir = torch.nn.functional.normalize(-v_cam, p=2, dim=-1)
         is_front = (v_normals * view_dir).sum(dim=-1) > 0.05
-        is_visible_strict = self.filter_occluded_vertices_strict(vertices, faces, cam_t)
+        # is_visible_strict = self.filter_occluded_vertices_strict(vertices, faces, cam_t)
 
         u_feat = (u / W_img * Wf).long().clamp(0, Wf - 1)
         v_feat = (v / H_img * Hf).long().clamp(0, Hf - 1)
         pixel_idx = v_feat * Wf + u_feat 
         
-        valid_indices_mask = in_frustum & is_visible_strict & is_front
+        # valid_indices_mask = in_frustum & is_visible_strict & is_front
+        valid_indices_mask = in_frustum & is_front
         valid_indices = torch.where(valid_indices_mask)[0]
         
         if len(valid_indices) == 0:
