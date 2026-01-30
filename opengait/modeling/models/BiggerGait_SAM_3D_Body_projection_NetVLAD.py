@@ -453,11 +453,10 @@ class BiggerGait_SAM3D_NetVLAD(BaseModel):
                         fpn_feats_for_this_sample.append(feats)
                     
                     combined_feats_b = torch.cat(fpn_feats_for_this_sample, dim=1)
-                    # features_per_person[person_idx].append(combined_feats_b) # memory cost: 4 人 x 8 帧 x ~2000 点 x 2048 维
 
-                    # 注意：虽然我们在 with torch.no_grad() 下，但 dim_reduce 需要训练。我们需要手动 set_grad_enabled
-                    with torch.set_grad_enabled(self.training):
-                        combined_feats_b = self.dim_reduce(combined_feats_b) # [1, 2048, N]
+                    # # 注意：虽然我们在 with torch.no_grad() 下，但 dim_reduce 需要训练。我们需要手动 set_grad_enabled
+                    # with torch.set_grad_enabled(self.training):
+                    #     combined_feats_b = self.dim_reduce(combined_feats_b) # [1, 2048, N]
 
                     features_per_person[person_idx].append(combined_feats_b) # 存的是小张量
 
@@ -546,14 +545,17 @@ class BiggerGait_SAM3D_NetVLAD(BaseModel):
         # 2. NetVLAD
         # =========================================================
         parts_features_list = []
-        for p_idx, p_list in enumerate(features_per_person):
+        for p_list in features_per_person:
             if len(p_list) > 0:
-                person_merged_feats = torch.cat(p_list, dim=2)
-            else:
-                person_merged_feats = torch.zeros(1, self.total_target_dim, 1, device=rgb.device)
-            
-            vlad_out = self.net_vlad(person_merged_feats) # [1, 2048, K]
-            parts_features_list.append(vlad_out)
+                # 这里 p_list 存的是原始 20480 维特征
+                merged = torch.cat(p_list, dim=2) # [1, 20480, Total_N]
+                
+                # 针对这一个人，进行一次性降维（比逐帧快，比全Batch省显存）
+                with torch.set_grad_enabled(self.training):
+                    merged = self.dim_reduce(merged) # 20480 -> 2048
+                    
+                vlad_out = self.net_vlad(merged) # [1, 2048, K]
+                parts_features_list.append(vlad_out)
             
         parts_features = torch.cat(parts_features_list, dim=0) # [n, 2048, K]
         
