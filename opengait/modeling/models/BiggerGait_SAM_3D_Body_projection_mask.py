@@ -1,0 +1,490 @@
+import sys
+import os
+import torch
+import torch.nn as nn
+import torch.utils.checkpoint
+from einops import rearrange
+from ..base_model import BaseModel
+from torch.nn import functional as F
+from functools import partial
+
+# import GaitBase
+from .BigGait_utils.BigGait_GaitBase import *
+from .BigGait_utils.save_img import save_image, pca_image
+from ..modules import GaitAlign
+
+# =========================================================================
+# Helper Functions
+# =========================================================================
+
+class infoDistillation(nn.Module):
+    def __init__(self, source_dim, target_dim, p, softmax, Relu, Up=True):
+        super(infoDistillation, self).__init__()
+        self.dropout = nn.Dropout(p=p)
+        self.bn_s = nn.BatchNorm1d(source_dim, affine=False)
+        self.bn_t = nn.BatchNorm1d(target_dim, affine=False)
+        if Relu:
+            self.down_sampling = nn.Sequential(
+                nn.Linear(source_dim, source_dim//2),
+                nn.BatchNorm1d(source_dim//2, affine=False),
+                nn.GELU(),
+                nn.Linear(source_dim//2, target_dim),
+                )
+            if Up:
+                self.up_sampling = nn.Sequential(
+                    nn.Linear(target_dim, source_dim//2),
+                    nn.BatchNorm1d(source_dim//2, affine=False),
+                    nn.GELU(),
+                    nn.Linear(source_dim//2, source_dim),
+                    )
+        else:
+            self.down_sampling = nn.Linear(source_dim, target_dim)
+            if Up:
+                self.up_sampling = nn.Linear(target_dim, source_dim)
+        self.softmax = softmax
+        self.mse = nn.MSELoss()
+        self.Up = Up
+
+    def forward(self, x):
+        d_x = self.down_sampling(self.bn_s(self.dropout(x)))
+        if self.softmax:
+            d_x = F.softmax(d_x, dim=1)
+            if self.Up:
+                u_x = self.up_sampling(d_x)
+                return d_x, torch.mean(self.mse(u_x, x))
+            else:
+                return d_x, None
+        else:
+            if self.Up:
+                u_x = self.up_sampling(d_x)
+                return torch.sigmoid(self.bn_t(d_x)), torch.mean(self.mse(u_x, x))
+            else:
+                return torch.sigmoid(self.bn_t(d_x)), None
+
+class ResizeToHW(torch.nn.Module):
+    def __init__(self, target_size):
+        super().__init__()
+        self.target_size = target_size
+
+    def forward(self, x):
+        return F.interpolate(x, size=self.target_size, mode='bilinear', align_corners=False)
+
+# =========================================================================
+# Main Model
+# =========================================================================
+
+class BiggerGait__SAM3DBody__Projection_Mask_Gaitbase_Share(BaseModel):
+    def build_network(self, model_cfg):
+        # 1. 基础参数
+        self.pretrained_lvm = model_cfg["pretrained_lvm"]
+        self.pretrained_mask_branch = model_cfg["pretrained_mask_branch"]
+        self.image_size = model_cfg["image_size"]
+        self.sils_size = model_cfg["sils_size"]
+        self.f4_dim = model_cfg["source_dim"]
+        self.num_unknown = model_cfg["num_unknown"]
+        self.num_FPN = model_cfg["num_FPN"]
+
+        # FPN Configuration
+        layer_cfg = model_cfg.get("layer_config", {})
+        self.layers_per_group = layer_cfg.get("layers_per_group", 2)
+        
+        # Hook Mask
+        if "hook_mask" in layer_cfg:
+            self.hook_mask = layer_cfg["hook_mask"]
+        else:
+            self.hook_mask = [False]*16 + [True]*16 # Default Top-16
+
+        self.total_hooked_layers = sum(self.hook_mask)
+        
+        # Dimensions Check
+        if self.total_hooked_layers % self.layers_per_group != 0:
+            raise ValueError(f"Hook layers ({self.total_hooked_layers}) must be divisible by group size ({self.layers_per_group})")
+        
+        self.total_groups = self.total_hooked_layers // self.layers_per_group
+        
+        if self.total_groups % self.num_FPN != 0:
+            raise ValueError(f"Total groups ({self.total_groups}) must be divisible by FPN heads ({self.num_FPN})")
+
+        self.layers_per_head = self.total_hooked_layers // self.num_FPN
+        input_dim = self.f4_dim * self.layers_per_head
+        
+        self.chunk_size = model_cfg.get("chunk_size", 96)
+
+        # GaitNet & PreConv
+        self.Gait_Net = Baseline_ShareTime_2B(model_cfg)
+        self.Pre_Conv = nn.Sequential(nn.Identity())
+
+        # FPN Heads
+        self.HumanSpace_Conv = nn.ModuleList([
+            nn.Sequential(
+                nn.BatchNorm2d(input_dim, affine=False),
+                nn.Conv2d(input_dim, self.f4_dim//2, kernel_size=1),
+                nn.BatchNorm2d(self.f4_dim//2, affine=False),
+                nn.GELU(),
+                nn.Conv2d(self.f4_dim//2, self.num_unknown, kernel_size=1),
+                ResizeToHW((self.sils_size*2, self.sils_size)),
+                nn.BatchNorm2d(self.num_unknown, affine=False),
+                nn.Sigmoid()
+            ) for _ in range(self.num_FPN)
+        ])
+        
+        # Mask Branch (Keep structure but not used for projection logic)
+        self.Mask_Branch = infoDistillation(**model_cfg["Mask_Branch"])
+        
+        self.init_SAM_Backbone()
+        # Skip loading mask branch weights if not needed
+        # self.init_Mask_Branch() 
+
+    def init_SAM_Backbone(self):
+        if self.pretrained_lvm not in sys.path:
+            sys.path.insert(0, self.pretrained_lvm)
+        
+        try:
+            from notebook.utils import setup_sam_3d_body
+        except ImportError as e:
+            raise ImportError(f"Cannot import setup_sam_3d_body. Error: {e}")
+
+        self.msg_mgr.log_info(f"[SAM3D] Loading SAM 3D Body (Encoder + Decoder)...")
+        estimator = setup_sam_3d_body(hf_repo_id="facebook/sam-3d-body-dinov3", device='cpu')
+        
+        # 🌟 修改点：保留 SAM_Engine 用于 Decoder 推理
+        self.SAM_Engine = estimator.model
+        
+        # 获取 Backbone 引用用于 Hook
+        if hasattr(self.SAM_Engine, 'backbone'):
+            raw_backbone = self.SAM_Engine.backbone
+        elif hasattr(self.SAM_Engine, 'image_encoder'):
+            raw_backbone = self.SAM_Engine.image_encoder
+        else:
+            raise RuntimeError("Cannot find backbone in SAM Engine")
+
+        if hasattr(raw_backbone, 'encoder'):
+            self.Backbone = raw_backbone.encoder
+        else:
+            self.Backbone = raw_backbone
+        
+        self.SAM_Engine.cpu() # 先放 CPU
+
+        # ================= Hook Logic =================
+        self.intermediate_features = {}
+        self.hook_handles = []
+
+        def get_activation(idx_in_list):
+            def hook(model, input, output):
+                if isinstance(output, (list, tuple)): output = output[0]
+                if isinstance(output, (list, tuple)): output = output[0]
+                self.intermediate_features[idx_in_list] = output
+            return hook
+
+        all_blocks = []
+        if hasattr(self.Backbone, 'blocks'):
+            all_blocks = self.Backbone.blocks
+        elif hasattr(self.Backbone, 'layers'):
+            all_blocks = self.Backbone.layers
+        else:
+            raise RuntimeError("Cannot find blocks in Backbone")
+
+        hook_count = 0
+        for layer_idx, should_hook in enumerate(self.hook_mask):
+            if should_hook:
+                handle = all_blocks[layer_idx].register_forward_hook(get_activation(hook_count))
+                self.hook_handles.append(handle)
+                hook_count += 1
+        
+        self.msg_mgr.log_info(f"[SAM3D] Hooked {hook_count} layers.")
+        
+        # Freeze Everything
+        self.SAM_Engine.eval()
+        for param in self.SAM_Engine.parameters():
+            param.requires_grad = False
+
+    def init_parameters(self):
+        for m in self.modules():
+            if isinstance(m, (nn.Conv3d, nn.Conv2d, nn.Conv1d)):
+                nn.init.xavier_uniform_(m.weight.data)
+                if m.bias is not None: nn.init.constant_(m.bias.data, 0.0)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight.data)
+                if m.bias is not None: nn.init.constant_(m.bias.data, 0.0)
+            elif isinstance(m, (nn.BatchNorm3d, nn.BatchNorm2d, nn.BatchNorm1d)):
+                if m.affine:
+                    nn.init.normal_(m.weight.data, 1.0, 0.02)
+                    nn.init.constant_(m.bias.data, 0.0)
+
+        # Re-initialize SAM (since modules() init might have messed it up)
+        self.init_SAM_Backbone()
+        
+        self.SAM_Engine.eval()
+        self.SAM_Engine.requires_grad_(False)
+
+        n_parameters = sum(p.numel() for p in self.parameters())
+        self.msg_mgr.log_info('All Model Count: {:.5f}M'.format(n_parameters / 1e6))
+
+    # --- 🌟 Helper: Prepare Dummy Batch for SAM Decoder ---
+    def _prepare_dummy_batch(self, image_embeddings, target_h, target_w):
+        B = image_embeddings.shape[0]
+        device = image_embeddings.device
+        
+        estimated_focal_length = max(target_h, target_w) * 1.1
+        cx, cy = target_w / 2.0, target_h / 2.0
+        
+        cam_int = torch.eye(3, device=device).unsqueeze(0).expand(B, 3, 3).clone()
+        cam_int[:, 0, 0] = estimated_focal_length 
+        cam_int[:, 1, 1] = estimated_focal_length 
+        cam_int[:, 0, 2] = cx
+        cam_int[:, 1, 2] = cy
+        
+        y_grid, x_grid = torch.meshgrid(
+            torch.arange(target_h, device=device),
+            torch.arange(target_w, device=device),
+            indexing='ij'
+        )
+        ray_x = (x_grid - cx) / estimated_focal_length
+        ray_y = (y_grid - cy) / estimated_focal_length
+        ray_cond = torch.stack([ray_x, ray_y], dim=0).unsqueeze(0).expand(B, 2, target_h, target_w)
+
+        bbox_scale = torch.tensor([max(target_h, target_w)], device=device).unsqueeze(0).unsqueeze(0).expand(B, 1, 1)
+        bbox_center = torch.tensor([cx, cy], device=device).unsqueeze(0).unsqueeze(0).expand(B, 1, 2)
+        img_size = torch.tensor([float(target_w), float(target_h)], device=device).unsqueeze(0).unsqueeze(0).expand(B, 1, 2)
+        affine_trans = torch.tensor([[1., 0., 0.], [0., 1., 0.]], device=device).unsqueeze(0).unsqueeze(0).expand(B, 1, 2, 3)
+
+        return {
+            "img": torch.zeros(B, 1, 3, target_h, target_w, device=device),
+            "ori_img_size": img_size, "img_size": img_size, "bbox_center": bbox_center,
+            "bbox_scale": bbox_scale, "cam_int": cam_int, "affine_trans": affine_trans,
+            "ray_cond": ray_cond, 
+        }
+
+    # --- 🌟 Helper: Project Vertices to Generate Mask ---
+    def project_vertices_to_mask(self, vertices, cam_t, cam_int, H_feat, W_feat, target_H, target_W):
+        """
+        vertices: [B, N, 3]
+        cam_t: [B, 3]
+        cam_int: [B, 3, 3]
+        H_feat, W_feat: 特征图尺寸 (e.g. 32, 16)
+        """
+        B, N, _ = vertices.shape
+        device = vertices.device
+        
+        # 1. World to Camera
+        v_cam = vertices + cam_t.unsqueeze(1) # [B, N, 3]
+        x, y, z = v_cam[..., 0], v_cam[..., 1], v_cam[..., 2]
+        z = z.clamp(min=1e-3) # Avoid division by zero
+        
+        # 2. Camera to Image (Pixel Coords)
+        fx, fy = cam_int[:, 0, 0].unsqueeze(1), cam_int[:, 1, 1].unsqueeze(1)
+        cx, cy = cam_int[:, 0, 2].unsqueeze(1), cam_int[:, 1, 2].unsqueeze(1)
+        
+        u = (x / z) * fx + cx # Range: [0, target_W]
+        v = (y / z) * fy + cy # Range: [0, target_H]
+        
+        # 3. Scale to Feature Map Size
+        # 我们需要在特征图尺度上生成 Mask
+        u_feat = (u / target_W * W_feat).long()
+        v_feat = (v / target_H * H_feat).long()
+        
+        # 4. Clip to bounds
+        u_feat = u_feat.clamp(0, W_feat - 1)
+        v_feat = v_feat.clamp(0, H_feat - 1)
+        
+        # 5. Create Mask using Scatter
+        # 初始化全 0 Mask [B, 1, H, W]
+        mask = torch.zeros(B, 1, H_feat, W_feat, device=device)
+        
+        # Flatten indices: idx = v * W + u
+        flat_indices = v_feat * W_feat + u_feat # [B, N]
+        
+        # Prepare src: all ones
+        ones = torch.ones_like(flat_indices, dtype=torch.float)
+        
+        # Flatten mask: [B, H*W]
+        mask_flat = mask.view(B, -1)
+        
+        # Scatter add (or just assign 1s)
+        # mask_flat.scatter_add_(1, flat_indices, ones)
+        # 由于顶点密集，我们不需要叠加计数，只需要知道“有”
+        # 使用 scatter_ 赋值 1.0
+        mask_flat.scatter_(1, flat_indices, ones)
+        
+        # Reshape back
+        mask = mask_flat.view(B, 1, H_feat, W_feat)
+        
+        # # 6. Morphological Dilation (膨胀)
+        # # 因为 SMPL 顶点可能有缝隙，做一次 3x3 MaxPool 相当于膨胀，填补空洞
+        # mask = F.max_pool2d(mask, kernel_size=3, stride=1, padding=1)
+        
+        return mask
+
+    def preprocess(self, sils, h, w, mode='bilinear'):
+        return F.interpolate(sils, (h, w), mode=mode, align_corners=False)
+
+    def min_max_norm(self, x):
+        return (x - x.min())/(x.max() - x.min())
+
+    def forward(self, inputs):
+        ipts, labs, ty, vi, seqL = inputs
+        rgb = ipts[0]
+        del ipts
+
+        CHUNK_SIZE = self.chunk_size # e.g. 4
+        rgb_chunks = torch.chunk(rgb, (rgb.size(1)//CHUNK_SIZE)+1, dim=1)
+        
+        all_outs = []
+        
+        # 图像目标尺寸 (512, 256)
+        target_h, target_w = self.image_size * 2, self.image_size 
+        # 特征图尺寸 (32, 16) -> Mask 在这里生成
+        h_feat, w_feat = target_h // 16, target_w // 16 
+
+        for _, rgb_img in enumerate(rgb_chunks):
+            n, s, c, h, w = rgb_img.size()
+            rgb_img = rearrange(rgb_img, 'n s c h w -> (n s) c h w').contiguous()
+            curr_bs = rgb_img.shape[0]
+            
+            with torch.no_grad():
+                # 1. Resize & Backbone
+                outs = self.preprocess(rgb_img, target_h, target_w)
+                self.intermediate_features = {}
+                _ = self.Backbone(outs)
+                
+                # 2. SAM Decoder Preparation
+                last_hook_idx = len(self.hook_handles) - 1
+                sam_emb = self.intermediate_features[last_hook_idx] # [B, 517, 1280]
+                
+                # 🌟 [关键修复] DINOv3 (B,N,C) -> SAM (B,C,H,W)
+                # DINOv3 output: [Batch, Tokens(517), Channels(1280)]
+                # Tokens = 512 (Spatial) + 5 (CLS/Registers)
+                target_tokens = h_feat * w_feat # 512
+                
+                # A. 剔除 CLS/Registers，只保留 Spatial Tokens
+                if sam_emb.shape[1] > target_tokens:
+                    sam_emb = sam_emb[:, -target_tokens:, :] # [B, 512, 1280]
+                
+                # B. 变换维度 [B, N, C] -> [B, C, N] -> [B, C, H, W]
+                sam_emb = sam_emb.transpose(1, 2) # [B, 1280, 512]
+                sam_emb = sam_emb.reshape(curr_bs, -1, h_feat, w_feat) # [B, 1280, 32, 16]
+                
+                # Prepare Inputs
+                dummy_batch = self._prepare_dummy_batch(sam_emb, target_h, target_w)
+                self.SAM_Engine._batch_size = curr_bs
+                self.SAM_Engine._max_num_person = 1
+                self.SAM_Engine.body_batch_idx = torch.arange(curr_bs, device=rgb.device)
+                self.SAM_Engine.hand_batch_idx = []
+                cond_info = torch.zeros(curr_bs, 3, device=rgb.device); cond_info[:, 2] = 1.1
+                dummy_kp = torch.zeros(curr_bs, 1, 3, device=rgb.device); dummy_kp[..., -1] = -2
+
+                # 3. Run Decoder
+                with torch.amp.autocast(enabled=False, device_type='cuda'):
+                     _, pose_outs = self.SAM_Engine.forward_decoder(
+                        image_embeddings=sam_emb, 
+                        keypoints=dummy_kp, 
+                        condition_info=cond_info, 
+                        batch=dummy_batch
+                    )
+                
+                # 4. 生成 Mask (32x16)
+                pred_verts = pose_outs[-1]['pred_vertices'] 
+                pred_cam_t = pose_outs[-1]['pred_cam_t']    
+                cam_int = dummy_batch['cam_int']            
+                
+                generated_mask = self.project_vertices_to_mask(
+                    pred_verts, pred_cam_t, cam_int, 
+                    h_feat, w_feat, target_h, target_w
+                ) # [B, 1, 32, 16]
+                
+                # 5. 收集特征用于 FPN
+                # 注意：我们这里收集的还是 [B, N, C] 格式，因为后面 FPN 处理逻辑是基于 Token 的
+                # 但我们需要在这里就应用 Mask
+                
+                # 先把 Mask 展平以便与 Token 对应: [B, 1, 32, 16] -> [B, 512, 1]
+                mask_flat = generated_mask.view(curr_bs, -1, 1) # [B, 512, 1]
+                
+                features_to_use = []
+                for i in range(len(self.hook_handles)):
+                    feat = self.intermediate_features[i] # [B, 517, 1280]
+                    # 剔除 CLS
+                    if feat.shape[1] > target_tokens:
+                        feat = feat[:, -target_tokens:, :] # [B, 512, 1280]
+                    
+                    # 🌟 [关键优化] Early Masking
+                    # 直接在源头特征上乘以 Mask，背景变 0
+                    feat = feat * mask_flat 
+                    
+                    features_to_use.append(feat)
+
+            # =======================================================
+            # 6. FPN Processing (Masked Features)
+            # =======================================================
+            processed_feat_list = []
+            step = len(features_to_use) // self.num_FPN
+            
+            for i in range(self.num_FPN):
+                start_idx = i * step
+                end_idx = (i + 1) * step
+                sub_feats = features_to_use[start_idx : end_idx]
+                
+                # A. 拼接特征 [B, 512, C*step]
+                sub_app = torch.concat(sub_feats, dim=-1) 
+                
+                # B. Reshape 成 2D [B, C_total, 32, 16]
+                # transpose: [B, 512, C] -> [B, C, 512] -> view -> [B, C, 32, 16]
+                sub_app = rearrange(sub_app, 'b (h w) c -> b c h w', h=h_feat).contiguous()
+                
+                # C. Pre_Conv & LayerNorm
+                sub_app = self.Pre_Conv(sub_app)
+                sub_app = rearrange(sub_app, 'b c h w -> b (h w) c')
+                curr_dim = self.f4_dim * len(sub_feats)
+                sub_app = partial(nn.LayerNorm, eps=1e-6)(curr_dim, elementwise_affine=False)(sub_app)
+                sub_app = rearrange(sub_app, 'b (h w) c -> b c h w', h=h_feat).contiguous()
+                
+                # D. FPN Head (HumanSpace_Conv)
+                # 这一步包含 Conv + Upsample (ResizeToHW)
+                # 由于输入已经被 Mask (背景为0)，卷积后的背景依然是 0 (或接近0)，上采样后也是 0
+                reduced_feat = self.HumanSpace_Conv[i](sub_app) # [B, 64, 64, 32]
+                
+                processed_feat_list.append(reduced_feat)
+                
+                del sub_app, sub_feats
+
+            # 7. 拼接 FPN 输出
+            human_feat = torch.concat(processed_feat_list, dim=1) # [B, Total_C, 64, 32]
+            
+            # 8. Reshape for GaitNet [n, c, s, h, w]
+            human_feat = rearrange(human_feat.view(n, s, -1, self.sils_size*2, self.sils_size), 'n s c h w -> n c s h w').contiguous()
+
+            # 9. GaitNet Part 1
+            outs = self.Gait_Net.test_1(human_feat)
+            all_outs.append(outs)
+
+        # GaitNet Part 2
+        embed_list, log_list = self.Gait_Net.test_2(
+            torch.cat(all_outs, dim=2),
+            seqL,
+        )
+        
+        if self.training:
+            retval = {
+                'training_feat': {
+                    'triplet': {'embeddings': torch.concat(embed_list, dim=-1), 'labels': labs},
+                    'softmax': {'logits': torch.concat(log_list, dim=-1), 'labels': labs},
+                },
+                'visual_summary': {
+                    'image/rgb_img': rgb_img.view(n*s, c, h, w)[:5].float(),
+                    # 可视化生成的 Low-Res Mask 验证效果
+                    'image/generated_3d_mask_lowres': generated_mask.view(n*s, 1, h_feat, w_feat)[:5].float(),
+                },
+                'inference_feat': {
+                    'embeddings': torch.concat(embed_list, dim=-1),
+                    **{f'embeddings_{i}': embed_list[i] for i in range(self.num_FPN)}
+                }
+            }
+        else:
+            retval = {
+                'training_feat': {},
+                'visual_summary': {},
+                'inference_feat': {
+                    'embeddings': torch.concat(embed_list, dim=-1),
+                    **{f'embeddings_{i}': embed_list[i] for i in range(self.num_FPN)}
+                }
+            }
+        return retval
