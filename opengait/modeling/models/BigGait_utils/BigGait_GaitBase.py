@@ -389,6 +389,92 @@ class Baseline_Single(nn.Module):
         _, logits = self.BNNecks(embed_1)  # [n, c, p]
         return embed_1, logits
     
+from ...modules import SemanticPartPooling, TemporalMotionAggregator
+class Baseline_Part_Single(nn.Module):
+    def __init__(self, model_cfg):
+        super(Baseline_Part_Single, self).__init__()
+        self.pre_rgb = SetBlockWrapper(Pre_ResNet9(**model_cfg['backbone_cfg']))
+        self.post_backbone = SetBlockWrapper(Post_ResNet9(**model_cfg['backbone_cfg']))
+        # 🌟 1. 初始化新模块
+        self.SPP = SemanticPartPooling(geo_order=2) # 开启5通道几何矩
+        self.TMA = TemporalMotionAggregator()
+        # 🌟 2. 调整 FC 输入维度 = 原始特征通道 + 5 (几何通道)
+        self.parts_num = 6 
+        in_c = model_cfg['SeparateFCs']['in_channels'] + 5 
+        out_c = model_cfg['SeparateFCs']['out_channels']
+        # ==================== 🌟 修复部分 Start ====================
+        # 处理 SeparateFCs 的参数冲突
+        fc_cfg = model_cfg['SeparateFCs'].copy()
+        # 移除冲突键，防止 **fc_cfg 解包时与位置参数打架
+        fc_cfg.pop('in_channels', None)
+        fc_cfg.pop('out_channels', None)
+        fc_cfg.pop('parts_num', None)
+        
+        self.FCs = SeparateFCs(self.parts_num, in_c, out_c, **fc_cfg)
+        
+        # 处理 SeparateBNNecks 的参数冲突
+        # SeparateBNNecks 定义: (parts_num, in_channels, class_num, ...)
+        bn_cfg = model_cfg['SeparateBNNecks'].copy()
+        bn_cfg.pop('in_channels', None) # 这里的 in_channels 对应上面的 out_c
+        bn_cfg.pop('parts_num', None)
+        
+        # 注意: bn_cfg 里面应该包含 'class_num'，这里直接解包即可
+        self.BNNecks = SeparateBNNecks(self.parts_num, out_c, **bn_cfg)
+        # ==================== 🌟 修复部分 End ====================
+
+    def get_backbone(self, backbone_cfg):
+        """Get the backbone of the model."""
+        if is_dict(backbone_cfg):
+            Backbone = get_attr_from([backbones], backbone_cfg['type'])
+            valid_args = get_valid_args(Backbone, backbone_cfg, ['type'])
+            return Backbone(**valid_args)
+        if is_list(backbone_cfg):
+            Backbone = nn.ModuleList([self.get_backbone(cfg)
+                                      for cfg in backbone_cfg])
+            return Backbone
+        raise ValueError(
+            "Error type for -Backbone-Cfg-, supported: (A list of) dict.")
+
+    def pre_forward(self, appearance, *args, **kwargs):
+        outs = self.pre_rgb(appearance, *args, **kwargs)  # [n, c, s, h, w]
+        outs = self.post_backbone(outs, *args, **kwargs)
+        return outs
+
+    def forward(self, appearance, seqL, *args, **kwargs):
+        outs = self.pre_rgb(appearance, *args, **kwargs)  # [n, c, s, h, w]
+        outs = self.post_backbone(outs, *args, **kwargs)
+        # Temporal Pooling, TP
+        outs = self.TP(outs, seqL, options={"dim": 2})[0]  # [n, c, h, w]
+        # Horizontal Pooling Matching, HPM
+        outs = self.HPP(outs)  # [n, c, p]
+        embed_1 = self.FCs(outs)  # [n, c, p]
+        _, logits = self.BNNecks(embed_1)  # [n, c, p]
+        return embed_1, logits
+    
+    def test_1(self, appearance, *args, **kwargs):
+        outs = self.pre_rgb(appearance, *args, **kwargs)  # [n, c, s, h, w]
+        outs = self.post_backbone(outs, *args, **kwargs)
+        return outs
+
+    # 🌟 3. 重写 test_2
+    def test_2(self, x, seqL, parts_mask):
+        # x: [n, c, s, h, w]
+        # parts_mask: [n, s, 6, h, w]
+        
+        # Step 1: 空间-几何提取 (Space) -> [n, c+5, s, 6]
+        part_feats_seq = self.SPP(x, parts_mask)
+        
+        # Step 2: 时序动态聚合 (Time) -> [n, c+5, 6]
+        # 这里的 embed_1 包含了纹理特征和 (速度, 角速度, 形变速率)
+        embed_1 = self.TMA(part_feats_seq) 
+        
+        # Step 3: 映射与分类
+        # FC 层会自动学习几何特征与纹理特征的非线性组合
+        embed_1 = self.FCs(embed_1) 
+        _, logits = self.BNNecks(embed_1)
+        
+        return embed_1, logits
+    
 import math
 def get_timestep_embedding(timesteps, embedding_dim, max_timesteps=40, frequency_scaling=10):
     """
@@ -500,6 +586,61 @@ class Baseline_ShareTime_2B(nn.Module):
         log_list = []
         for i in range(self.num_FPN):
             embed_1, logits = self.Gait_List[i].test_2(x_list[i], seqL)
+            embed_list.append(embed_1)
+            log_list.append(logits)
+        return embed_list, log_list
+    
+class Baseline_Part_ShareTime_2B(nn.Module):
+    def __init__(self, model_cfg):
+        super(Baseline_Part_ShareTime_2B, self).__init__()
+        self.num_FPN = model_cfg['num_FPN']
+        # 只改这里
+        self.Gait_Net_1 = Baseline_Part_Single(model_cfg)
+        self.Gait_Net_2 = Baseline_Part_Single(model_cfg)
+        self.Gait_List = nn.ModuleList(
+            [self.Gait_Net_1 for _ in range(self.num_FPN - self.num_FPN//2)] +
+            [self.Gait_Net_2 for _ in range(self.num_FPN//2)]
+        )
+        # self.Gait_List = nn.ModuleList([
+        #     self.Gait_Net for _ in range(self.num_FPN)
+        # ])
+
+        self.t_channel = 256
+        self.temb_proj = nn.Sequential(
+            nn.Linear(self.t_channel, self.t_channel),
+            nn.ReLU(),
+            nn.Linear(self.t_channel, self.t_channel),
+        )
+
+    def forward(self, x, seqL):
+        x = self.test_1(x)
+        embed_list, log_list = self.test_2(x, seqL)
+        return embed_list, log_list
+
+    def test_1(self, x, *args, **kwargs):
+        # x: [n, c, s, h, w]
+        n,c,s,h,w = x.shape
+        x_list = list(torch.chunk(x, self.num_FPN, dim=1))
+        t = torch.tensor(list(range(self.num_FPN))).to(x).view(1,-1).repeat(n*s,1)
+        for i in range(self.num_FPN):
+            
+            temb = get_timestep_embedding(t[:,i], self.t_channel, max_timesteps=self.num_FPN).to(x)
+            temb = self.temb_proj(temb)
+
+            x_list[i] = self.Gait_List[i].test_1(x_list[i], temb=temb, *args, **kwargs)
+        x = torch.concat(x_list, dim=1)
+        return x
+
+    def test_2(self, x, seqL, parts_mask): # 新增 parts_mask
+        # x: [n, c, s, h, w]
+        # parts_mask: [n, s, 6, h, w]
+        
+        x_list = torch.chunk(x, self.num_FPN, dim=1)
+        embed_list = []
+        log_list = []
+        for i in range(self.num_FPN):
+            # 这里的 parts_mask 对所有 FPN 层是共用的
+            embed_1, logits = self.Gait_List[i].test_2(x_list[i], seqL, parts_mask)
             embed_list.append(embed_1)
             log_list.append(logits)
         return embed_list, log_list

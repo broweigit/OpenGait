@@ -5,6 +5,90 @@ import torch.nn.functional as F
 from utils import clones, is_list_or_tuple
 from torchvision.ops import RoIAlign
 
+class SemanticPartPooling(nn.Module):
+    def __init__(self, geo_order=2):
+        super(SemanticPartPooling, self).__init__()
+        self.geo_order = geo_order
+        
+    def forward(self, x, parts_mask):
+        n, c, s, h, w = x.size()
+        device = x.device
+        
+        # 1. Mask 对齐
+        parts_mask = rearrange(parts_mask, 'n s p h w -> (n s) p h w')
+        if parts_mask.shape[-2:] != (h, w):
+            parts_mask = F.interpolate(parts_mask, size=(h, w), mode='nearest')
+        parts_mask = rearrange(parts_mask, '(n s) p h w -> n s p h w', n=n)
+        
+        # 🌟 关键修正：计算每个部位是否存在 (面积是否 > 0)
+        # m_expand: [n, 1, s, p, h, w]
+        m_expand = parts_mask.unsqueeze(1)
+        # part_exists: [n, 1, s, p] (布尔值)
+        part_exists = m_expand.sum(dim=(-2, -1)) > 1e-6
+
+        # 2. 坐标注入 (保持不变，已经归一化了)
+        y_range = torch.linspace(-1, 1, steps=h, device=device)
+        x_range = torch.linspace(-1, 1, steps=w, device=device)
+        yy, xx = torch.meshgrid(y_range, x_range, indexing='ij')
+        xx = xx.view(1, 1, 1, h, w).expand(n, 1, s, h, w)
+        yy = yy.view(1, 1, 1, h, w).expand(n, 1, s, h, w)
+        
+        geo_feats = [x, xx, yy]
+        if self.geo_order >= 2:
+            geo_feats.extend([xx*xx, yy*yy, xx*yy])
+        x = torch.cat(geo_feats, dim=1) # [n, c+5, s, h, w]
+            
+        # 3. 空间加权池化 (Avg Pooling)
+        x_expand = x.unsqueeze(3)
+        numerator = (x_expand * m_expand).sum(dim=(-2, -1)) 
+        area = m_expand.sum(dim=(-2, -1)) + 1e-6 
+        
+        # Avg 结果本来就是安全的，如果是空集，分子是0，结果是0
+        part_feat_avg = numerator / area
+        
+        # 4. Max Pooling (修正版)
+        num_geo = 2 if self.geo_order == 1 else 5
+        feat_content = part_feat_avg[:, :-num_geo, ...]
+        feat_geo     = part_feat_avg[:, -num_geo:, ...]
+        
+        x_content = x_expand[:, :-num_geo, ...]
+        mask_bool = m_expand > 0.5
+        
+        # 这里依然用 -1e4 进行 Max 运算，确保找出最大激活值
+        # 注意：对于 FP16，建议把 -1e4 改小一点，比如 -100，只要比正常的 feature 值(通常<20)小即可
+        # 但最保险的方法是下面这一步 masking
+        x_max_input = x_content.masked_fill(~mask_bool, -100.0) 
+        feat_max_content = x_max_input.amax(dim=(-2, -1))
+        
+        # 🌟 关键修正：如果该部位不存在，强制把 Max 结果置为 0
+        # 这样就消除了 -100.0/-1e4 这种离群值
+        feat_max_content = feat_max_content * part_exists.float()
+        
+        # 最终拼接
+        final_feat = torch.cat([feat_content + feat_max_content, feat_geo], dim=1)
+
+        return final_feat
+
+class TemporalMotionAggregator(nn.Module):
+    def __init__(self):
+        super(TemporalMotionAggregator, self).__init__()
+        
+    def forward(self, part_feats):
+        """
+        part_feats: [n, c+5, s, p]
+        """
+        # 1. 静态特征 (Static): Max Pooling over Time
+        # 捕捉序列中最显著的特征/姿态
+        feat_static = part_feats.max(dim=2)[0] # [n, c+5, p]
+        
+        # 2. 动态特征 (Dynamic): Max Pooling over Differences
+        # 捕捉最剧烈的运动/形变
+        # Diff: [n, c+5, s-1, p]
+        feat_diff = part_feats[:, :, 1:, :] - part_feats[:, :, :-1, :]
+        feat_dynamic = feat_diff.max(dim=2)[0] # [n, c+5, p]
+        
+        # 融合: 简单相加 (ResNet style)
+        return feat_static + feat_dynamic
 
 class HorizontalPoolingPyramid():
     """
