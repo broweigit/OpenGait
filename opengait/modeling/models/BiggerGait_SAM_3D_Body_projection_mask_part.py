@@ -418,34 +418,23 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_Gaitbase_Share(BaseModel):
                             # 兜底：如果某个 part 没生成，给全 0
                             final_disjoint_masks[name] = torch.zeros((curr_bs, 1, h_feat, w_feat), device=rgb.device)
 
-                    # # 🌟 修改点 2: 收集当前 Chunk 的 6通道 Mask
-                    # # stack 顺序必须与 ordered_parts 一致
-                    # # [B, 1, H, W] * 6 -> Cat -> [B, 6, H, W]
-                    # chunk_mask_tensor = torch.cat([final_disjoint_masks[k] for k in ordered_parts], dim=1)
-                    
-                    # # 恢复维度 [n, s, 6, h, w] 并存入列表
-                    # # n 是 batch size (subject 数), s 是当前 chunk 的帧数
-                    # all_masks_list.append(chunk_mask_tensor.view(n, s, 6, h_feat, w_feat))
-                    
-                    # 修改为：
-                    # 1. 拼接 6 个局部部位和 1 个全局部位 (总和为 7 通道)
+                    # 1. 首先，基于 6 个去重后的局部部位，合并算出“总人体 Mask” (Full Body)
+                    # 这里的顺序不影响求和结果，但建议按 ordered_parts 提取
+                    temp_stack = torch.stack([final_disjoint_masks[k] for k in ordered_parts], dim=1) # [B, 6, H, W]
+                    generated_mask = torch.clamp(torch.sum(temp_stack, dim=1), 0, 1) # [B, 1, H, W]
+
+                    # 2. 构造 7 通道 Tensor：[6个局部部位] + [1个总人体]
+                    # 注意：这里我们直接把刚才算好的 generated_mask 拼在最后
                     chunk_mask_tensor = torch.cat([
                         final_disjoint_masks[k] for k in ordered_parts
-                    ] + [generated_mask], dim=1) # generated_mask 本身就是 [B, 1, H, W]
+                    ] + [generated_mask], dim=1) # 最终得到 [B, 7, H, W]
 
-                    # 2. 恢复维度 [n, s, 7, h, w]
+                    # 3. 恢复维度 [n, s, 7, h, w] 并存入列表
+                    # n 是 batch size, s 是当前 chunk 帧数
                     all_masks_list.append(chunk_mask_tensor.view(n, s, 7, h_feat, w_feat))
-
-                    # 合并生成总 Mask (用于 FPN 降噪)
-                    generated_mask = torch.clamp(torch.sum(chunk_mask_tensor, dim=1, keepdim=True), 0, 1)
                 
                 else:
-                    # 如果没有 part_indices，生成全 1 或全 0 Mask (避免崩溃)
-                    generated_mask = torch.ones((curr_bs, 1, h_feat, w_feat), device=rgb.device)
-                    # 同时也需要填充 all_masks_list
-                    dummy_parts = torch.zeros((n, s, 6, h_feat, w_feat), device=rgb.device)
-                    all_masks_list.append(dummy_parts)
-                    part_summaries = {}
+                    raise RuntimeError("Part indices for MHR not loaded; cannot generate part masks.")
 
                 # 5. 收集特征用于 FPN (Early Masking)
                 mask_flat = generated_mask.view(curr_bs, -1, 1) # [B, 512, 1]
