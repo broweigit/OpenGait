@@ -399,7 +399,7 @@ class Baseline_Part_Single(nn.Module):
         self.SPP = SemanticPartPooling(geo_order=2) # 开启5通道几何矩
         self.TMA = TemporalMotionAggregator()
         # 🌟 2. 调整 FC 输入维度 = 原始特征通道 + 5 (几何通道)
-        self.parts_num = 6 
+        self.parts_num = 7 
         in_c = model_cfg['SeparateFCs']['in_channels'] + 5 
         out_c = model_cfg['SeparateFCs']['out_channels']
         # ==================== 🌟 修复部分 Start ====================

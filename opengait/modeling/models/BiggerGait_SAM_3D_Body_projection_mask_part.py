@@ -418,14 +418,23 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_Gaitbase_Share(BaseModel):
                             # 兜底：如果某个 part 没生成，给全 0
                             final_disjoint_masks[name] = torch.zeros((curr_bs, 1, h_feat, w_feat), device=rgb.device)
 
-                    # 🌟 修改点 2: 收集当前 Chunk 的 6通道 Mask
-                    # stack 顺序必须与 ordered_parts 一致
-                    # [B, 1, H, W] * 6 -> Cat -> [B, 6, H, W]
-                    chunk_mask_tensor = torch.cat([final_disjoint_masks[k] for k in ordered_parts], dim=1)
+                    # # 🌟 修改点 2: 收集当前 Chunk 的 6通道 Mask
+                    # # stack 顺序必须与 ordered_parts 一致
+                    # # [B, 1, H, W] * 6 -> Cat -> [B, 6, H, W]
+                    # chunk_mask_tensor = torch.cat([final_disjoint_masks[k] for k in ordered_parts], dim=1)
                     
-                    # 恢复维度 [n, s, 6, h, w] 并存入列表
-                    # n 是 batch size (subject 数), s 是当前 chunk 的帧数
-                    all_masks_list.append(chunk_mask_tensor.view(n, s, 6, h_feat, w_feat))
+                    # # 恢复维度 [n, s, 6, h, w] 并存入列表
+                    # # n 是 batch size (subject 数), s 是当前 chunk 的帧数
+                    # all_masks_list.append(chunk_mask_tensor.view(n, s, 6, h_feat, w_feat))
+                    
+                    # 修改为：
+                    # 1. 拼接 6 个局部部位和 1 个全局部位 (总和为 7 通道)
+                    chunk_mask_tensor = torch.cat([
+                        final_disjoint_masks[k] for k in ordered_parts
+                    ] + [generated_mask], dim=1) # generated_mask 本身就是 [B, 1, H, W]
+
+                    # 2. 恢复维度 [n, s, 7, h, w]
+                    all_masks_list.append(chunk_mask_tensor.view(n, s, 7, h_feat, w_feat))
 
                     # 合并生成总 Mask (用于 FPN 降噪)
                     generated_mask = torch.clamp(torch.sum(chunk_mask_tensor, dim=1, keepdim=True), 0, 1)
