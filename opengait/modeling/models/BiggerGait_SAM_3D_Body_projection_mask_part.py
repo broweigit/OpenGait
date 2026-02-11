@@ -120,8 +120,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_Gaitbase_Share(BaseModel):
         self.chunk_size = model_cfg.get("chunk_size", 96)
 
         # GaitNet & PreConv
-        self.Gait_Net = Baseline_Part_ShareTime_2B(model_cfg)
-        self.Pre_Conv = nn.Sequential(nn.Identity())
+        self.Gait_Net = Baseline_ShareTime_2B(model_cfg)
 
         # FPN Heads
         self.HumanSpace_Conv = nn.ModuleList([
@@ -141,13 +140,10 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_Gaitbase_Share(BaseModel):
         self.Mask_Branch = infoDistillation(**model_cfg["Mask_Branch"])
         
         self.init_SAM_Backbone()
-        # Skip loading mask branch weights if not needed
-        # self.init_Mask_Branch() 
 
     def init_SAM_Backbone(self):
         if self.pretrained_lvm not in sys.path:
             sys.path.insert(0, self.pretrained_lvm)
-        
         try:
             from notebook.utils import setup_sam_3d_body
         except ImportError as e:
@@ -156,21 +152,8 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_Gaitbase_Share(BaseModel):
         self.msg_mgr.log_info(f"[SAM3D] Loading SAM 3D Body (Encoder + Decoder)...")
         estimator = setup_sam_3d_body(hf_repo_id="facebook/sam-3d-body-dinov3", device='cpu')
         
-        # 🌟 修改点：保留 SAM_Engine 用于 Decoder 推理
         self.SAM_Engine = estimator.model
-        
-        # 获取 Backbone 引用用于 Hook
-        if hasattr(self.SAM_Engine, 'backbone'):
-            raw_backbone = self.SAM_Engine.backbone
-        elif hasattr(self.SAM_Engine, 'image_encoder'):
-            raw_backbone = self.SAM_Engine.image_encoder
-        else:
-            raise RuntimeError("Cannot find backbone in SAM Engine")
-
-        if hasattr(raw_backbone, 'encoder'):
-            self.Backbone = raw_backbone.encoder
-        else:
-            self.Backbone = raw_backbone
+        self.Backbone = self.SAM_Engine.backbone.encoder
         
         self.SAM_Engine.cpu() # 先放 CPU
 
@@ -185,13 +168,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_Gaitbase_Share(BaseModel):
                 self.intermediate_features[idx_in_list] = output
             return hook
 
-        all_blocks = []
-        if hasattr(self.Backbone, 'blocks'):
-            all_blocks = self.Backbone.blocks
-        elif hasattr(self.Backbone, 'layers'):
-            all_blocks = self.Backbone.layers
-        else:
-            raise RuntimeError("Cannot find blocks in Backbone")
+        all_blocks = self.Backbone.blocks
 
         hook_count = 0
         for layer_idx, should_hook in enumerate(self.hook_mask):
@@ -313,7 +290,6 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_Gaitbase_Share(BaseModel):
         rgb_chunks = torch.chunk(rgb, (rgb.size(1)//CHUNK_SIZE)+1, dim=1)
         
         all_outs = []
-        all_masks_list = []
         
         # 图像目标尺寸 (512, 256)
         target_h, target_w = self.image_size * 2, self.image_size 
@@ -325,6 +301,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_Gaitbase_Share(BaseModel):
 
         for _, rgb_img in enumerate(rgb_chunks):
             n, s, c, h, w = rgb_img.size()
+            # B(n*s), C, H, W
             rgb_img = rearrange(rgb_img, 'n s c h w -> (n s) c h w').contiguous()
             curr_bs = rgb_img.shape[0]
             
@@ -338,18 +315,15 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_Gaitbase_Share(BaseModel):
                 last_hook_idx = len(self.hook_handles) - 1
                 sam_emb = self.intermediate_features[last_hook_idx] # [B, 517, 1280]
                 
-                # 🌟 [关键修复] DINOv3 (B,N,C) -> SAM (B,C,H,W)
-                # DINOv3 output: [Batch, Tokens(517), Channels(1280)]
-                # Tokens = 512 (Spatial) + 5 (CLS/Registers)
+                # DINOv3 (B,N(517),C) -> SAM (B,C,H,W)
                 target_tokens = h_feat * w_feat # 512
                 
-                # A. 剔除 CLS/Registers，只保留 Spatial Tokens
+                # 剔除 CLS/Registers，只保留 Spatial Tokens
                 if sam_emb.shape[1] > target_tokens:
                     sam_emb = sam_emb[:, -target_tokens:, :] # [B, 512, 1280]
                 
-                # B. 变换维度 [B, N, C] -> [B, C, N] -> [B, C, H, W]
-                sam_emb = sam_emb.transpose(1, 2) # [B, 1280, 512]
-                sam_emb = sam_emb.reshape(curr_bs, -1, h_feat, w_feat) # [B, 1280, 32, 16]
+                # [B, N, C] -> [B, C, N] -> [B, C, H, W]
+                sam_emb = sam_emb.transpose(1, 2).reshape(curr_bs, -1, h_feat, w_feat) # [B, 1280, 32, 16]
                 
                 # Prepare Inputs
                 dummy_batch = self._prepare_dummy_batch(sam_emb, target_h, target_w)
@@ -374,9 +348,9 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_Gaitbase_Share(BaseModel):
                 pred_cam_t = pose_outs[-1]['pred_cam_t']
                 cam_int = dummy_batch['cam_int']            
                 
-                # --- 🌟 核心：遮挡去重逻辑 (Z-Buffer) ---
+                # --- 遮挡去重逻辑 (Z-Buffer) ---
                 part_depths = {}
-                # 第一遍循环：收集每个部位的原始深度图
+                # 第一遍：收集每个部位的原始深度图
                 if self.part_indices is not None:
                     for name, idxs in self.part_indices.items():
                         _, p_depth = self.project_vertices_to_mask_and_depth(
@@ -404,11 +378,17 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_Gaitbase_Share(BaseModel):
                     for name in ordered_parts:
                         if name in part_depths:
                             p_depth = part_depths[name]
-                            # 判定条件：该部位深度等于全局最小深度，且不是背景
+                            # 1. 深度竞争，获得基础硬掩码
                             is_closest = (p_depth == global_min_depth) & (p_depth < 1e5)
-                            final_disjoint_masks[name] = is_closest.float()
+                            mask = is_closest.float()
+
+                            # 2. 执行掩码膨胀 (Dilation)
+                            # kernel_size=3 可以让每个点向四周扩充 1 像素
+                            mask = F.max_pool2d(mask, kernel_size=3, stride=1, padding=1)
                             
-                            # Debug: 生成单部位叠加图 (仅限前5个样本)
+                            final_disjoint_masks[name] = mask # [B, 1, H, W]
+                            
+                            # 生成单部位叠加图 (仅限前5个样本)
                             if name in part_colors and curr_bs > 0:
                                 m_high = F.interpolate(is_closest.float(), (target_h, target_w), mode='nearest')
                                 c_vec = torch.tensor(part_colors[name], device=rgb.device).view(1, 3, 1, 1)
@@ -418,21 +398,11 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_Gaitbase_Share(BaseModel):
                             # 兜底：如果某个 part 没生成，给全 0
                             final_disjoint_masks[name] = torch.zeros((curr_bs, 1, h_feat, w_feat), device=rgb.device)
 
-                    # 1. 首先，基于 6 个去重后的局部部位，合并算出“总人体 Mask” (Full Body)
-                    # 这里的顺序不影响求和结果，但建议按 ordered_parts 提取
-                    temp_stack = torch.stack([final_disjoint_masks[k] for k in ordered_parts], dim=1) # [B, 6, H, W]
-                    generated_mask = torch.clamp(torch.sum(temp_stack, dim=1), 0, 1) # [B, 1, H, W]
+                    # 3. 堆叠 6 个部位 Mask [B, 6, H, W]
+                    part_masks = torch.cat([final_disjoint_masks[k] for k in ordered_parts], dim=1)
 
-                    # 2. 构造 7 通道 Tensor：[6个局部部位] + [1个总人体]
-                    # 注意：这里我们直接把刚才算好的 generated_mask 拼在最后
-                    chunk_mask_tensor = torch.cat([
-                        final_disjoint_masks[k] for k in ordered_parts
-                    ] + [generated_mask], dim=1) # 最终得到 [B, 7, H, W]
-
-                    # 3. 恢复维度 [n, s, 7, h, w] 并存入列表
-                    # n 是 batch size, s 是当前 chunk 帧数
-                    all_masks_list.append(chunk_mask_tensor.view(n, s, 7, h_feat, w_feat))
-                
+                    # 4. 生成总 Mask 用于 FPN 前的背景滤除
+                    generated_mask = torch.clamp(torch.sum(part_masks, dim=1, keepdim=True), 0, 1) # [B, 1, H, W]
                 else:
                     raise RuntimeError("Part indices for MHR not loaded; cannot generate part masks.")
 
@@ -454,59 +424,78 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_Gaitbase_Share(BaseModel):
             step = len(features_to_use) // self.num_FPN
             
             for i in range(self.num_FPN):
-                start_idx = i * step
-                end_idx = (i + 1) * step
-                sub_feats = features_to_use[start_idx : end_idx]
+                sub_feats = features_to_use[i*step : (i+1)*step]
                 
-                # A. 拼接特征 [B, 512, C*step]
-                sub_app = torch.concat(sub_feats, dim=-1) 
-                
-                # B. Reshape 成 2D [B, C_total, 32, 16]
-                # transpose: [B, 512, C] -> [B, C, 512] -> view -> [B, C, 32, 16]
-                sub_app = rearrange(sub_app, 'b (h w) c -> b c h w', h=h_feat).contiguous()
-                
-                # C. Pre_Conv & LayerNorm
-                sub_app = self.Pre_Conv(sub_app)
-                sub_app = rearrange(sub_app, 'b c h w -> b (h w) c')
-                curr_dim = self.f4_dim * len(sub_feats)
-                sub_app = partial(nn.LayerNorm, eps=1e-6)(curr_dim, elementwise_affine=False)(sub_app)
+                # A. 拼接特征 [B, 512, C*step(4)]
+                sub_app = torch.concat(sub_feats, dim=-1)
+                sub_app = partial(nn.LayerNorm, eps=1e-6)(self.f4_dim * len(sub_feats), elementwise_affine=False)(sub_app)
                 sub_app = rearrange(sub_app, 'b (h w) c -> b c h w', h=h_feat).contiguous()
                 
                 # D. FPN Head (HumanSpace_Conv)
                 # 这一步包含 Conv + Upsample (ResizeToHW)
                 reduced_feat = self.HumanSpace_Conv[i](sub_app) # [B, 64, 64, 32]
-                
                 processed_feat_list.append(reduced_feat)
                 
                 del sub_app, sub_feats
 
             # 7. 拼接 FPN 输出
             human_feat = torch.concat(processed_feat_list, dim=1) # [B, Total_C, 64, 32]
-            
-            # 8. Reshape for GaitNet [n, c, s, h, w]
-            human_feat = rearrange(human_feat.view(n, s, -1, self.sils_size*2, self.sils_size), 'n s c h w -> n c s h w').contiguous()
 
-            # 9. GaitNet Part 1
-            outs = self.Gait_Net.test_1(human_feat)
+            # Early Masking (ResNet 前分 Part)
+
+            part_masks_resized = F.interpolate(part_masks, size=(self.sils_size*2, self.sils_size), mode='nearest')
+            # Masking & Flatten Batch
+            # Feature: [B, 1, C, H, W]
+            # Mask:    [B, 6, 1, H, W]
+            # Result:  [B, 6, C, H, W]
+            masked_feat = human_feat.unsqueeze(1) * part_masks_resized.unsqueeze(2)
+
+            # C. Reshape for GaitNet [n, c, s, h, w]
+            # 将 (n*s) 解开，并将 Part 维度 p 融合进 batch 维度 n
+            masked_feat = rearrange(masked_feat, '(n s) p c h w -> (n p) c s h w', n=n, s=s).contiguous()
+            
+            # 9. GaitNet Part 1 (ResNet)
+            # Input:  [(n*6), C, s, H, W]
+            # Output: [(n*6), C_out, s, H', W']
+            outs = self.Gait_Net.test_1(masked_feat)
+
+            # ===============================================
+            # 🌟 核心修改：在进入 test_2 之前，消除 Part 维度 (Max Pooling)
+            # 输出: [(n p), c, s, h, w] -> [n, p, c, s, h, w]
+            outs = rearrange(outs, '(n p) c s h w -> n p c s h w', p=6)
+            # Max Pooling 聚合所有部位 -> [n, c, s, h, w]
+            outs = outs.max(dim=1)[0]
+            # ===============================================
+
             all_outs.append(outs)
 
-        # 🌟 修改点 3: 拼接完整的时序 Mask
-        # [n, s_total, 6, h, w]
-        full_parts_mask = torch.cat(all_masks_list, dim=1)
+        # # 处理 seqL (扩展 6 倍)
+        # # 因为我们的 Batch 维度变成了 (n * 6)
+        # if seqL is not None:
+        #     # [n] -> [n*6] (repeat_interleave: 0,0,0,0,0,0, 1,1,1,1,1,1...)
+        #     seqL = seqL.repeat_interleave(6)
+        # else:
+        #     seqL = None
 
         # GaitNet Part 2 (时序聚合)
-        # 🌟 修改点 4: 传入 full_parts_mask
         embed_list, log_list = self.Gait_Net.test_2(
-            torch.cat(all_outs, dim=2), # [n, c, s_total, h, w]
-            seqL,
-            full_parts_mask             # [n, s_total, 6, 32, 16] (分辨率可能需要对齐，SPP内部会做)
+            torch.cat(all_outs, dim=2), # [(n*6), c, s_chunk, h, w]
+            seqL
         )
+
+        # 5. 拼接 FPN 结果 [(n*6), c_all_fpn, P]
+        embed = torch.cat(embed_list, dim=1)
+        logits = torch.cat(log_list, dim=1)
+        
+        # # 6. 最终重组 [N, C_total, 6*P]
+        # embed = rearrange(embed, '(n p) c k -> n c (p k)', p=6)
+        # logits = rearrange(logits, '(n p) c k -> n c (p k)', p=6)
         
         if self.training:
             retval = {
                 'training_feat': {
-                    'triplet': {'embeddings': torch.concat(embed_list, dim=-1), 'labels': labs},
-                    'softmax': {'logits': torch.concat(log_list, dim=-1), 'labels': labs},
+                    'triplet': {'embeddings': embed, 'labels': labs},
+                    'softmax': {'logits': logits, 'labels': labs},
                 },
                 'visual_summary': {
                     'image/rgb_img': rgb_img.view(n*s, c, h, w)[:5].float(),
@@ -514,7 +503,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_Gaitbase_Share(BaseModel):
                     'image/generated_3d_mask_lowres': generated_mask.view(n*s, 1, h_feat, w_feat)[:5].float(),
                 },
                 'inference_feat': {
-                    'embeddings': torch.concat(embed_list, dim=-1),
+                    'embeddings': embed,
                     **{f'embeddings_{i}': embed_list[i] for i in range(self.num_FPN)}
                 }
             }
@@ -523,7 +512,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_Gaitbase_Share(BaseModel):
                 'training_feat': {},
                 'visual_summary': {},
                 'inference_feat': {
-                    'embeddings': torch.concat(embed_list, dim=-1),
+                    'embeddings': embed,
                     **{f'embeddings_{i}': embed_list[i] for i in range(self.num_FPN)}
                 }
             }
