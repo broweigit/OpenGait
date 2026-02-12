@@ -483,9 +483,9 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_Gaitbase_Share(BaseModel):
             seqL
         )
 
-        # 5. 拼接 FPN 结果 [(n*6), c_all_fpn, P]
-        embed = torch.cat(embed_list, dim=1)
-        logits = torch.cat(log_list, dim=1)
+        # 5. 拼接 FPN 结果
+        embed = torch.cat(embed_list, dim=-1)
+        logits = torch.cat(log_list, dim=-1)
         
         # # 6. 最终重组 [N, C_total, 6*P]
         # embed = rearrange(embed, '(n p) c k -> n c (p k)', p=6)
