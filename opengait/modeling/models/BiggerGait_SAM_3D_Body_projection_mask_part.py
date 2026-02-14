@@ -469,10 +469,9 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_Gaitbase_Share(BaseModel):
 
             # all_outs.append(outs)
 
-            # 🌟 修改：在循环内就做时间维度的压缩
-            # masked_feat: [(n*p), c, s_chunk, h, w] -> [(n*p), c, 1, h, w]
-            static_chunk_map = masked_feat.max(dim=2, keepdim=True)[0]
-            all_outs.append(static_chunk_map)
+            # 🌟 修改：不要在这里过 test_1，而是把原始 masked 特征存起来
+            # masked_feat shape: [(n*p), c, s_chunk, h, w]
+            all_outs.append(masked_feat)
 
         # # GaitNet Part 2 (时序聚合)
         # embed_list, log_list = self.Gait_Net.test_2(
@@ -501,7 +500,10 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_Gaitbase_Share(BaseModel):
         test2_input = rearrange(outs, 'n c p h w -> 1 c (n p) h w').contiguous()
 
         # 6. 构造适配 OpenGait 格式的 seqL (必须是包含 Tensor 的 List)
-        new_seqL = [torch.full((n,), 6, dtype=torch.long, device=rgb.device)]
+        if seqL is not None:
+            new_seqL = [torch.full((n,), 6, dtype=torch.long, device=rgb.device)] # TODO may have bug
+        else:
+            new_seqL = None
         
         # 7. GaitNet Part 2 (逻辑完全不改)
         # test_2 内部：TP 会把 (n*6) 重新切分为 n 个样本并取 Max，cat 之后自动恢复 Batch 维度 n
