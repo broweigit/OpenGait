@@ -454,42 +454,62 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_Gaitbase_Share(BaseModel):
             # 将 (n*s) 解开，并将 Part 维度 p 融合进 batch 维度 n
             masked_feat = rearrange(masked_feat, '(n s) p c h w -> (n p) c s h w', n=n, s=s).contiguous()
             
-            # 9. GaitNet Part 1 (ResNet)
-            # Input:  [(n*6), C, s, H, W]
-            # Output: [(n*6), C_out, s, H', W']
-            outs = self.Gait_Net.test_1(masked_feat)
+            # # 9. GaitNet Part 1 (ResNet)
+            # # Input:  [(n*6), C, s, H, W]
+            # # Output: [(n*6), C_out, s, H', W']
+            # outs = self.Gait_Net.test_1(masked_feat)
 
-            # ===============================================
-            # 🌟 核心修改：在进入 test_2 之前，消除 Part 维度 (Max Pooling)
-            # 输出: [(n p), c, s, h, w] -> [n, p, c, s, h, w]
-            outs = rearrange(outs, '(n p) c s h w -> n p c s h w', p=6)
-            # Max Pooling 聚合所有部位 -> [n, c, s, h, w]
-            outs = outs.max(dim=1)[0]
-            # ===============================================
+            # # ===============================================
+            # # 🌟 核心修改：在进入 test_2 之前，消除 Part 维度 (Max Pooling)
+            # # 输出: [(n p), c, s, h, w] -> [n, p, c, s, h, w]
+            # outs = rearrange(outs, '(n p) c s h w -> n p c s h w', p=6)
+            # # Max Pooling 聚合所有部位 -> [n, c, s, h, w]
+            # outs = outs.max(dim=1)[0]
+            # # ===============================================
 
-            all_outs.append(outs)
+            # all_outs.append(outs)
 
-        # # 处理 seqL (扩展 6 倍)
-        # # 因为我们的 Batch 维度变成了 (n * 6)
-        # if seqL is not None:
-        #     # [n] -> [n*6] (repeat_interleave: 0,0,0,0,0,0, 1,1,1,1,1,1...)
-        #     seqL = seqL.repeat_interleave(6)
-        # else:
-        #     seqL = None
+            # 🌟 修改：不要在这里过 test_1，而是把原始 masked 特征存起来
+            # masked_feat shape: [(n*p), c, s_chunk, h, w]
+            all_outs.append(masked_feat)
 
-        # GaitNet Part 2 (时序聚合)
-        embed_list, log_list = self.Gait_Net.test_2(
-            torch.cat(all_outs, dim=2), # [(n*6), c, s_chunk, h, w]
-            seqL
-        )
+        # # GaitNet Part 2 (时序聚合)
+        # embed_list, log_list = self.Gait_Net.test_2(
+        #     torch.cat(all_outs, dim=2), # [(n*6), c, s_chunk, h, w]
+        #     seqL
+        # )
+
+        # 1. 拼接所有 Part 的时序特征 -> [(n*6), c, s_total, h, w]
+        full_masked_feat = torch.cat(all_outs, dim=2) 
+        
+        # 2. 执行时序 Max Pooling -> 得到每个部位的 Gait Entropy Map
+        # 得到: [(n*6), c, 1, h, w]
+        static_part_maps = full_masked_feat.max(dim=2, keepdim=True)[0]
+        
+        # 3. 维度重组：把 Part (6) 放到 Time 轴，Batch (n) 回归 Batch 轴
+        # 结果: [n, c, 6, h, w]
+        pseudo_temporal_feat = rearrange(static_part_maps, '(n p) c 1 h w -> n c p h w', p=6).contiguous()
+        
+        # 4. GaitNet Part 1 (ResNet)
+        # 卷积核现在在 6 个部位之间滑动。输出: [n, c_out, 6, h', w']
+        outs = self.Gait_Net.test_1(pseudo_temporal_feat)
+
+        # 5. 🌟 关键适配：将 Batch 压入 Time 轴以通过 TP 模块
+        # 目的：PackSequenceWrapper 内部会根据 seqL 在 dim=2 上 narrow。
+        # 我们把 [n, c, 6, h, w] 变成 [1, c, (n*6), h, w]
+        test2_input = rearrange(outs, 'n c p h w -> 1 c (n p) h w').contiguous()
+
+        # 6. 构造适配 OpenGait 格式的 seqL (必须是包含 Tensor 的 List)
+        new_seqL = [torch.full((n,), 6, dtype=torch.long, device=rgb.device)]
+        
+        # 7. GaitNet Part 2 (逻辑完全不改)
+        # test_2 内部：TP 会把 (n*6) 重新切分为 n 个样本并取 Max，cat 之后自动恢复 Batch 维度 n
+        # 输出 embed_list 每个元素为: [n, c_sub, 16]
+        embed_list, log_list = self.Gait_Net.test_2(test2_input, new_seqL)
 
         # 5. 拼接 FPN 结果
         embed = torch.cat(embed_list, dim=-1)
         logits = torch.cat(log_list, dim=-1)
-        
-        # # 6. 最终重组 [N, C_total, 6*P]
-        # embed = rearrange(embed, '(n p) c k -> n c (p k)', p=6)
-        # logits = rearrange(logits, '(n p) c k -> n c (p k)', p=6)
         
         if self.training:
             retval = {
