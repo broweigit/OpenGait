@@ -469,9 +469,10 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_Gaitbase_Share(BaseModel):
 
             # all_outs.append(outs)
 
-            # 🌟 修改：不要在这里过 test_1，而是把原始 masked 特征存起来
-            # masked_feat shape: [(n*p), c, s_chunk, h, w]
-            all_outs.append(masked_feat)
+            # 🌟 修改：在循环内就做时间维度的压缩
+            # masked_feat: [(n*p), c, s_chunk, h, w] -> [(n*p), c, 1, h, w]
+            static_chunk_map = masked_feat.max(dim=2, keepdim=True)[0]
+            all_outs.append(static_chunk_map)
 
         # # GaitNet Part 2 (时序聚合)
         # embed_list, log_list = self.Gait_Net.test_2(
