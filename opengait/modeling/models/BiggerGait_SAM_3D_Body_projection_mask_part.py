@@ -393,7 +393,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_Gaitbase_Share(BaseModel):
                                 m_high = F.interpolate(is_closest.float(), (target_h, target_w), mode='nearest')
                                 c_vec = torch.tensor(part_colors[name], device=rgb.device).view(1, 3, 1, 1)
                                 part_overlay = outs * 0.2 + (m_high * c_vec) * 0.8
-                                part_summaries[f'image/part_{name}'] = part_overlay[:5].float()
+                                part_summaries[f'image/part_{name}'] = part_overlay[:3].float()
                         else:
                             # 兜底：如果某个 part 没生成，给全 0
                             final_disjoint_masks[name] = torch.zeros((curr_bs, 1, h_feat, w_feat), device=rgb.device)
@@ -469,9 +469,9 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_Gaitbase_Share(BaseModel):
 
             # all_outs.append(outs)
 
-            # 🌟 修改：不要在这里过 test_1，而是把原始 masked 特征存起来
-            # masked_feat shape: [(n*p), c, s_chunk, h, w]
-            all_outs.append(masked_feat)
+            # 执行 Chunk 压缩
+            static_chunk_map = masked_feat.max(dim=2, keepdim=True)[0]
+            all_outs.append(static_chunk_map) # 存入的是 [B, C, 1, H, W]
 
         # # GaitNet Part 2 (时序聚合)
         # embed_list, log_list = self.Gait_Net.test_2(
@@ -494,11 +494,6 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_Gaitbase_Share(BaseModel):
         # 卷积核现在在 6 个部位之间滑动。输出: [n, c_out, 6, h', w']
         outs = self.Gait_Net.test_1(pseudo_temporal_feat)
 
-        # 5. 🌟 关键适配：将 Batch 压入 Time 轴以通过 TP 模块
-        # 目的：PackSequenceWrapper 内部会根据 seqL 在 dim=2 上 narrow。
-        # 我们把 [n, c, 6, h, w] 变成 [1, c, (n*6), h, w]
-        test2_input = rearrange(outs, 'n c p h w -> 1 c (n p) h w').contiguous()
-
         # 6. 构造适配 OpenGait 格式的 seqL (必须是包含 Tensor 的 List)
         if seqL is not None:
             new_seqL = [torch.full((n,), 6, dtype=torch.long, device=rgb.device)] # TODO may have bug
@@ -508,7 +503,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_Gaitbase_Share(BaseModel):
         # 7. GaitNet Part 2 (逻辑完全不改)
         # test_2 内部：TP 会把 (n*6) 重新切分为 n 个样本并取 Max，cat 之后自动恢复 Batch 维度 n
         # 输出 embed_list 每个元素为: [n, c_sub, 16]
-        embed_list, log_list = self.Gait_Net.test_2(test2_input, new_seqL)
+        embed_list, log_list = self.Gait_Net.test_2(outs, new_seqL)
 
         # 5. 拼接 FPN 结果
         embed = torch.cat(embed_list, dim=-1)
@@ -521,9 +516,9 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_Gaitbase_Share(BaseModel):
                     'softmax': {'logits': logits, 'labels': labs},
                 },
                 'visual_summary': {
-                    'image/rgb_img': rgb_img.view(n*s, c, h, w)[:5].float(),
+                    'image/rgb_img': rgb_img.view(n*s, c, h, w)[:3].float(),
                     **part_summaries,
-                    'image/generated_3d_mask_lowres': generated_mask.view(n*s, 1, h_feat, w_feat)[:5].float(),
+                    'image/generated_3d_mask_lowres': generated_mask.view(n*s, 1, h_feat, w_feat)[:3].float(),
                 },
                 'inference_feat': {
                     'embeddings': embed,
