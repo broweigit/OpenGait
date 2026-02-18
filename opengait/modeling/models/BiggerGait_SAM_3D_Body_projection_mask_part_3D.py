@@ -69,74 +69,95 @@ class ResizeToHW(torch.nn.Module):
 
     def forward(self, x):
         return F.interpolate(x, size=self.target_size, mode='bilinear', align_corners=False)
-    
+
+import torch.nn.functional as F
+
 class GeometryOptimalTransport(nn.Module):
-    def __init__(self, temperature=0.01, dist_thresh=0.2):
+    def __init__(self, temperature=0.01, dist_thresh=0.2, num_iters=3):
         super().__init__()
-        self.temperature = temperature
+        self.epsilon = temperature
         self.dist_thresh = dist_thresh
+        self.num_iters = num_iters # 迭代次数少一点(3次)，即为"软"Sinkhorn
 
     def forward(self, source_feats, source_locs, target_locs, source_valid_mask=None, target_valid_mask=None):
         """
         Args:
-            source_feats: [B, N_src, C]
-            source_locs:  [B, N_src, 2] (Projected Source Locations)
-            target_locs:  [B, M_tgt, 2] (Target Grid Locations)
-            source_valid_mask: [B, N_src] (bool) 源点是否有效
-            target_valid_mask: [B, M_tgt] (bool) 目标点是否有效 (新增!)
+            source_feats: [B, N, C]
+            source_locs:  [B, N, 2]
+            target_locs:  [B, M, 2]
+            source_valid_mask: [B, N]
+            target_valid_mask: [B, M]
         """
         B, N, C = source_feats.shape
         M = target_locs.shape[1]
         
-        # 1. 计算距离矩阵 [B, M, N]
-        # diff: Target(M) - Source(N)
+        # 1. 计算代价矩阵 Cost (同老方法)
         diff = target_locs.unsqueeze(2) - source_locs.unsqueeze(1)
-        dist_sq = torch.sum(diff ** 2, dim=-1) 
+        dist_sq = torch.sum(diff ** 2, dim=-1)
 
-        # 2. 构造组合掩码 [B, M, N]
-        # 基础距离掩码
+        # 2. 构建 Log-Kernel (同老方法，但在 Log 域)
+        # Log_K_ij = -C_ij / epsilon
+        log_K = -dist_sq / (self.epsilon + 1e-8)
+
+        # 3. 处理 Mask (同老方法，逻辑一致)
         valid_connection = dist_sq < (self.dist_thresh ** 2)
-        
-        # 融入 Source Mask (列约束: 屏蔽无效的源点)
-        # [B, N] -> [B, 1, N]
         if source_valid_mask is not None:
             valid_connection = valid_connection & source_valid_mask.unsqueeze(1)
-            
-        # 融入 Target Mask (行约束: 屏蔽无效的目标像素，不让它们参与计算)
-        # [B, M] -> [B, M, 1]
         if target_valid_mask is not None:
             valid_connection = valid_connection & target_valid_mask.unsqueeze(2)
+        
+        # 填充 -1e9 (Log 域的 0)
+        log_K = log_K.masked_fill(~valid_connection, -1e9)
 
-        # 3. 数值稳定的带掩码 Softmax
-        score = -dist_sq / (self.temperature + 1e-8)
+        # ==========================================================
+        # 4. Sinkhorn 迭代 (Log-Domain)
+        # 这里的改进：我们只迭代 3 次，这是一种"部分 OT"。
+        # 它比 Softmax 更锐利，但又不像完全收敛的 OT 那样死板（允许一定的质量不平衡）。
+        # ==========================================================
         
-        # 为了数值稳定，减去每行最大值
-        # 这里的 mask_fill 是为了在 max() 计算时忽略无效连接
-        masked_score = score.masked_fill(~valid_connection, -1e9) 
-        max_score = masked_score.max(dim=-1, keepdim=True)[0]
-        
-        # 计算 Exp
-        exp_score = torch.exp(masked_score - max_score)
-        
-        # 【关键】显式硬过滤：无效连接的权重强制为 0
-        exp_score = exp_score * valid_connection.float()
-        
-        # 归一化
-        sum_exp = exp_score.sum(dim=-1, keepdim=True)
-        attn = exp_score / (sum_exp + 1e-12) # 防止分母为0
+        # 初始化势能
+        v = torch.zeros(B, 1, N, device=source_feats.device) # Source 势能
+        u = torch.zeros(B, M, 1, device=source_feats.device) # Target 势能
 
-        # 4. 特征搬运 [B, M, N] @ [B, N, C] -> [B, M, C]
+        for _ in range(self.num_iters):
+            # 步骤 A: Target 归一化 (类似 Softmax 的行归一化)
+            # u = -logsumexp(log_K + v)
+            # 这一步保证了每个 Target 像素能"抢"到足够的特征
+            u = -torch.logsumexp(log_K + v, dim=2, keepdim=True)
+            
+            # 步骤 B: Source 归一化 (列归一化)
+            # v = -logsumexp(log_K + u)
+            # 这一步抑制了被过度复用的 Source 像素
+            v = -torch.logsumexp(log_K + u, dim=1, keepdim=True)
+            
+            # 【关键修正】：防止 v 在全是 Mask 的列变成 inf
+            # 如果某列 Source 全是无效连接，logsumexp 结果是 -inf，v 变成 inf
+            # 我们需要把这些无效列的 v 重置为 0，防止污染后续计算
+            if source_valid_mask is not None:
+                v = v.masked_fill(~source_valid_mask.unsqueeze(1), 0.0)
+
+        # 5. 计算最终 Attention Map
+        # P = exp(log_K + u + v)
+        log_P = log_K + u + v
+        attn = torch.exp(log_P)
+        
+        # 再次硬过滤 (双重保险，同老方法)
+        attn = attn * valid_connection.float()
+        
+        # ==========================================================
+        # 6. 特征搬运 (同老方法)
+        # ==========================================================
         target_feats = torch.bmm(attn, source_feats)
-        
-        # 5. 最终清理
-        # 如果 Target 像素本身无效，或者周围没有有效 Source，强制置 0
+
+        # 7. 最终清理 (同老方法)
         if target_valid_mask is not None:
             target_feats = target_feats * target_valid_mask.unsqueeze(-1).float()
             
-        # 双重保险：如果 sum_exp 极小，说明没有有效源，也置 0
-        has_source = sum_exp > 1e-11
+        # 检查是否有没有来源的目标点
+        # 注意：在 Sinkhorn 中，u 会自动补偿，但如果真的没有任何连接，还是需要置 0
+        has_source = valid_connection.any(dim=-1, keepdim=True)
         target_feats = target_feats * has_source.float()
-        
+
         return target_feats
 
 # =========================================================================
@@ -211,7 +232,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
         
         self.init_SAM_Backbone()
 
-        self.ot_solver = GeometryOptimalTransport(temperature=0.01, dist_thresh=0.2)
+        self.ot_solver = GeometryOptimalTransport(temperature=0.01, dist_thresh=0.2, num_iters=8)
 
     def init_SAM_Backbone(self):
         if self.pretrained_lvm not in sys.path:
