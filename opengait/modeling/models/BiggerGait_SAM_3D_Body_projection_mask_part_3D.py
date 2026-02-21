@@ -232,7 +232,16 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
         
         self.init_SAM_Backbone()
 
-        self.ot_solver = GeometryOptimalTransport(temperature=0.01, dist_thresh=0.2, num_iters=8)
+        ot_temp = model_cfg.get("ot_temperature", 0.01)
+        ot_dist = model_cfg.get("ot_dist_thresh", 0.2)
+        ot_iters = model_cfg.get("ot_iters", 8)
+        self.target_angle = model_cfg.get("target_angle", 90.0) # 默认 90 度侧视
+        
+        self.ot_solver = GeometryOptimalTransport(
+            temperature=ot_temp, 
+            dist_thresh=ot_dist, 
+            num_iters=ot_iters
+        )
 
     def init_SAM_Backbone(self):
         if self.pretrained_lvm not in sys.path:
@@ -429,8 +438,17 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
         
         # 构建旋转矩阵 (Current -> Canonical Side)
         rot_fix = global_rot.clone(); rot_fix[..., [0,1,2]] *= -1
-        R_canon = roma.euler_to_rotmat("XYZ", rot_fix) 
-        R_side = torch.tensor([[0.,0.,1.],[0.,1.,0.],[-1.,0.,0.]], device=device).view(1,3,3).expand(B,3,3)
+        R_canon = roma.euler_to_rotmat("XYZ", rot_fix)
+
+        # 🌟 根据配置的 target_angle 生成绕 Y 轴的旋转矩阵
+        rad = math.radians(self.target_angle)
+        c, s = math.cos(rad), math.sin(rad)
+        R_side = torch.tensor([
+            [ c, 0., s],
+            [ 0., 1., 0.],
+            [-s, 0., c]
+        ], device=device, dtype=torch.float32).view(1, 3, 3).expand(B, 3, 3)
+
         # 复合旋转: R_comp @ v (在 SMPL 坐标系下)
         R_comp = torch.matmul(R_canon.transpose(1,2), R_side.transpose(1,2))
         

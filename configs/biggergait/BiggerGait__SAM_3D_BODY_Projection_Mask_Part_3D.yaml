@@ -15,7 +15,7 @@ evaluator_cfg:
   eval_func: evaluate_CCPG_part
   sampler:
     batch_shuffle: false
-    batch_size: 4
+    batch_size: 8
     sample_type: all_ordered
     frames_all_limit: 250
   metric: euc
@@ -92,6 +92,11 @@ model_cfg:
       - True  # 31
   
   num_unknown: 16
+
+  ot_temperature: 0.01
+  ot_dist_thresh: 0.2
+  ot_iters: 8
+  target_angle: 90.0
   
   Mask_Branch:
     source_dim: 1280  # 注意：这里也要改成 1280，因为 MaskBranch 也是接在 Backbone 后面
