@@ -8,6 +8,7 @@ from einops import rearrange
 from ..base_model import BaseModel
 from torch.nn import functional as F
 from functools import partial
+import numpy as np
 
 # import GaitBase
 from .BigGait_utils.BigGait_GaitBase import *
@@ -235,7 +236,12 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
         ot_temp = model_cfg.get("ot_temperature", 0.01)
         ot_dist = model_cfg.get("ot_dist_thresh", 0.2)
         ot_iters = model_cfg.get("ot_iters", 8)
-        self.target_angle = model_cfg.get("target_angle", 90.0) # 默认 90 度侧视
+
+        self.target_angles = model_cfg.get("target_angles", [90.0])
+        if isinstance(self.target_angles, (float, int)):
+            self.target_angles = [float(self.target_angles)]
+            
+        self.use_tpose_branch = model_cfg.get("use_tpose_branch", False)
         
         self.ot_solver = GeometryOptimalTransport(
             temperature=ot_temp, 
@@ -395,6 +401,42 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
         # 注意：Depth Map 恢复成 [B, 1, H, W] 以兼容你后续的 mask = (depth_map < 1e5).float()
         return index_map_global.reshape(B, H_feat, W_feat), depth_map_flat.reshape(B, 1, H_feat, W_feat)
     
+    def get_pca_vis_tensor(self, feat_tensor, mask_tensor, max_samples=5):
+        """
+        批量提取特征的 PCA 可视化张量，用于 TensorBoard / Wandb
+        """
+        import numpy as np
+        import torch
+        from einops import rearrange
+
+        B, C, H, W = feat_tensor.shape
+        K = min(B, max_samples) # 只取前几个样本以节省时间
+        
+        feat = feat_tensor[:K].detach().cpu()
+        mask = mask_tensor[:K].detach().cpu()
+        if mask.dim() == 4:
+            mask = mask.squeeze(1) # [K, H, W]
+            
+        flat_feat = rearrange(feat, 'k c h w -> k (h w) c').numpy()
+        flat_mask = mask.view(K, -1).numpy()
+        
+        vis_data = {'embeddings': flat_feat}
+        
+        pca_res = pca_image(
+            data=vis_data, 
+            mask=flat_mask, 
+            root=None, 
+            model_name=None, 
+            dataset=None, 
+            n_components=3, 
+            is_return=True
+        ) # [1, K, 3, H, W]
+        
+        # [K, 3, H, W]
+        pca_vis = torch.from_numpy(pca_res[0]).float() / 255.0
+        
+        return pca_vis.to(feat_tensor.device)
+    
     def warp_features_with_ot(self, human_feat, mask_src, 
                               pred_verts, pred_keypoints, pred_cam_t, global_rot, 
                               cam_int_src, cam_int_tgt, cam_t_tgt,
@@ -515,68 +557,145 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
         # 恢复形状
         warped_feat = rearrange(transported_feats, 'b (h w) c -> b c h w', h=H_feat)
         
-        return warped_feat
+        # 附带返回 Target Mask 用于 PCA 可视化
+        return warped_feat, valid_tgt_mask.view(B, 1, H_feat, W_feat)
     
-    # def get_standard_90deg_projection(self, vertices, global_orient, h_feat, w_feat, target_h, target_w):
-    #     """
-    #     利用 SMPL Global Orientation 将点云还原到标准侧面视角
-    #     Args:
-    #         vertices: [B, N, 3] 相机坐标系下的点云
-    #         global_orient: [B, 3] (轴角)
-    #         h_feat, w_feat: 特征图尺寸
-    #         target_h, target_w: 投影基准尺寸
-    #     """
-    #     B = vertices.shape[0]
-    #     device = vertices.device
+    def generate_mhr_tpose(self, pose_out):
+        """
+        利用 MHRHead 生成对应的 A-Pose (手臂自然下垂) 网格和关键点。
+        在送入 MHR 前，直接在 133维 参数空间中精准修改左右肩的 Z轴 旋转。
+        """
+        device = pose_out['pred_vertices'].device
+        B = pose_out['pred_vertices'].shape[0]
+
+        pred_shape = pose_out['shape'].float()
+        pred_scale = pose_out['scale'].float()
+        pred_face = pose_out['face'].float()
+
+        zero_global_trans = torch.zeros((B, 3), device=device, dtype=torch.float32)
+        zero_global_rot = torch.zeros_like(pose_out['global_rot'], dtype=torch.float32)
+        zero_hand_pose = torch.zeros_like(pose_out['hand'], dtype=torch.float32)
         
-    #     # 1. 关键：修正坐标系翻转
-    #     # MHR 输出时翻转了 Y 和 Z，我们先镜像回来，使其回到标准 SMPL 坐标空间进行计算
-    #     v_fix = vertices.clone()
-    #     v_fix[..., [1, 2]] *= -1
-    #     # v_fix = v_fix - v_fix.mean(dim=1, keepdim=True) # 中心化到骨架中心
-
-    #     # Debug (偏转角取反)
-    #     global_orient_fix = global_orient.clone()
-    #     global_orient_fix[..., [0, 1, 2]] *= -1
-    #     R_full = roma.euler_to_rotmat("XYZ", global_orient_fix)
-
-    #     # 2. 构造 "标准态 -> 侧身态" 的 90 度旋转矩阵
-    #     # 对应 Canonical 空间下的绕 Y 轴旋转
-    #     R_90 = torch.tensor([
-    #         [ 0., 0., 1.],
-    #         [ 0., 1., 0.],
-    #         [-1., 0., 0.]
-    #     ], device=device, dtype=vertices.dtype).view(1, 3, 3).expand(B, 3, 3)
-
-    #     R_composite = torch.matmul(R_full.transpose(1, 2), R_90.transpose(1, 2))
-
-    #     # 3. 执行旋转
-    #     # 使用 bmm 将中心化后的点云旋转到标准图
-    #     v_smpl = torch.bmm(v_fix, R_composite) # [B, N, 3]
-
-    #     # 4. 关键：投影前镜像回 MHR 坐标系 (Y轴向下)
-    #     # 这样 project_vertices_to_mask_and_depth 才能正确处理
-    #     v_mhr = v_smpl.clone()
-    #     v_mhr[..., [1, 2]] *= -1
-
-    #     # 5. 标准虚拟相机参数 TODO
-    #     # 根据经验，focal 设为 target_h * 1.1 比较稳妥
-    #     focal = max(target_h, target_w) * 1.1
-    #     cam_int_90 = torch.eye(3, device=device).unsqueeze(0).expand(B, 3, 3).clone()
-    #     cam_int_90[:, 0, 0] = focal
-    #     cam_int_90[:, 1, 1] = focal
-    #     cam_int_90[:, 0, 2] = target_w / 2.0
-    #     cam_int_90[:, 1, 2] = target_h / 2.0
+        # 1. 初始化全 0 姿态 (此时为标准 T-Pose，手臂水平)
+        a_pose_body = torch.zeros_like(pose_out['body_pose'], dtype=torch.float32)
         
-    #     # 将相机放在前方 2.2 米处
-    #     cam_t_90 = torch.zeros((B, 3), device=device)
-    #     cam_t_90[:, 2] = 2.2 
+        # =========================================================
+        # 🌟 核心修改：设置 A-Pose 角度和经过验证的 Index
+        # =========================================================
+        angle_rad = math.radians(-20)
+        a_pose_body[:, 25] = angle_rad   # 左肩 (画面右侧)
+        a_pose_body[:, 35] = angle_rad  # 右肩 (画面左侧)
+        # =========================================================
 
-    #     # 6. 投影生成 90 度 Mask
-    #     mask_90, _ = self.project_vertices_to_mask_and_depth(
-    #         v_mhr, cam_t_90, cam_int_90, h_feat, w_feat, target_h, target_w
-    #     )
-    #     return mask_90
+        with torch.no_grad(), torch.amp.autocast(enabled=False, device_type='cuda'):
+            t_pose_outputs = self.SAM_Engine.head_pose.mhr_forward(
+                global_trans=zero_global_trans,
+                global_rot=zero_global_rot,
+                body_pose_params=a_pose_body, # 传入修改好的 A-Pose 参数
+                hand_pose_params=zero_hand_pose,
+                scale_params=pred_scale,
+                shape_params=pred_shape,
+                expr_params=pred_face,
+                return_keypoints=True 
+            )
+
+        a_pose_verts = t_pose_outputs[0]
+        a_pose_keypoints = t_pose_outputs[1][:, :70] 
+
+        # 还原到 MHR 外部的 OpenCV 视角的坐标系 (翻转 Y, Z)
+        a_pose_verts[..., [1, 2]] *= -1
+        a_pose_keypoints[..., [1, 2]] *= -1
+        
+        return a_pose_verts, a_pose_keypoints
+
+    def warp_features_with_ot_tpose(self, human_feat, mask_src, 
+                                    pred_verts, pred_cam_t, 
+                                    t_pose_verts, t_pose_keypoints,
+                                    cam_int_src, cam_int_tgt, cam_t_tgt,
+                                    H_feat, W_feat, target_H, target_W):
+        """
+        专用于 T-Pose 的特征迁移：
+        Source: 用原姿态 (pred_verts) 找可见像素。
+        Target: 将对应像素强行映射到 T-Pose (t_pose_verts) 上，并旋转渲染。
+        """
+        import math
+        B, C, H, W = human_feat.shape
+        device = human_feat.device
+        
+        # =========================================================
+        # 1. Source 端几何计算 (依然用原网格找可见性)
+        # =========================================================
+        src_idx_map, _ = self.get_source_vertex_index_map(
+            pred_verts, pred_cam_t, cam_int_src, H_feat, W_feat, target_H, target_W
+        )
+        valid_src_mask = (mask_src.squeeze(1) > 0.5) & (src_idx_map >= 0) 
+        
+        flat_human_feat = rearrange(human_feat, 'b c h w -> b (h w) c')
+        flat_src_idx_map = src_idx_map.view(B, -1)
+        flat_src_mask = valid_src_mask.view(B, -1)
+        
+        # 🌟 核心：获取有效像素在 T-Pose 下的 3D 绝对规范化坐标
+        safe_indices = flat_src_idx_map.clone()
+        safe_indices[safe_indices < 0] = 0
+        flat_src_verts_tpose = torch.gather(t_pose_verts, 1, safe_indices.unsqueeze(-1).expand(-1, -1, 3))
+
+        # =========================================================
+        # 2. Target 端几何计算 (利用 T-Pose 生成笔挺的 Mask)
+        # =========================================================
+        midhip = (t_pose_keypoints[:, 9] + t_pose_keypoints[:, 10]) / 2.0
+        centered_tpose = t_pose_verts - midhip.unsqueeze(1) 
+        
+        # 🌟 移除 self.target_angle 的旋转逻辑，直接保持 0 度正视
+        v_tmp = centered_tpose.clone(); v_tmp[...,[1,2]] *= -1 
+        v_rot_cv = v_tmp.clone(); v_rot_cv[...,[1,2]] *= -1 
+        
+        _, tgt_depth_map = self.get_source_vertex_index_map(
+            v_rot_cv, cam_t_tgt, cam_int_tgt, H_feat, W_feat, target_H, target_W
+        )
+        valid_tgt_mask = (tgt_depth_map.view(B, -1) < 1e5)
+
+        # =========================================================
+        # 3. 构建 OT 坐标系 
+        # =========================================================
+        src_centered = flat_src_verts_tpose - midhip.unsqueeze(1)
+        src_tmp = src_centered.clone(); src_tmp[...,[1,2]] *= -1
+        # 🌟 同理，无需旋转，直接进入目标坐标系
+        src_rot_cv = src_tmp.clone(); src_rot_cv[...,[1,2]] *= -1
+        
+        v_cam_tgt = src_rot_cv + cam_t_tgt.unsqueeze(1)
+        x, y, z = v_cam_tgt.unbind(-1)
+        z = z.clamp(min=1e-3) 
+        
+        fx, fy = cam_int_tgt[:,0,0].unsqueeze(1), cam_int_tgt[:,1,1].unsqueeze(1)
+        cx, cy = cam_int_tgt[:,0,2].unsqueeze(1), cam_int_tgt[:,1,2].unsqueeze(1)
+        u_tgt = (x / z) * fx + cx
+        v_tgt = (y / z) * fy + cy
+        
+        u_norm = 2.0 * (u_tgt / target_W) - 1.0
+        v_norm = 2.0 * (v_tgt / target_H) - 1.0
+        projected_source_locs = torch.stack([u_norm, v_norm], dim=-1)
+
+        # =========================================================
+        # 4. 执行 OT (Attention)
+        # =========================================================
+        grid_y, grid_x = torch.meshgrid(
+            torch.linspace(-1, 1, H_feat, device=device),
+            torch.linspace(-1, 1, W_feat, device=device),
+            indexing='ij'
+        )
+        target_grid_locs = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(0).expand(B, -1, -1, -1).reshape(B, -1, 2)
+        
+        transported_feats = self.ot_solver(
+            flat_human_feat, 
+            projected_source_locs, 
+            target_grid_locs, 
+            source_valid_mask=flat_src_mask, 
+            target_valid_mask=valid_tgt_mask 
+        )
+        
+        warped_feat = rearrange(transported_feats, 'b (h w) c -> b c h w', h=H_feat)
+        
+        return warped_feat, valid_tgt_mask.view(B, 1, H_feat, W_feat)
 
     def preprocess(self, sils, h, w, mode='bilinear'):
         return F.interpolate(sils, (h, w), mode=mode, align_corners=False)
@@ -592,7 +711,9 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
         CHUNK_SIZE = self.chunk_size # e.g. 4
         rgb_chunks = torch.chunk(rgb, (rgb.size(1)//CHUNK_SIZE)+1, dim=1)
         
-        all_outs = []
+        # 🌟 2. 动态计算总分支数 = (视角数量) + (1个可选的TPose分支)
+        self.num_branches = len(self.target_angles) + (1 if self.use_tpose_branch else 0)
+        all_outs = [[] for _ in range(self.num_branches)] # 为每个分支准备独立的 chunk 列表
         
         # 图像目标尺寸 (512, 256)
         target_h, target_w = self.image_size * 2, self.image_size 
@@ -777,34 +898,76 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
             cam_t_tgt = torch.zeros((curr_bs, 3), device=rgb.device)
             cam_t_tgt[:, 2] = 2.2 
 
-            # C. 执行特征迁移
-            # human_feat: [B, C, 64, 32] -> warped_feat: [B, C, 64, 32]
-            # 注意：这里的特征是正侧面的！
-            warped_feat = self.warp_features_with_ot(
-                human_feat, 
-                full_mask_src, 
-                pred_verts, pred_keypoints, pred_cam_t, global_rot,
-                cam_int_src, cam_int_tgt, cam_t_tgt,
-                self.sils_size*2, self.sils_size, # Feat Size: 64, 32
-                target_h, target_w                # Render Size: 512, 256
-            )
-
-            # C. Reshape for GaitNet [n, c, s, h, w]
-            # 将 (n*s) 解开
-            warped_feat = rearrange(warped_feat, '(n s) c h w -> n c s h w', n=n, s=s).contiguous()
+            # =======================================================
+            # 🌟 3. 多视角 & 独立 A-Pose 分支并行处理
+            # =======================================================
+            branch_warped_feats = []
+            chunk_pca_tgt_list = []
             
-            # 9. GaitNet Part 1 (ResNet)
-            # Input:  [n, C, s, H, W]
-            # Output: [n, C_out, s, H', W']
-            outs = self.Gait_Net.test_1(warped_feat)
+            # 分支组 A: 遍历所有配置的 target_angles，保持原始姿态进行旋转
+            for angle in self.target_angles:
+                self.target_angle = angle # 临时覆盖，只影响 warp_features_with_ot
+                
+                warp_feat_norm, tgt_mask_norm = self.warp_features_with_ot(
+                    human_feat, full_mask_src, 
+                    pred_verts, pred_keypoints, pred_cam_t, global_rot,
+                    cam_int_src, cam_int_tgt, cam_t_tgt,
+                    self.sils_size*2, self.sils_size, target_h, target_w 
+                )
+                branch_warped_feats.append(warp_feat_norm)
+                if self.training: 
+                    chunk_pca_tgt_list.append(self.get_pca_vis_tensor(warp_feat_norm, tgt_mask_norm))
+            
+            # 分支 B: 唯一的 T-Pose 分支 (完全正视，不再做任何旋转)
+            if self.use_tpose_branch:
+                t_pose_verts, t_pose_keypoints = self.generate_mhr_tpose(pose_outs[-1])
+                warp_feat_tpose, tgt_mask_tpose = self.warp_features_with_ot_tpose(
+                    human_feat, full_mask_src, 
+                    pred_verts, pred_cam_t, 
+                    t_pose_verts, t_pose_keypoints,
+                    cam_int_src, cam_int_tgt, cam_t_tgt,
+                    self.sils_size*2, self.sils_size, target_h, target_w 
+                )
+                branch_warped_feats.append(warp_feat_tpose)
+                if self.training: 
+                    chunk_pca_tgt_list.append(self.get_pca_vis_tensor(warp_feat_tpose, tgt_mask_tpose))
+            
+            # 聚合 PCA 图像
+            if self.training:
+                # 1. 处理 Source (OT前): 将 5 个样本横向拼成一条 [1, 3, H, 5W]
+                src_pca_batch = self.get_pca_vis_tensor(human_feat, full_mask_src)
+                chunk_pca_src = torch.cat(torch.unbind(src_pca_batch, dim=0), dim=-1).unsqueeze(0)
+                
+                # 2. 处理 Target (OT后): 
+                # 每个分支是一个 [5, 3, H, W] 的 Tensor
+                # 先把每个分支内部的 5 个样本横向拼成一行条带 [3, H, 5W]
+                row_strips = [torch.cat(torch.unbind(b_pca, dim=0), dim=-1) for b_pca in chunk_pca_tgt_list]
+                
+                # 再把所有分支的条带纵向拼接，形成最终网格 [1, 3, Branches*H, 5W]
+                chunk_pca_tgt = torch.cat(row_strips, dim=-2).unsqueeze(0)
 
-            all_outs.append(outs)
+            # 分别独立通过 GaitNet Part 1
+            for b_idx, warp_feat in enumerate(branch_warped_feats):
+                warp_feat_5d = rearrange(warp_feat, '(n s) c h w -> n c s h w', n=n, s=s).contiguous()
+                outs = self.Gait_Net.test_1(warp_feat_5d)
+                all_outs[b_idx].append(outs)
 
-        # GaitNet Part 2 (时序聚合)
-        embed_list, log_list = self.Gait_Net.test_2(
-            torch.cat(all_outs, dim=2), # [n, c, s_chunk, h, w]
-            seqL
-        )
+        # 🌟 4. 各分支分别经过 Part 2，并按 FPN 头进行特征融合 (Feature Fusion)
+        embed_grouped = [[] for _ in range(self.num_FPN)]
+        log_grouped = [[] for _ in range(self.num_FPN)]
+        
+        for b_idx in range(self.num_branches):
+            branch_seq_feat = torch.cat(all_outs[b_idx], dim=2) 
+            e_list, l_list = self.Gait_Net.test_2(branch_seq_feat, seqL)
+            
+            # 将当前分支的结果按 FPN 头分配到对应的组里
+            for i in range(self.num_FPN):
+                embed_grouped[i].append(e_list[i])
+                log_grouped[i].append(l_list[i])
+        
+        # 将同 1 个 FPN 头在不同分支下的特征在 Part 维度 (dim=-1) 拼接
+        embed_list = [torch.cat(feats, dim=-1) for feats in embed_grouped]
+        log_list = [torch.cat(logits, dim=-1) for logits in log_grouped]
         
         if self.training:
             retval = {
@@ -816,6 +979,8 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
                     'image/rgb_img': rgb_img.view(n*s, c, h, w)[:3].float(),
                     **part_summaries,
                     'image/generated_3d_mask_lowres': generated_mask.view(n*s, 1, h_feat, w_feat)[:3].float(),
+                    'image/pca_before_OT': chunk_pca_src,
+                    'image/pca_after_OT': chunk_pca_tgt,
                 },
                 'inference_feat': {
                     'embeddings': torch.cat(embed_list, dim=-1),

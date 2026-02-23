@@ -10,7 +10,7 @@ data_cfg:
 evaluator_cfg:
   enable_float16: true
   restore_ckpt_strict: False
-  restore_hint: 10000
+  restore_hint: 15000
   save_name: BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share
   eval_func: evaluate_CCPG_part
   sampler:
@@ -96,7 +96,8 @@ model_cfg:
   ot_temperature: 0.01
   ot_dist_thresh: 0.2
   ot_iters: 8
-  target_angle: 90.0
+  target_angles: [-45, 45]
+  use_tpose_branch: True
   
   Mask_Branch:
     source_dim: 1280  # 注意：这里也要改成 1280，因为 MaskBranch 也是接在 Backbone 后面
@@ -154,20 +155,20 @@ trainer_cfg:
   find_unused_parameters: True
   enable_float16: true
   fix_BN: false
-  log_iter: 100
+  log_iter: 1
   with_test: true
   restore_ckpt_strict: true
   restore_hint: 0
   save_iter: 5000
   save_name: BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share
   sync_BN: true
-  total_iter: 30000
+  total_iter: 3
   sampler:
     batch_shuffle: true
     batch_size:
       - 8
       - 4 # 显存警告：SAM 3D Body 很大，如果 OOM，请将此值减小到 2
-    frames_num_fixed: 5
+    frames_num_fixed: 30
     frames_skip_num: 4
     frames_num_max: 40
     frames_num_min: 20
