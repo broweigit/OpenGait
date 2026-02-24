@@ -98,6 +98,7 @@ model_cfg:
   ot_iters: 8
   target_angles: [-45, 45]
   use_tpose_branch: True
+  use_identity_branch: True
   
   Mask_Branch:
     source_dim: 1280  # 注意：这里也要改成 1280，因为 MaskBranch 也是接在 Backbone 后面

@@ -246,6 +246,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
             self.target_angles = [float(self.target_angles)]
             
         self.use_tpose_branch = model_cfg.get("use_tpose_branch", False)
+        self.use_identity_branch = model_cfg.get("use_identity_branch", False)
         
         self.ot_solver = GeometryOptimalTransport(
             temperature=ot_temp, 
@@ -715,9 +716,11 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
         CHUNK_SIZE = self.chunk_size # e.g. 4
         rgb_chunks = torch.chunk(rgb, (rgb.size(1)//CHUNK_SIZE)+1, dim=1)
         
-        # 🌟 2. 动态计算总分支数 = (视角数量) + (1个可选的TPose分支)
-        self.num_branches = len(self.target_angles) + (1 if self.use_tpose_branch else 0)
-        all_outs = [[] for _ in range(self.num_branches)] # 为每个分支准备独立的 chunk 列表
+        # 🌟 2. 动态计算总分支数 = (视角数量) + (1个可选的TPose分支) + (1个可选的原图分支)
+        self.num_branches = len(self.target_angles) + \
+                            (1 if self.use_tpose_branch else 0) + \
+                            (1 if self.use_identity_branch else 0)
+        all_outs = [[] for _ in range(self.num_branches)]
         
         # 图像目标尺寸 (512, 256)
         target_h, target_w = self.image_size * 2, self.image_size 
@@ -907,6 +910,13 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
             # =======================================================
             branch_warped_feats = []
             chunk_pca_tgt_list = []
+
+            # 将不做任何修改的特征图作为一个独立分支
+            if self.use_identity_branch:
+                branch_warped_feats.append(human_feat)
+                if self.training:
+                    # 可视化时，使用原始的 full_mask_src
+                    chunk_pca_tgt_list.append(self.get_pca_vis_tensor(human_feat, full_mask_src))
             
             # 分支组 A: 遍历所有配置的 target_angles，保持原始姿态进行旋转
             for angle in self.target_angles:
