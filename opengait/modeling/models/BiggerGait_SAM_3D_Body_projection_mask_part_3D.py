@@ -91,59 +91,63 @@ class GeometryOptimalTransport(nn.Module):
         """
         B, N, C = source_feats.shape
         M = target_locs.shape[1]
+
+        with torch.no_grad():
         
-        # 1. 计算代价矩阵 Cost (同老方法)
-        diff = target_locs.unsqueeze(2) - source_locs.unsqueeze(1)
-        dist_sq = torch.sum(diff ** 2, dim=-1)
+            # 1. 计算代价矩阵 Cost (同老方法)
+            diff = target_locs.unsqueeze(2) - source_locs.unsqueeze(1)
+            dist_sq = torch.sum(diff ** 2, dim=-1)
 
-        # 2. 构建 Log-Kernel (同老方法，但在 Log 域)
-        # Log_K_ij = -C_ij / epsilon
-        log_K = -dist_sq / (self.epsilon + 1e-8)
+            # 2. 构建 Log-Kernel (同老方法，但在 Log 域)
+            # Log_K_ij = -C_ij / epsilon
+            log_K = -dist_sq / (self.epsilon + 1e-8)
 
-        # 3. 处理 Mask (同老方法，逻辑一致)
-        valid_connection = dist_sq < (self.dist_thresh ** 2)
-        if source_valid_mask is not None:
-            valid_connection = valid_connection & source_valid_mask.unsqueeze(1)
-        if target_valid_mask is not None:
-            valid_connection = valid_connection & target_valid_mask.unsqueeze(2)
-        
-        # 填充 -1e9 (Log 域的 0)
-        log_K = log_K.masked_fill(~valid_connection, -1e9)
+            # 3. 处理 Mask (同老方法，逻辑一致)
+            valid_connection = dist_sq < (self.dist_thresh ** 2)
+            del diff, dist_sq # 释放内存
 
-        # ==========================================================
-        # 4. Sinkhorn 迭代 (Log-Domain)
-        # 这里的改进：我们只迭代 3 次，这是一种"部分 OT"。
-        # 它比 Softmax 更锐利，但又不像完全收敛的 OT 那样死板（允许一定的质量不平衡）。
-        # ==========================================================
-        
-        # 初始化势能
-        v = torch.zeros(B, 1, N, device=source_feats.device) # Source 势能
-        u = torch.zeros(B, M, 1, device=source_feats.device) # Target 势能
-
-        for _ in range(self.num_iters):
-            # 步骤 A: Target 归一化 (类似 Softmax 的行归一化)
-            # u = -logsumexp(log_K + v)
-            # 这一步保证了每个 Target 像素能"抢"到足够的特征
-            u = -torch.logsumexp(log_K + v, dim=2, keepdim=True)
-            
-            # 步骤 B: Source 归一化 (列归一化)
-            # v = -logsumexp(log_K + u)
-            # 这一步抑制了被过度复用的 Source 像素
-            v = -torch.logsumexp(log_K + u, dim=1, keepdim=True)
-            
-            # 【关键修正】：防止 v 在全是 Mask 的列变成 inf
-            # 如果某列 Source 全是无效连接，logsumexp 结果是 -inf，v 变成 inf
-            # 我们需要把这些无效列的 v 重置为 0，防止污染后续计算
             if source_valid_mask is not None:
-                v = v.masked_fill(~source_valid_mask.unsqueeze(1), 0.0)
+                valid_connection = valid_connection & source_valid_mask.unsqueeze(1)
+            if target_valid_mask is not None:
+                valid_connection = valid_connection & target_valid_mask.unsqueeze(2)
+            
+            # 填充 -1e9 (Log 域的 0)
+            log_K = log_K.masked_fill(~valid_connection, -1e9)
 
-        # 5. 计算最终 Attention Map
-        # P = exp(log_K + u + v)
-        log_P = log_K + u + v
-        attn = torch.exp(log_P)
-        
-        # 再次硬过滤 (双重保险，同老方法)
-        attn = attn * valid_connection.float()
+            # ==========================================================
+            # 4. Sinkhorn 迭代 (Log-Domain)
+            # 这里的改进：我们只迭代 3 次，这是一种"部分 OT"。
+            # 它比 Softmax 更锐利，但又不像完全收敛的 OT 那样死板（允许一定的质量不平衡）。
+            # ==========================================================
+            
+            # 初始化势能
+            v = torch.zeros(B, 1, N, device=source_feats.device) # Source 势能
+            u = torch.zeros(B, M, 1, device=source_feats.device) # Target 势能
+
+            for _ in range(self.num_iters):
+                # 步骤 A: Target 归一化 (类似 Softmax 的行归一化)
+                # u = -logsumexp(log_K + v)
+                # 这一步保证了每个 Target 像素能"抢"到足够的特征
+                u = -torch.logsumexp(log_K + v, dim=2, keepdim=True)
+                
+                # 步骤 B: Source 归一化 (列归一化)
+                # v = -logsumexp(log_K + u)
+                # 这一步抑制了被过度复用的 Source 像素
+                v = -torch.logsumexp(log_K + u, dim=1, keepdim=True)
+                
+                # 【关键修正】：防止 v 在全是 Mask 的列变成 inf
+                # 如果某列 Source 全是无效连接，logsumexp 结果是 -inf，v 变成 inf
+                # 我们需要把这些无效列的 v 重置为 0，防止污染后续计算
+                if source_valid_mask is not None:
+                    v = v.masked_fill(~source_valid_mask.unsqueeze(1), 0.0)
+
+            # 5. 计算最终 Attention Map
+            # P = exp(log_K + u + v)
+            attn = torch.exp(log_K + u + v)
+            del log_K, u, v # 释放内存
+            
+            # 再次硬过滤 (双重保险，同老方法)
+            # has_source = valid_connection.any(dim=-1, keepdim=True)
         
         # ==========================================================
         # 6. 特征搬运 (同老方法)
@@ -949,8 +953,24 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
             # 分别独立通过 GaitNet Part 1
             for b_idx, warp_feat in enumerate(branch_warped_feats):
                 warp_feat_5d = rearrange(warp_feat, '(n s) c h w -> n c s h w', n=n, s=s).contiguous()
-                outs = self.Gait_Net.test_1(warp_feat_5d)
+                
+                # 🌟 优化点 1: 使用梯度检查点
+                if self.training:
+                    # 使用 PyTorch 原生的 checkpoint 函数
+                    # 注意：需要确保输入 warp_feat_5d 有梯度（OT 输出通常是有梯度的）
+                    outs = torch.utils.checkpoint.checkpoint(
+                        self.Gait_Net.test_1, 
+                        warp_feat_5d, 
+                        use_reentrant=False
+                    )
+                else:
+                    outs = self.Gait_Net.test_1(warp_feat_5d)
+                
                 all_outs[b_idx].append(outs)
+                
+                # 🌟 优化点 2: 及时释放不再需要的中间特征
+                # 执行完 test_1 后，原本巨大的 warp_feat 已经没用了，立即手动清理
+                branch_warped_feats[b_idx] = None
 
         # 🌟 4. 各分支分别经过 Part 2，并按 FPN 头进行特征融合 (Feature Fusion)
         embed_grouped = [[] for _ in range(self.num_FPN)]
