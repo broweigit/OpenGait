@@ -262,6 +262,9 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
             num_iters=ot_iters
         )
 
+        self.enable_visual = model_cfg.get("enable_visual", False)
+        self.msg_mgr.log_info(f"Visualization status: {self.enable_visual}")
+
     def init_SAM_Backbone(self):
         if self.pretrained_lvm not in sys.path:
             sys.path.insert(0, self.pretrained_lvm)
@@ -583,21 +586,23 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
         # 恢复形状
         warped_feat = rearrange(transported_feats, 'b (h w) c -> b c h w', h=H_feat)
         
-        # 🌟 新增：搬运颜色流 (仅限训练可视化)
-        color_grid = self._generate_color_grid(B, H_feat, W_feat, device)
-        flat_color = rearrange(color_grid, 'b c h w -> b (h w) c')
-        
-        # 这里的 transported_feats 是特征，我们需要再算一次颜色
-        # 或者直接让 ot_solver 返回 attn 矩阵。
-        # 简单做法：再次调用 solver 搬运颜色
-        warped_color_flat = self.ot_solver(
-            flat_color, 
-            projected_source_locs, 
-            target_grid_locs, 
-            source_valid_mask=flat_src_mask,
-            target_valid_mask=valid_tgt_mask
-        )
-        warped_color = rearrange(warped_color_flat, 'b (h w) c -> b c h w', h=H_feat)
+        warped_color = None
+        if self.enable_visual:
+            # 🌟 新增：搬运颜色流 (仅限训练可视化)
+            color_grid = self._generate_color_grid(B, H_feat, W_feat, device)
+            flat_color = rearrange(color_grid, 'b c h w -> b (h w) c')
+            
+            # 这里的 transported_feats 是特征，我们需要再算一次颜色
+            # 或者直接让 ot_solver 返回 attn 矩阵。
+            # 简单做法：再次调用 solver 搬运颜色
+            warped_color_flat = self.ot_solver(
+                flat_color, 
+                projected_source_locs, 
+                target_grid_locs, 
+                source_valid_mask=flat_src_mask,
+                target_valid_mask=valid_tgt_mask
+            )
+            warped_color = rearrange(warped_color_flat, 'b (h w) c -> b c h w', h=H_feat)
         
         return warped_feat, valid_tgt_mask.view(B, 1, H_feat, W_feat), warped_color
     
@@ -736,21 +741,23 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
 
         warped_feat = rearrange(transported_feats, 'b (h w) c -> b c h w', h=H_feat)
         
-        # 🌟 新增：搬运颜色流 (仅限训练可视化)
-        color_grid = self._generate_color_grid(B, H_feat, W_feat, device)
-        flat_color = rearrange(color_grid, 'b c h w -> b (h w) c')
-        
-        # 这里的 transported_feats 是特征，我们需要再算一次颜色
-        # 或者直接让 ot_solver 返回 attn 矩阵。
-        # 简单做法：再次调用 solver 搬运颜色
-        warped_color_flat = self.ot_solver(
-            flat_color, 
-            projected_source_locs, 
-            target_grid_locs, 
-            source_valid_mask=flat_src_mask,
-            target_valid_mask=valid_tgt_mask
-        )
-        warped_color = rearrange(warped_color_flat, 'b (h w) c -> b c h w', h=H_feat)
+        warped_color = None
+        if self.enable_visual:
+            # 🌟 新增：搬运颜色流 (仅限训练可视化)
+            color_grid = self._generate_color_grid(B, H_feat, W_feat, device)
+            flat_color = rearrange(color_grid, 'b c h w -> b (h w) c')
+            
+            # 这里的 transported_feats 是特征，我们需要再算一次颜色
+            # 或者直接让 ot_solver 返回 attn 矩阵。
+            # 简单做法：再次调用 solver 搬运颜色
+            warped_color_flat = self.ot_solver(
+                flat_color, 
+                projected_source_locs, 
+                target_grid_locs, 
+                source_valid_mask=flat_src_mask,
+                target_valid_mask=valid_tgt_mask
+            )
+            warped_color = rearrange(warped_color_flat, 'b (h w) c -> b c h w', h=H_feat)
         
         return warped_feat, valid_tgt_mask.view(B, 1, H_feat, W_feat), warped_color
     
@@ -1067,7 +1074,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
                             final_disjoint_masks[name] = mask # [B, 1, H, W]
                             
                             # 生成单部位叠加图 (仅限前5个样本)
-                            if name in part_colors and curr_bs > 0:
+                            if self.enable_visual and name in part_colors and curr_bs > 0:
                                 m_high = F.interpolate(is_closest.float(), (target_h, target_w), mode='bilinear', align_corners=False)
                                 c_vec = torch.tensor(part_colors[name], device=rgb.device).view(1, 3, 1, 1)
                                 part_overlay = outs * 0.2 + (m_high * c_vec) * 0.8
@@ -1162,7 +1169,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
             # 将不做任何修改的特征图作为一个独立分支
             if self.use_identity_branch:
                 branch_warped_feats.append(human_feat)
-                if self.training:
+                if self.training and self.enable_visual:
                     # 可视化时，使用原始的 full_mask_src
                     chunk_pca_tgt_list.append(self.get_pca_vis_tensor(human_feat, full_mask_src))
                     chunk_flow_tgt_list.append(self._generate_color_grid(curr_bs, h_feat, w_feat, rgb.device) * generated_mask)
@@ -1178,7 +1185,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
                     self.sils_size*2, self.sils_size, target_h, target_w 
                 )
                 branch_warped_feats.append(warp_feat_norm)
-                if self.training: 
+                if self.training and self.enable_visual: 
                     chunk_pca_tgt_list.append(self.get_pca_vis_tensor(warp_feat_norm, tgt_mask_norm))
                     chunk_flow_tgt_list.append(tgt_color_flow)
             
@@ -1193,26 +1200,20 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
                     self.sils_size*2, self.sils_size, target_h, target_w 
                 )
                 branch_warped_feats.append(warp_feat_tpose)
-                if self.training: 
+                if self.training and self.enable_visual: 
                     chunk_pca_tgt_list.append(self.get_pca_vis_tensor(warp_feat_tpose, tgt_mask_tpose))
                     chunk_flow_tgt_list.append(tgt_color_flow_tpose)
             
-            # 聚合 PCA 图像
-            if self.training:
-                # 1. 处理 Source (OT前): 将 5 个样本横向拼成一条 [1, 3, H, 5W]
+            # 聚合 PCA 和其他图像
+            visual_summary = {}
+            if self.training and self.enable_visual:
+                # 1. 聚合 PCA 图像
                 src_pca_batch = self.get_pca_vis_tensor(human_feat, full_mask_src)
                 chunk_pca_src = torch.cat(torch.unbind(src_pca_batch, dim=0), dim=-1).unsqueeze(0)
-                
-                # 2. 处理 Target (OT后): 
-                # 每个分支是一个 [5, 3, H, W] 的 Tensor
-                # 先把每个分支内部的 5 个样本横向拼成一行条带 [3, H, 5W]
                 row_strips = [torch.cat(torch.unbind(b_pca, dim=0), dim=-1) for b_pca in chunk_pca_tgt_list]
-                
-                # 再把所有分支的条带纵向拼接，形成最终网格 [1, 3, Branches*H, 5W]
                 chunk_pca_tgt = torch.cat(row_strips, dim=-2).unsqueeze(0)
 
-                # ====================================================
-                # 🌟 调用临时点云渲染代码 (想关闭时直接注释这一小段即可)
+                # 2. 渲染点云 (极其耗时)
                 t_verts = t_pose_verts if self.use_tpose_branch else None
                 t_kps = t_pose_keypoints if self.use_tpose_branch else None
                 chunk_pcd_grid = self._temp_render_pcd_grid(
@@ -1221,17 +1222,24 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
                     cam_int_src, cam_int_tgt, cam_t_tgt,
                     target_h, target_w, max_samples=5
                 )
-                # ====================================================
 
-            # 🌟 4. 聚合颜色流图像 (若干行 x 5列)
-            if self.training:
-                # Source Flow (原始参考)
+                # 3. 聚合颜色流
                 src_color = self._generate_color_grid(curr_bs, h_feat, w_feat, rgb.device) * generated_mask
                 chunk_flow_src = torch.cat(torch.unbind(src_color[:5], dim=0), dim=-1).unsqueeze(0)
-                
-                # Target Flow Grid
                 flow_strips = [torch.cat(torch.unbind(b_flow[:5], dim=0), dim=-1) for b_flow in chunk_flow_tgt_list]
                 chunk_flow_grid = torch.cat(flow_strips, dim=-2).unsqueeze(0)
+
+                # 组装 visual_summary
+                visual_summary = {
+                    'image/rgb_img': rgb_img.view(n*s, c, h, w)[:5].float(),
+                    **part_summaries,
+                    'image/generated_3d_mask_lowres': generated_mask.view(n*s, 1, h_feat, w_feat)[:5].float(),
+                    'image/pca_before_OT': chunk_pca_src,
+                    'image/pca_after_OT': chunk_pca_tgt,
+                    'image/point_cloud_grid': chunk_pcd_grid,
+                    'image/ot_flow_reference': chunk_flow_src,
+                    'image/ot_flow_warped_grid': chunk_flow_grid,
+                }
 
             # 分别独立通过 GaitNet Part 1
             for b_idx, warp_feat in enumerate(branch_warped_feats):
@@ -1278,16 +1286,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
                     'triplet': {'embeddings': torch.cat(embed_list, dim=-1), 'labels': labs},
                     'softmax': {'logits': torch.cat(log_list, dim=-1), 'labels': labs},
                 },
-                'visual_summary': {
-                    'image/rgb_img': rgb_img.view(n*s, c, h, w)[:5].float(),
-                    **part_summaries,
-                    'image/generated_3d_mask_lowres': generated_mask.view(n*s, 1, h_feat, w_feat)[:5].float(),
-                    'image/pca_before_OT': chunk_pca_src,
-                    'image/pca_after_OT': chunk_pca_tgt,
-                    'image/point_cloud_grid': chunk_pcd_grid, # 临时点云可视化输出
-                    'image/ot_flow_reference': chunk_flow_src, # 源图颜色参考
-                    'image/ot_flow_warped_grid': chunk_flow_grid, # 搬运后的网格
-                },
+                'visual_summary': visual_summary,
                 'inference_feat': {
                     'embeddings': torch.cat(embed_list, dim=-1),
                     **{f'embeddings_{i}': embed_list[i] for i in range(self.num_FPN)}

@@ -102,6 +102,8 @@ model_cfg:
     - [45.0, 45.0]   # 45度偏转 + 45度俯视
   use_tpose_branch: True  # A-Pose 独立的分支
   use_identity_branch: False
+
+  enable_visual: False  # 是否启用可视化输出（仅训练时）
   
   Mask_Branch:
     source_dim: 1280  # 注意：这里也要改成 1280，因为 MaskBranch 也是接在 Backbone 后面
