@@ -577,6 +577,12 @@ def evaluate_CCPG_part(data, dataset, metric='euc'):
         msg_mgr.log_info("\n" + "="*40)
         msg_mgr.log_info(f"2. FPN Branch Evaluation")
         msg_mgr.log_info("="*40)
+
+        # 硬编码：单个 Branch 在一个 FPN Head 里的 Part 数量
+        PARTS_PER_SINGLE_BRANCH = 16
+        # 自动计算当前模型总共拼接了几个 Branch
+        num_branches = PARTS_PER_HEAD // PARTS_PER_SINGLE_BRANCH
+        msg_mgr.log_info(f"Detected {num_branches} branches per Head (Parts per branch: {PARTS_PER_SINGLE_BRANCH})")
         
         for head_idx in range(NUM_FPN_HEADS):
             msg_mgr.log_info(f"\n>>> [FPN Head {head_idx}]")
@@ -589,12 +595,28 @@ def evaluate_CCPG_part(data, dataset, metric='euc'):
             head_feat_chunk = feature[:, :, start:end] 
             run_evaluation_core(head_feat_chunk, title_suffix=f"[Head-{head_idx} Full]")
 
-            # 单个 Part [N, C, 1]
+            # 2. 分别评估每一个 Branch (子组的 Full 评估)
+            if num_branches > 1:
+                for b_idx in range(num_branches):
+                    b_start = start + (b_idx * PARTS_PER_SINGLE_BRANCH)
+                    b_end = b_start + PARTS_PER_SINGLE_BRANCH
+                    branch_feat_chunk = feature[:, :, b_start:b_end]
+                    run_evaluation_core(branch_feat_chunk, title_suffix=f"  *[Branch-{b_idx} Full]")
+
+            # 3. 细粒度到单个 Part 
             for part_idx in range(PARTS_PER_HEAD):
                 abs_idx = start + part_idx
-                # 切片保持 3D 维度
                 part_feat = feature[:, :, abs_idx : abs_idx+1]
-                run_evaluation_core(part_feat, title_suffix=f"  - Part {part_idx:02d}")
+                
+                # 为了可读性，如果是多 branch，可以在标题里标明属于哪个 branch
+                b_id = part_idx // PARTS_PER_SINGLE_BRANCH
+                inner_p_id = part_idx % PARTS_PER_SINGLE_BRANCH
+                if num_branches > 1:
+                    title = f"    - B{b_id} Part {inner_p_id:02d} (Abs:{part_idx:02d})"
+                else:
+                    title = f"    - Part {part_idx:02d}"
+                    
+                run_evaluation_core(part_feat, title_suffix=title)
 
     return {}
 

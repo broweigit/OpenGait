@@ -241,9 +241,17 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
         ot_dist = model_cfg.get("ot_dist_thresh", 0.2)
         ot_iters = model_cfg.get("ot_iters", 8)
 
-        self.target_angles = model_cfg.get("target_angles", [90.0])
-        if isinstance(self.target_angles, (float, int)):
-            self.target_angles = [float(self.target_angles)]
+        # 🌟 1. 兼容元组/列表解析: [Yaw, Pitch]
+        raw_angles = model_cfg.get("target_angles", [[90.0, 0.0]])
+        self.target_angles = []
+        if isinstance(raw_angles, (float, int)):
+            self.target_angles.append((float(raw_angles), 0.0))
+        else:
+            for a in raw_angles:
+                if isinstance(a, (list, tuple)) and len(a) >= 2:
+                    self.target_angles.append((float(a[0]), float(a[1])))
+                else:
+                    self.target_angles.append((float(a), 0.0))
             
         self.use_tpose_branch = model_cfg.get("use_tpose_branch", False)
         self.use_identity_branch = model_cfg.get("use_identity_branch", False)
@@ -487,14 +495,27 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
         rot_fix = global_rot.clone(); rot_fix[..., [0,1,2]] *= -1
         R_canon = roma.euler_to_rotmat("XYZ", rot_fix)
 
-        # 🌟 根据配置的 target_angle 生成绕 Y 轴的旋转矩阵
-        rad = math.radians(self.target_angle)
-        c, s = math.cos(rad), math.sin(rad)
-        R_side = torch.tensor([
-            [ c, 0., s],
+        # 🌟 2. 复合旋转矩阵 (Yaw 偏转 + Pitch 俯仰)
+        yaw, pitch = self.target_angle
+        cy, sy = math.cos(math.radians(yaw)), math.sin(math.radians(yaw))
+        cp, sp = math.cos(math.radians(pitch)), math.sin(math.radians(pitch))
+        
+        # 绕 Y 轴偏转 (Yaw)
+        R_y = torch.tensor([
+            [ cy, 0., sy],
             [ 0., 1., 0.],
-            [-s, 0., c]
-        ], device=device, dtype=torch.float32).view(1, 3, 3).expand(B, 3, 3)
+            [-sy, 0., cy]
+        ], device=device, dtype=torch.float32)
+        
+        # 绕 X 轴俯仰 (Pitch)
+        R_p = torch.tensor([
+            [ 1., 0.,  0.],
+            [ 0., cp, -sp],
+            [ 0., sp,  cp]
+        ], device=device, dtype=torch.float32)
+        
+        # 组合：先偏转，再俯仰 (注意矩阵乘法顺序)
+        R_side = torch.matmul(R_p, R_y).view(1, 3, 3).expand(B, 3, 3)
 
         # 复合旋转: R_comp @ v (在 SMPL 坐标系下)
         R_comp = torch.matmul(R_canon.transpose(1,2), R_side.transpose(1,2))
@@ -562,8 +583,23 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
         # 恢复形状
         warped_feat = rearrange(transported_feats, 'b (h w) c -> b c h w', h=H_feat)
         
-        # 附带返回 Target Mask 用于 PCA 可视化
-        return warped_feat, valid_tgt_mask.view(B, 1, H_feat, W_feat)
+        # 🌟 新增：搬运颜色流 (仅限训练可视化)
+        color_grid = self._generate_color_grid(B, H_feat, W_feat, device)
+        flat_color = rearrange(color_grid, 'b c h w -> b (h w) c')
+        
+        # 这里的 transported_feats 是特征，我们需要再算一次颜色
+        # 或者直接让 ot_solver 返回 attn 矩阵。
+        # 简单做法：再次调用 solver 搬运颜色
+        warped_color_flat = self.ot_solver(
+            flat_color, 
+            projected_source_locs, 
+            target_grid_locs, 
+            source_valid_mask=flat_src_mask,
+            target_valid_mask=valid_tgt_mask
+        )
+        warped_color = rearrange(warped_color_flat, 'b (h w) c -> b c h w', h=H_feat)
+        
+        return warped_feat, valid_tgt_mask.view(B, 1, H_feat, W_feat), warped_color
     
     def generate_mhr_tpose(self, pose_out):
         """
@@ -697,10 +733,221 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
             source_valid_mask=flat_src_mask, 
             target_valid_mask=valid_tgt_mask 
         )
-        
+
         warped_feat = rearrange(transported_feats, 'b (h w) c -> b c h w', h=H_feat)
         
-        return warped_feat, valid_tgt_mask.view(B, 1, H_feat, W_feat)
+        # 🌟 新增：搬运颜色流 (仅限训练可视化)
+        color_grid = self._generate_color_grid(B, H_feat, W_feat, device)
+        flat_color = rearrange(color_grid, 'b c h w -> b (h w) c')
+        
+        # 这里的 transported_feats 是特征，我们需要再算一次颜色
+        # 或者直接让 ot_solver 返回 attn 矩阵。
+        # 简单做法：再次调用 solver 搬运颜色
+        warped_color_flat = self.ot_solver(
+            flat_color, 
+            projected_source_locs, 
+            target_grid_locs, 
+            source_valid_mask=flat_src_mask,
+            target_valid_mask=valid_tgt_mask
+        )
+        warped_color = rearrange(warped_color_flat, 'b (h w) c -> b c h w', h=H_feat)
+        
+        return warped_feat, valid_tgt_mask.view(B, 1, H_feat, W_feat), warped_color
+    
+    # =========================================================================
+    # 🛠️ 临时代码区：点云投影渲染器 (带 3D 实心朝向箭头)
+    # =========================================================================
+    def _generate_solid_arrow_pcd(self, device, num_points=4000, y_offset=-1.0):
+        """
+        生成一个实心的 3D 箭头点云。
+        y_offset: 箭头在 Y 轴的高度。-1.0 约在脚底地面，0.0 在骨盆中心。
+        """
+        # 定义箭头尺寸
+        w_shaft = 0.3  # 箭杆宽度
+        l_shaft = 0.3   # 箭杆长度
+        w_head = 0.6    # 箭头宽度
+        l_head = 0.3    # 箭头长度
+        
+        # 计算面积用于分配点数，保证密度均匀
+        area_shaft = w_shaft * l_shaft
+        area_head = 0.5 * w_head * l_head
+        total_area = area_shaft + area_head
+        
+        n_shaft = int(num_points * (area_shaft / total_area))
+        n_head = num_points - n_shaft
+        
+        # 1. 均匀采样箭杆 (矩形)
+        # x 在 [-w/2, w/2], z 在 [0, l_shaft]
+        x_shaft = (torch.rand(n_shaft, device=device) - 0.5) * w_shaft
+        z_shaft = torch.rand(n_shaft, device=device) * l_shaft
+        
+        # 2. 均匀采样箭头 (三角形)
+        # 使用随机仿射组合，并折叠超出的部分保证在三角形内
+        r1 = torch.rand(n_head, device=device)
+        r2 = torch.rand(n_head, device=device)
+        mask = (r1 + r2) > 1.0
+        r1[mask] = 1.0 - r1[mask]
+        r2[mask] = 1.0 - r2[mask]
+        
+        # 三角形顶点: 尖端 (0, l_shaft+l_head), 左下 (-w_head/2, l_shaft), 右下 (w_head/2, l_shaft)
+        x_head = r1 * (-w_head/2) + r2 * (w_head/2)
+        z_head = (l_shaft + l_head) - (r1 + r2) * l_head
+        
+        # 3. 组合为 3D 坐标
+        x = torch.cat([x_shaft, x_head])
+        z = torch.cat([z_shaft, z_head])
+        y = torch.full_like(x, y_offset) # 压扁在同一个高度平面上
+        
+        arrow_pcd = torch.stack([x, y, z], dim=-1) # [N, 3]
+        return arrow_pcd.unsqueeze(0) # [1, N, 3]
+
+    def _temp_render_pcd_grid(self, pred_verts, pred_keypoints, pred_cam_t, global_rot, 
+                              t_pose_verts, t_pose_keypoints,
+                              cam_int_src, cam_int_tgt, cam_t_tgt, 
+                              target_h, target_w, max_samples=5):
+        """
+        渲染彩色 3D 点云投影图，并包含实心朝向箭头。
+        """
+        import math
+        B = min(pred_verts.shape[0], max_samples)
+        device = pred_verts.device
+        
+        v_src = pred_verts[:B]
+        kp_src = pred_keypoints[:B]
+        c_int_src = cam_int_src[:B]
+        g_rot = global_rot[:B]
+        c_int_tgt = cam_int_tgt[:B]
+
+        c_t_tgt = cam_t_tgt[:B].clone()
+        # 🌟 增加 Z 轴距离，把相机往后拉，数值越大人物越小 (原本是 2.2)
+        c_t_tgt[:, 2] += 0.5 
+        
+        # 同时也把第一行的原始相机往后拉一点，保持一致
+        c_t_src = pred_cam_t[:B].clone()
+        c_t_src[:, 2] += 0.5
+        
+        # 1. 准备身体颜色 [B, N_verts, 3]
+        N_verts = v_src.shape[1]
+        colors = torch.ones((N_verts, 3), device=device) * 0.4
+        part_colors = {
+            "head": [1.0, 0.3, 0.3], "torso": [0.3, 0.8, 0.8], 
+            "l_arm": [0.3, 1.0, 0.3], "r_arm": [1.0, 0.8, 0.0],
+            "l_leg": [0.3, 0.3, 1.0], "r_leg": [1.0, 0.3, 1.0]
+        }
+        if getattr(self, 'part_indices', None) is not None:
+            for name, idxs in self.part_indices.items():
+                if name in part_colors:
+                    colors[idxs] = torch.tensor(part_colors[name], device=device)
+        colors = colors.unsqueeze(0).expand(B, -1, -1) 
+
+        # 2. 生成实心箭头点云 (自身中心设为绝对原点 0,0,0)
+        num_arrow_pts = 4000
+        arrow_smpl = self._generate_solid_arrow_pcd(device, num_points=num_arrow_pts, y_offset=0.0)
+        arrow_smpl = arrow_smpl.expand(B, -1, -1)
+        arrow_colors = torch.tensor([1.0, 0.0, 0.0], device=device).view(1, 1, 3).expand(B, num_arrow_pts, 3)
+
+        # 渲染函数
+        def render_verts_to_img(verts, cam_t, cam_int, arr_verts=None):
+            if arr_verts is not None:
+                # 🌟 核心逻辑：X 和 Z 找中心(mean)，Y 找最低点(min，即脚底)
+                v_mean = verts.mean(dim=1, keepdim=True) # [B, 1, 3]
+                
+                # MHR/SMPL 中，Y轴正方向可能朝下或朝上(OpenCV下是朝下，越往下Y越大)
+                # 为了安全，我们用最大值(最下方) 或 最小值(最上方)
+                # 在 OpenCV 坐标系下，脚底的 Y 值是最大的 (靠近图像底边)
+                v_foot_y, _ = verts[..., 1].max(dim=-1, keepdim=True) # [B, 1]
+                v_mean[..., 1] = v_foot_y
+                
+                arr_verts = arr_verts + v_mean           # 箭头动态平移到脚底正中
+                
+                v_render = torch.cat([verts, arr_verts], dim=1)
+                c_render = torch.cat([colors, arrow_colors], dim=1)
+            else:
+                v_render = verts
+                c_render = colors
+
+            v_cam = v_render + cam_t.unsqueeze(1)
+            x, y, z = v_cam.unbind(-1)
+            z_safe = z.clamp(min=1e-3)
+            
+            # Z-Buffer 遮挡排序
+            sort_idx = torch.argsort(z_safe, dim=1, descending=True)
+            x = torch.gather(x, 1, sort_idx)
+            y = torch.gather(y, 1, sort_idx)
+            z_safe = torch.gather(z_safe, 1, sort_idx)
+            c_sorted = torch.gather(c_render, 1, sort_idx.unsqueeze(-1).expand(-1, -1, 3))
+            
+            fx, fy = cam_int[:,0,0].unsqueeze(1), cam_int[:,1,1].unsqueeze(1)
+            cx, cy = cam_int[:,0,2].unsqueeze(1), cam_int[:,1,2].unsqueeze(1)
+            
+            u = ((x / z_safe) * fx + cx).long().clamp(0, target_w - 1)
+            v = ((y / z_safe) * fy + cy).long().clamp(0, target_h - 1)
+            
+            canvas = torch.ones((B, 3, target_h, target_w), device=device) * 0.95 
+            for b_i in range(B):
+                canvas[b_i, :, v[b_i], u[b_i]] = c_sorted[b_i].T
+            return canvas
+
+        row_images = []
+        
+        rot_fix = g_rot.clone(); rot_fix[..., [0,1,2]] *= -1
+        R_canon = roma.euler_to_rotmat("XYZ", rot_fix)
+
+        # A. Identity 原图视角
+        if getattr(self, 'use_identity_branch', False):
+            # 将中心对齐。人体网格偏移过了，所以箭头的起点也自动对齐了人体的中心
+            arr_orig_smpl = torch.bmm(arrow_smpl, R_canon)
+            arr_orig_cv = arr_orig_smpl.clone(); arr_orig_cv[..., [1,2]] *= -1
+            row_images.append(render_verts_to_img(v_src, c_t_src, c_int_src, arr_orig_cv))
+            
+        # B. 设定的各视角分支
+        for angle in getattr(self, 'target_angles', []):
+            midhip = (kp_src[:, 9] + kp_src[:, 10]) / 2.0
+            centered_verts = v_src - midhip.unsqueeze(1) # 人体中心归零
+            
+            # 点云渲染的复合旋转
+            yaw, pitch = angle
+            cy, sy = math.cos(math.radians(yaw)), math.sin(math.radians(yaw))
+            cp, sp = math.cos(math.radians(pitch)), math.sin(math.radians(pitch))
+            R_y = torch.tensor([[ cy, 0., sy], [ 0., 1., 0.], [-sy, 0., cy]], device=device, dtype=torch.float32)
+            R_p = torch.tensor([[ 1., 0., 0.], [ 0., cp, -sp], [ 0., sp, cp]], device=device, dtype=torch.float32)
+            R_side = torch.matmul(R_p, R_y).view(1, 3, 3).expand(B, 3, 3)
+            
+            R_comp = torch.matmul(R_canon.transpose(1,2), R_side.transpose(1,2))
+            v_tmp = centered_verts.clone(); v_tmp[...,[1,2]] *= -1 
+            v_rot_cv = torch.bmm(v_tmp, R_comp).clone(); v_rot_cv[...,[1,2]] *= -1 
+            
+            arr_side_smpl = torch.bmm(arrow_smpl, R_side.transpose(1, 2))
+            arr_side_cv = arr_side_smpl.clone(); arr_side_cv[..., [1,2]] *= -1
+            row_images.append(render_verts_to_img(v_rot_cv, c_t_tgt, c_int_tgt, arr_side_cv))
+            
+        # C. T-Pose 零度正视分支
+        if getattr(self, 'use_tpose_branch', False) and t_pose_verts is not None:
+            v_tp = t_pose_verts[:B]
+            kp_tp = t_pose_keypoints[:B]
+            midhip_tp = (kp_tp[:, 9] + kp_tp[:, 10]) / 2.0
+            centered_tp = v_tp - midhip_tp.unsqueeze(1)
+            v_tmp = centered_tp.clone(); v_tmp[...,[1,2]] *= -1 
+            v_rot_cv = v_tmp.clone(); v_rot_cv[...,[1,2]] *= -1 
+            
+            arr_cv = arrow_smpl.clone(); arr_cv[..., [1,2]] *= -1
+            row_images.append(render_verts_to_img(v_rot_cv, c_t_tgt, c_int_tgt, arr_cv))
+            
+        rows_list = [torch.cat(torch.unbind(img_b, dim=0), dim=-1) for img_b in row_images]
+        grid = torch.cat(rows_list, dim=-2).unsqueeze(0)
+        return grid
+    
+    def _generate_color_grid(self, B, H, W, device):
+        """生成一个 [B, 3, H, W] 的 2D 颜色梯度网格"""
+        grid_y, grid_x = torch.meshgrid(
+            torch.linspace(0, 1, H, device=device),
+            torch.linspace(0, 1, W, device=device),
+            indexing='ij'
+        )
+        # R: X梯度, G: Y梯度, B: 混合或固定值
+        color_grid = torch.stack([grid_x, grid_y, 1 - grid_x], dim=0) # [3, H, W]
+        return color_grid.unsqueeze(0).expand(B, -1, -1, -1)
+    # =========================================================================
 
     def preprocess(self, sils, h, w, mode='bilinear'):
         return F.interpolate(sils, (h, w), mode=mode, align_corners=False)
@@ -824,7 +1071,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
                                 m_high = F.interpolate(is_closest.float(), (target_h, target_w), mode='bilinear', align_corners=False)
                                 c_vec = torch.tensor(part_colors[name], device=rgb.device).view(1, 3, 1, 1)
                                 part_overlay = outs * 0.2 + (m_high * c_vec) * 0.8
-                                part_summaries[f'image/part_{name}'] = part_overlay[:3].float()
+                                part_summaries[f'image/part_{name}'] = part_overlay[:5].float()
                         else:
                             # 兜底：如果某个 part 没生成，给全 0
                             final_disjoint_masks[name] = torch.zeros((curr_bs, 1, h_feat, w_feat), device=rgb.device)
@@ -910,6 +1157,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
             # =======================================================
             branch_warped_feats = []
             chunk_pca_tgt_list = []
+            chunk_flow_tgt_list = []
 
             # 将不做任何修改的特征图作为一个独立分支
             if self.use_identity_branch:
@@ -917,12 +1165,13 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
                 if self.training:
                     # 可视化时，使用原始的 full_mask_src
                     chunk_pca_tgt_list.append(self.get_pca_vis_tensor(human_feat, full_mask_src))
+                    chunk_flow_tgt_list.append(self._generate_color_grid(curr_bs, h_feat, w_feat, rgb.device) * generated_mask)
             
             # 分支组 A: 遍历所有配置的 target_angles，保持原始姿态进行旋转
             for angle in self.target_angles:
                 self.target_angle = angle # 临时覆盖，只影响 warp_features_with_ot
                 
-                warp_feat_norm, tgt_mask_norm = self.warp_features_with_ot(
+                warp_feat_norm, tgt_mask_norm, tgt_color_flow = self.warp_features_with_ot(
                     human_feat, full_mask_src, 
                     pred_verts, pred_keypoints, pred_cam_t, global_rot,
                     cam_int_src, cam_int_tgt, cam_t_tgt,
@@ -931,11 +1180,12 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
                 branch_warped_feats.append(warp_feat_norm)
                 if self.training: 
                     chunk_pca_tgt_list.append(self.get_pca_vis_tensor(warp_feat_norm, tgt_mask_norm))
+                    chunk_flow_tgt_list.append(tgt_color_flow)
             
             # 分支 B: 唯一的 T-Pose 分支 (完全正视，不再做任何旋转)
             if self.use_tpose_branch:
                 t_pose_verts, t_pose_keypoints = self.generate_mhr_tpose(pose_outs[-1])
-                warp_feat_tpose, tgt_mask_tpose = self.warp_features_with_ot_tpose(
+                warp_feat_tpose, tgt_mask_tpose, tgt_color_flow_tpose = self.warp_features_with_ot_tpose(
                     human_feat, full_mask_src, 
                     pred_verts, pred_cam_t, 
                     t_pose_verts, t_pose_keypoints,
@@ -945,6 +1195,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
                 branch_warped_feats.append(warp_feat_tpose)
                 if self.training: 
                     chunk_pca_tgt_list.append(self.get_pca_vis_tensor(warp_feat_tpose, tgt_mask_tpose))
+                    chunk_flow_tgt_list.append(tgt_color_flow_tpose)
             
             # 聚合 PCA 图像
             if self.training:
@@ -959,6 +1210,28 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
                 
                 # 再把所有分支的条带纵向拼接，形成最终网格 [1, 3, Branches*H, 5W]
                 chunk_pca_tgt = torch.cat(row_strips, dim=-2).unsqueeze(0)
+
+                # ====================================================
+                # 🌟 调用临时点云渲染代码 (想关闭时直接注释这一小段即可)
+                t_verts = t_pose_verts if self.use_tpose_branch else None
+                t_kps = t_pose_keypoints if self.use_tpose_branch else None
+                chunk_pcd_grid = self._temp_render_pcd_grid(
+                    pred_verts, pred_keypoints, pred_cam_t, global_rot,
+                    t_verts, t_kps,
+                    cam_int_src, cam_int_tgt, cam_t_tgt,
+                    target_h, target_w, max_samples=5
+                )
+                # ====================================================
+
+            # 🌟 4. 聚合颜色流图像 (若干行 x 5列)
+            if self.training:
+                # Source Flow (原始参考)
+                src_color = self._generate_color_grid(curr_bs, h_feat, w_feat, rgb.device) * generated_mask
+                chunk_flow_src = torch.cat(torch.unbind(src_color[:5], dim=0), dim=-1).unsqueeze(0)
+                
+                # Target Flow Grid
+                flow_strips = [torch.cat(torch.unbind(b_flow[:5], dim=0), dim=-1) for b_flow in chunk_flow_tgt_list]
+                chunk_flow_grid = torch.cat(flow_strips, dim=-2).unsqueeze(0)
 
             # 分别独立通过 GaitNet Part 1
             for b_idx, warp_feat in enumerate(branch_warped_feats):
@@ -1006,11 +1279,14 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
                     'softmax': {'logits': torch.cat(log_list, dim=-1), 'labels': labs},
                 },
                 'visual_summary': {
-                    'image/rgb_img': rgb_img.view(n*s, c, h, w)[:3].float(),
+                    'image/rgb_img': rgb_img.view(n*s, c, h, w)[:5].float(),
                     **part_summaries,
-                    'image/generated_3d_mask_lowres': generated_mask.view(n*s, 1, h_feat, w_feat)[:3].float(),
+                    'image/generated_3d_mask_lowres': generated_mask.view(n*s, 1, h_feat, w_feat)[:5].float(),
                     'image/pca_before_OT': chunk_pca_src,
                     'image/pca_after_OT': chunk_pca_tgt,
+                    'image/point_cloud_grid': chunk_pcd_grid, # 临时点云可视化输出
+                    'image/ot_flow_reference': chunk_flow_src, # 源图颜色参考
+                    'image/ot_flow_warped_grid': chunk_flow_grid, # 搬运后的网格
                 },
                 'inference_feat': {
                     'embeddings': torch.cat(embed_list, dim=-1),
