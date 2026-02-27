@@ -98,8 +98,7 @@ model_cfg:
   ot_iters: 8
   target_angles:
     - [90.0, 0.0]    # 纯 90度侧视
-    - [0.0, 90.0]    # 纯头顶俯视
-    - [45.0, 45.0]   # 45度偏转 + 45度俯视
+    - [45.0, 30.0]   # 45度偏转 + 30度俯视
   use_tpose_branch: True  # A-Pose 独立的分支
   use_identity_branch: False
 
