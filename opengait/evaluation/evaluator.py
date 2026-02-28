@@ -455,16 +455,29 @@ def evaluate_CCPG_part(data, dataset, metric='euc'):
 
     # ================= [结构配置区] =================
     TEST_PARTS = True
-    NUM_FPN_HEADS = 4  
+    # 🌟 1. 硬编码你的配置文件路径并解析
+    import yaml
+    CONFIG_PATH = r'configs/biggergait/BiggerGait__SAM_3D_BODY_Projection_Mask_Part_3D.yaml' # ⚠️ 务必替换为你的真实配置文件路径！
+    try:
+        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+            yaml_cfg = yaml.safe_load(f)
+        NUM_FPN_HEADS = yaml_cfg['model_cfg']['num_FPN']
+        # 提取出每个 branch 独立的 parts 数量，例如 [16, 12, 8, 16]
+        branch_parts = [b['parts'] for b in yaml_cfg['model_cfg']['branch_configs']]
+    except Exception as e:
+        msg_mgr.log_warning(f"Failed to load config from {CONFIG_PATH}: {e}. Fallback to default.")
+        NUM_FPN_HEADS = 4
+        branch_parts = [16] # 兜底策略
     # ===============================================
 
-    # [关键修改]：动态计算每个 Head 的 Part 数量
-    if P % NUM_FPN_HEADS != 0:
-        msg_mgr.log_warning(f"Warning: Total parts {P} cannot be evenly divided by {NUM_FPN_HEADS} heads!")
-    
-    PARTS_PER_HEAD = P // NUM_FPN_HEADS  # 动态计算，例如 128->32, 240->60
+    PARTS_PER_HEAD = P // NUM_FPN_HEADS  
+    expected_parts = sum(branch_parts)
     
     msg_mgr.log_info(f"Dynamic Config: Total Parts={P}, Heads={NUM_FPN_HEADS}, Parts/Head={PARTS_PER_HEAD}")
+    msg_mgr.log_info(f"Branch Architecture: {len(branch_parts)} branches, parts per branch = {branch_parts}")
+    
+    if PARTS_PER_HEAD != expected_parts:
+        msg_mgr.log_warning(f"Warning: Calculated Parts/Head ({PARTS_PER_HEAD}) != Sum of branch configs ({expected_parts})!")
 
     # 2. View 处理
     if len(view) > 0 and "_" in view[0]:
@@ -575,14 +588,10 @@ def evaluate_CCPG_part(data, dataset, metric='euc'):
     # (B) FPN Head & Part Evaluation
     if TEST_PARTS:
         msg_mgr.log_info("\n" + "="*40)
-        msg_mgr.log_info(f"2. FPN Branch Evaluation")
+        msg_mgr.log_info(f"2. FPN Branch Evaluation (Heterogeneous Parts)")
         msg_mgr.log_info("="*40)
 
-        # 硬编码：单个 Branch 在一个 FPN Head 里的 Part 数量
-        PARTS_PER_SINGLE_BRANCH = 16
-        # 自动计算当前模型总共拼接了几个 Branch
-        num_branches = PARTS_PER_HEAD // PARTS_PER_SINGLE_BRANCH
-        msg_mgr.log_info(f"Detected {num_branches} branches per Head (Parts per branch: {PARTS_PER_SINGLE_BRANCH})")
+        num_branches = len(branch_parts)
         
         for head_idx in range(NUM_FPN_HEADS):
             msg_mgr.log_info(f"\n>>> [FPN Head {head_idx}]")
@@ -590,33 +599,33 @@ def evaluate_CCPG_part(data, dataset, metric='euc'):
             start = head_idx * PARTS_PER_HEAD
             end = start + PARTS_PER_HEAD
             
-            # [FIX] Head 整体 [N, C, 32] -> 3D Input -> Sum Logic
-            # 同样不要 flatten
+            # 1. 评估 Head 整体
             head_feat_chunk = feature[:, :, start:end] 
             run_evaluation_core(head_feat_chunk, title_suffix=f"[Head-{head_idx} Full]")
 
-            # 2. 分别评估每一个 Branch (子组的 Full 评估)
+            # 2. 🌟 分别评估每一个 Branch (使用动态配置的 parts 累加截取)
             if num_branches > 1:
-                for b_idx in range(num_branches):
-                    b_start = start + (b_idx * PARTS_PER_SINGLE_BRANCH)
-                    b_end = b_start + PARTS_PER_SINGLE_BRANCH
+                b_start = start
+                for b_idx, b_parts in enumerate(branch_parts):
+                    b_end = b_start + b_parts
                     branch_feat_chunk = feature[:, :, b_start:b_end]
                     run_evaluation_core(branch_feat_chunk, title_suffix=f"  *[Branch-{b_idx} Full]")
+                    b_start = b_end # 游标推进一步
 
-            # 3. 细粒度到单个 Part 
-            for part_idx in range(PARTS_PER_HEAD):
-                abs_idx = start + part_idx
-                part_feat = feature[:, :, abs_idx : abs_idx+1]
-                
-                # 为了可读性，如果是多 branch，可以在标题里标明属于哪个 branch
-                b_id = part_idx // PARTS_PER_SINGLE_BRANCH
-                inner_p_id = part_idx % PARTS_PER_SINGLE_BRANCH
-                if num_branches > 1:
-                    title = f"    - Branch{b_id} Part {inner_p_id:02d}"
-                else:
-                    title = f"    - Part {part_idx:02d}"
+            # 3. 🌟 细粒度到单个 Part (双重循环匹配动态 Part 数)
+            current_p_idx = start
+            for b_idx, b_parts in enumerate(branch_parts):
+                for inner_p_id in range(b_parts):
+                    # 每次刚好截取 1 个通道
+                    part_feat = feature[:, :, current_p_idx : current_p_idx+1]
                     
-                run_evaluation_core(part_feat, title_suffix=title)
+                    if num_branches > 1:
+                        title = f"    - Branch{b_idx} Part {inner_p_id:02d}"
+                    else:
+                        title = f"    - Part {inner_p_id:02d}"
+                        
+                    run_evaluation_core(part_feat, title_suffix=title)
+                    current_p_idx += 1 # 游标前进一步
 
     return {}
 

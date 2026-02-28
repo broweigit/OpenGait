@@ -12,27 +12,64 @@ from sklearn.preprocessing import minmax_scale
 import cv2
 
 
+# def pca_image(data, mask, root, model_name, dataset, n_components=3, is_return=False):
+#     features = data['embeddings']
+#     ns,hw,c = features.shape
+#     features = features.reshape(ns*hw,c)
+#     mask = mask.reshape(ns*hw)
+
+#     pca = PCA(n_components=n_components)
+#     pca_features = pca.fit_transform(features[mask != 0])
+#     pca_features = minmax_scale(pca_features, (0,255), axis=1)
+#     # pca_features = minmax_scale(pca_features, (0,255), axis=0)
+
+#     norm_features = np.zeros_like(mask,dtype=np.uint8).reshape(ns*hw,1).repeat(n_components,axis=1)
+#     norm_features[mask != 0] = pca_features
+
+#     if is_return:
+#         norm_features = norm_features.reshape(1,ns,64,32,n_components)[...,:3].transpose(0,1,4,2,3) # 
+#         return norm_features
+    
+#     s = 20
+#     assert ns % s == 0
+#     norm_features = norm_features.reshape(ns//s,s,64,32,n_components)[...,:3].transpose(0,1,4,2,3)
+#     data['embeddings'] = norm_features
+#     save_image(data, root, model_name, dataset, need='image')
+
 def pca_image(data, mask, root, model_name, dataset, n_components=3, is_return=False):
     features = data['embeddings']
-    ns,hw,c = features.shape
-    features = features.reshape(ns*hw,c)
+    ns, hw, c = features.shape
+    
+    # 🌟 动态获取高宽：优先从 data 字典获取
+    _h = data.get('h', 64) 
+    _w = data.get('w', 32)
+    # 如果乘积不对
+    if _h * _w != hw:
+        raise ValueError(f"Provided height {_h} and width {_w} do not match the feature map size {hw}. Please check the input data or provide correct dimensions.")
+
+    features = features.reshape(ns*hw, c)
     mask = mask.reshape(ns*hw)
+
+    from sklearn.decomposition import PCA
+    from sklearn.preprocessing import minmax_scale
+    import numpy as np
 
     pca = PCA(n_components=n_components)
     pca_features = pca.fit_transform(features[mask != 0])
     pca_features = minmax_scale(pca_features, (0,255), axis=1)
-    # pca_features = minmax_scale(pca_features, (0,255), axis=0)
 
     norm_features = np.zeros_like(mask,dtype=np.uint8).reshape(ns*hw,1).repeat(n_components,axis=1)
     norm_features[mask != 0] = pca_features
 
     if is_return:
-        norm_features = norm_features.reshape(1,ns,64,32,n_components)[...,:3].transpose(0,1,4,2,3) # 
+        # 🌟 使用动态的高宽 _h, _w 替代写死的 64, 32
+        norm_features = norm_features.reshape(1, ns, _h, _w, n_components)[...,:3].transpose(0,1,4,2,3)
         return norm_features
     
     s = 20
     assert ns % s == 0
-    norm_features = norm_features.reshape(ns//s,s,64,32,n_components)[...,:3].transpose(0,1,4,2,3)
+    # 🌟 使用动态的高宽 _h, _w 替代写死的 64, 32
+    norm_features = norm_features.reshape(ns//s, s, _h, _w, n_components)[...,:3].transpose(0,1,4,2,3)
     data['embeddings'] = norm_features
     save_image(data, root, model_name, dataset, need='image')
 

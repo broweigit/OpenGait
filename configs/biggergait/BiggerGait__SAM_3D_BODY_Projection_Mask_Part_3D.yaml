@@ -96,13 +96,27 @@ model_cfg:
   ot_temperature: 0.01
   ot_dist_thresh: 0.2
   ot_iters: 8
-  target_angles:
-    - [90.0, 0.0]    # 纯 90度侧视
-    - [45.0, 30.0]   # 45度偏转 + 30度俯视
-  use_tpose_branch: True  # A-Pose 独立的分支
-  use_identity_branch: False
+  # 🌟 核心修改：分支独立配置
+  branch_configs:
+    - angle: [90.0, 0.0]    # 侧视
+      h_ratio: 2.0          # 高度为 2.0 * width (512x256)
+      parts: 16             # HPP 划分 16 块
+      use_tpose: false      # 保持原始姿态
+    - angle: [45.0, 45.0]
+      h_ratio: 1.25         # 高度减小，适应俯视 (约 307x256)
+      parts: 10             # 缩减 Part 数量，避免采样空白
+      use_tpose: false
+    - angle: [-45.0, 60.0]
+      h_ratio: 0.75          # 接近正视，保持 1:1
+      parts: 6              # 同样缩减 Part 数量
+      use_tpose: false
+    - angle: [0.0, 0.0]
+      h_ratio: 2.0
+      parts: 16
+      use_tpose: true
 
-  enable_visual: False  # 是否启用可视化输出（仅训练时）
+
+  enable_visual: True  # 是否启用可视化输出（仅训练时）
   
   Mask_Branch:
     source_dim: 1280  # 注意：这里也要改成 1280，因为 MaskBranch 也是接在 Backbone 后面
