@@ -560,7 +560,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
         y_extent = curr_ratio / base_ratio 
         
         grid_y, grid_x = torch.meshgrid(
-            torch.linspace(-y_extent, y_extent, tgt_h_feat, device=device),
+            torch.linspace(-1, 1, tgt_h_feat, device=device),
             torch.linspace(-1, 1, tgt_w_feat, device=device),
             indexing='ij'
         )
@@ -693,7 +693,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
         y_extent = curr_ratio / base_ratio 
         
         grid_y, grid_x = torch.meshgrid(
-            torch.linspace(-y_extent, y_extent, tgt_h_feat, device=device),
+            torch.linspace(-1, 1, tgt_h_feat, device=device),
             torch.linspace(-1, 1, tgt_w_feat, device=device),
             indexing='ij'
         )
@@ -1033,7 +1033,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
                 #     processed_feat_list.append(reduced_feat)
 
                 # human_feat_base = torch.concat(processed_feat_list, dim=1) 
-                full_mask_src = F.interpolate(generated_mask.float(), (64, 32), mode='bilinear', align_corners=False) 
+                full_mask_src = F.interpolate(generated_mask.float(), (self.sils_size*2, self.sils_size), mode='bilinear', align_corners=False) 
 
                 # =======================================================
                 # 🌟 2. 分支独立处理 (OT 动态画幅)
