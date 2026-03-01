@@ -235,20 +235,22 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
             
             self.Gait_Nets.append(Baseline_ShareTime_2B(sub_cfg))
 
-        # 🌟 修改 2: FPN Head 的 Resize 逻辑调整
-        # 我们让 FPN 输出一个足够大的“通用特征图”，具体的动态高度在 OT 投影阶段实现
-        self.HumanSpace_Conv = nn.ModuleList([
-            nn.Sequential(
-                nn.BatchNorm2d(input_dim, affine=False),
-                nn.Conv2d(input_dim, self.f4_dim//2, kernel_size=1),
-                nn.BatchNorm2d(self.f4_dim//2, affine=False),
-                nn.GELU(),
-                nn.Conv2d(self.f4_dim//2, self.num_unknown, kernel_size=1),
-                ResizeToHW((self.sils_size*2, self.sils_size)),
-                nn.BatchNorm2d(self.num_unknown, affine=False),
-                nn.Sigmoid()
-            ) for _ in range(self.num_FPN)
-        ])
+        # 🌟 修改后：为每个 Branch 独立实例化 FPN Head
+        self.Branch_HumanSpace_Convs = nn.ModuleList()
+        for _ in range(self.num_branches):
+            branch_fpn = nn.ModuleList([
+                nn.Sequential(
+                    nn.BatchNorm2d(input_dim, affine=False),
+                    nn.Conv2d(input_dim, self.f4_dim//2, kernel_size=1),
+                    nn.BatchNorm2d(self.f4_dim//2, affine=False),
+                    nn.GELU(),
+                    nn.Conv2d(self.f4_dim//2, self.num_unknown, kernel_size=1),
+                    ResizeToHW((self.sils_size*2, self.sils_size)),
+                    nn.BatchNorm2d(self.num_unknown, affine=False),
+                    nn.Sigmoid()
+                ) for _ in range(self.num_FPN)
+            ])
+            self.Branch_HumanSpace_Convs.append(branch_fpn)
         
         # Mask Branch (Keep structure but not used for projection logic)
         self.Mask_Branch = infoDistillation(**model_cfg["Mask_Branch"])
@@ -1020,17 +1022,17 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
                     feat = feat * mask_flat 
                     features_to_use.append(feat)
 
-                processed_feat_list = []
-                step = len(features_to_use) // self.num_FPN
-                for i in range(self.num_FPN):
-                    sub_feats = features_to_use[i*step : (i+1)*step]
-                    sub_app = torch.concat(sub_feats, dim=-1)
-                    sub_app = partial(nn.LayerNorm, eps=1e-6)(self.f4_dim * len(sub_feats), elementwise_affine=False)(sub_app)
-                    sub_app = rearrange(sub_app, 'b (h w) c -> b c h w', h=base_h_feat).contiguous()
-                    reduced_feat = self.HumanSpace_Conv[i](sub_app) 
-                    processed_feat_list.append(reduced_feat)
+                # processed_feat_list = []
+                # step = len(features_to_use) // self.num_FPN
+                # for i in range(self.num_FPN):
+                #     sub_feats = features_to_use[i*step : (i+1)*step]
+                #     sub_app = torch.concat(sub_feats, dim=-1)
+                #     sub_app = partial(nn.LayerNorm, eps=1e-6)(self.f4_dim * len(sub_feats), elementwise_affine=False)(sub_app)
+                #     sub_app = rearrange(sub_app, 'b (h w) c -> b c h w', h=base_h_feat).contiguous()
+                #     reduced_feat = self.HumanSpace_Conv[i](sub_app) 
+                #     processed_feat_list.append(reduced_feat)
 
-                human_feat_base = torch.concat(processed_feat_list, dim=1) 
+                # human_feat_base = torch.concat(processed_feat_list, dim=1) 
                 full_mask_src = F.interpolate(generated_mask.float(), (64, 32), mode='bilinear', align_corners=False) 
 
                 # =======================================================
@@ -1044,7 +1046,25 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
                 # 预先生成一次 TPose 数据，防止每个配置都重复算
                 t_pose_verts, t_pose_keypoints = None, None
 
-                for b_cfg in self.branch_configs:
+                for b_idx, b_cfg in enumerate(self.branch_configs):
+                    # ==========================================
+                    # 🌟 核心修复：在此处独立计算该分支的 Base 特征
+                    # ==========================================
+                    processed_feat_list = []
+                    step = len(features_to_use) // self.num_FPN
+                    for i in range(self.num_FPN):
+                        sub_feats = features_to_use[i*step : (i+1)*step]
+                        sub_app = torch.concat(sub_feats, dim=-1)
+                        sub_app = partial(nn.LayerNorm, eps=1e-6)(self.f4_dim * len(sub_feats), elementwise_affine=False)(sub_app)
+                        sub_app = rearrange(sub_app, 'b (h w) c -> b c h w', h=base_h_feat).contiguous()
+                        
+                        # 调用对应分支专用的 FPN
+                        reduced_feat = self.Branch_HumanSpace_Convs[b_idx][i](sub_app) 
+                        processed_feat_list.append(reduced_feat)
+
+                    human_feat_base = torch.concat(processed_feat_list, dim=1) 
+                    # ==========================================
+                    
                     yaw, pitch = b_cfg['angle']
                     tgt_h = int(self.image_size * b_cfg['h_ratio'])
                     tgt_w = self.image_size

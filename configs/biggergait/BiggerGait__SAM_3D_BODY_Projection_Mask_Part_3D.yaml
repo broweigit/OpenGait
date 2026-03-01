@@ -103,16 +103,16 @@ model_cfg:
       parts: 16             # HPP 划分 16 块
       use_tpose: false      # 保持原始姿态
       vertical_pooling: false
-    # - angle: [45.0, 45.0]
-    #   h_ratio: 1.25         # 高度减小，适应俯视 (约 307x256)
-    #   parts: 10             # 缩减 Part 数量，避免采样空白
-    #   use_tpose: false
-    #   vertical_pooling: false
-    # - angle: [-45.0, 60.0]
-    #   h_ratio: 0.75          # 接近正视，保持 1:1
-    #   parts: 6              # 同样缩减 Part 数量
-    #   use_tpose: false
-    #   vertical_pooling: false
+    - angle: [45.0, 45.0]
+      h_ratio: 1.25         # 高度减小，适应俯视 (约 307x256)
+      parts: 10             # 缩减 Part 数量，避免采样空白
+      use_tpose: false
+      vertical_pooling: false
+    - angle: [-45.0, 60.0]
+      h_ratio: 0.75          # 接近正视，保持 1:1
+      parts: 6              # 同样缩减 Part 数量
+      use_tpose: false
+      vertical_pooling: false
     - angle: [0.0, 0.0]
       h_ratio: 2.0
       parts: 8
