@@ -102,21 +102,25 @@ model_cfg:
       h_ratio: 2.0          # 高度为 2.0 * width (512x256)
       parts: 16             # HPP 划分 16 块
       use_tpose: false      # 保持原始姿态
-    - angle: [45.0, 45.0]
-      h_ratio: 1.25         # 高度减小，适应俯视 (约 307x256)
-      parts: 10             # 缩减 Part 数量，避免采样空白
-      use_tpose: false
-    - angle: [-45.0, 60.0]
-      h_ratio: 0.75          # 接近正视，保持 1:1
-      parts: 6              # 同样缩减 Part 数量
-      use_tpose: false
+      vertical_pooling: false
+    # - angle: [45.0, 45.0]
+    #   h_ratio: 1.25         # 高度减小，适应俯视 (约 307x256)
+    #   parts: 10             # 缩减 Part 数量，避免采样空白
+    #   use_tpose: false
+    #   vertical_pooling: false
+    # - angle: [-45.0, 60.0]
+    #   h_ratio: 0.75          # 接近正视，保持 1:1
+    #   parts: 6              # 同样缩减 Part 数量
+    #   use_tpose: false
+    #   vertical_pooling: false
     - angle: [0.0, 0.0]
       h_ratio: 2.0
-      parts: 16
+      parts: 8
       use_tpose: true
+      vertical_pooling: true
 
 
-  enable_visual: True  # 是否启用可视化输出（仅训练时）
+  enable_visual: False  # 是否启用可视化输出（仅训练时）
   
   Mask_Branch:
     source_dim: 1280  # 注意：这里也要改成 1280，因为 MaskBranch 也是接在 Backbone 后面

@@ -348,6 +348,8 @@ class Baseline_Single(nn.Module):
         self.TP = PackSequenceWrapper(torch.max)
         self.HPP = HorizontalPoolingPyramid(bin_num=model_cfg['bin_num'])
 
+        self.vertical_pooling = model_cfg.get('vertical_pooling', False)
+
     def get_backbone(self, backbone_cfg):
         """Get the backbone of the model."""
         if is_dict(backbone_cfg):
@@ -371,6 +373,9 @@ class Baseline_Single(nn.Module):
         outs = self.post_backbone(outs, *args, **kwargs)
         # Temporal Pooling, TP
         outs = self.TP(outs, seqL, options={"dim": 2})[0]  # [n, c, h, w]
+        # 🌟 新增：如果开启纵向池化，交换 H 和 W 的物理位置
+        if self.vertical_pooling:
+            outs = outs.transpose(2, 3).contiguous() # 变成 [n, c, w, h]
         # Horizontal Pooling Matching, HPM
         outs = self.HPP(outs)  # [n, c, p]
         embed_1 = self.FCs(outs)  # [n, c, p]
@@ -384,6 +389,9 @@ class Baseline_Single(nn.Module):
 
     def test_2(self, outs, seqL):
         outs = self.TP(outs, seqL, options={"dim": 2})[0]  # [n, c, h, w]
+        # 🌟 新增：同样在 test_2 中加入转置
+        if self.vertical_pooling:
+            outs = outs.transpose(2, 3).contiguous()
         outs = self.HPP(outs)  # [n, c, p]
         embed_1 = self.FCs(outs)  # [n, c, p]
         _, logits = self.BNNecks(embed_1)  # [n, c, p]

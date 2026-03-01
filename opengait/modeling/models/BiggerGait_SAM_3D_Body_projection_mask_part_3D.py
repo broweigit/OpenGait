@@ -231,6 +231,8 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
             sub_cfg['SeparateBNNecks']['parts_num'] = n_parts
             sub_cfg['bin_num'] = [n_parts] # 强制 HPP 按照当前分支指定的数量分段
             
+            sub_cfg['vertical_pooling'] = b_cfg.get('vertical_pooling', False)
+            
             self.Gait_Nets.append(Baseline_ShareTime_2B(sub_cfg))
 
         # 🌟 修改 2: FPN Head 的 Resize 逻辑调整
@@ -889,16 +891,20 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
         color_grid = torch.stack([grid_x, grid_y, 1 - grid_x], dim=0) # [3, H, W]
         return color_grid.unsqueeze(0).expand(B, -1, -1, -1)
     
-    def _generate_part_stripes(self, B, H, W, num_parts, device):
-        """生成按 Part 数量划分的黑灰相间背景"""
-        grid_y, _ = torch.meshgrid(
+    def _generate_part_stripes(self, B, H, W, num_parts, device, is_vertical=False):
+        """生成按 Part 数量划分的横向或竖向黑灰相间背景"""
+        grid_y, grid_x = torch.meshgrid(
             torch.arange(H, device=device),
             torch.arange(W, device=device),
             indexing='ij'
         )
-        # 计算每个像素属于哪个 part
-        part_idx = (grid_y // (H / num_parts)).long()
-        # 偶数 part: 深灰(0.15), 奇数 part: 黑色(0.05)
+        
+        # 🌟 根据方向切分
+        if is_vertical:
+            part_idx = (grid_x // (W / num_parts)).long()
+        else:
+            part_idx = (grid_y // (H / num_parts)).long()
+            
         bg = torch.where(part_idx % 2 == 0, 0.15, 0.05).float()
         return bg.unsqueeze(0).unsqueeze(0).expand(B, 3, H, W)
     # =========================================================================
@@ -1085,7 +1091,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
 
                     if self.training and self.enable_visual:
                         pca_img = self.get_pca_vis_tensor(warp_feat, tgt_mask) 
-                        part_bg = self._generate_part_stripes(pca_img.shape[0], tgt_h_feat, tgt_w_feat, b_cfg['parts'], rgb.device)
+                        part_bg = self._generate_part_stripes(pca_img.shape[0], tgt_h_feat, tgt_w_feat, b_cfg['parts'], rgb.device, is_vertical=b_cfg.get('vertical_pooling', False))
                         combined_pca = pca_img * tgt_mask[:pca_img.shape[0]] + part_bg * (1 - tgt_mask[:pca_img.shape[0]].float())
                         chunk_pca_tgt_list.append(combined_pca)
                         if tgt_color_flow is not None:
