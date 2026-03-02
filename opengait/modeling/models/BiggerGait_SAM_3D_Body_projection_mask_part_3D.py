@@ -1175,17 +1175,17 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
             cam_t_tgt = torch.zeros((curr_bs, 3), device=rgb.device)
             cam_t_tgt[:, 2] = 2.2
 
-            # 记录参数用于 PCD 渲染
-            pcd_camera_configs.append({
-                'tgt_h': target_h, 'tgt_w': target_w,
-                'cam_int': cam_int_tgt, 'cam_t': cam_t_tgt,
-                'use_tpose': b_cfg.get('use_tpose', False),
-                'angle': b_cfg['angle']
-            })
-
             for b_cfg in self.branch_configs:
-                branch_h_feat = int(self.image_size * b_cfg['h_ratio']) // 16
+                branch_h_feat = int(self.sils_size * b_cfg['h_ratio'])
                 self.target_angle = b_cfg['angle'] # 临时覆盖，只影响 warp_features_with_ot
+
+                # 记录参数用于 PCD 渲染
+                pcd_camera_configs.append({
+                    'tgt_h': target_h, 'tgt_w': target_w,
+                    'cam_int': cam_int_tgt, 'cam_t': cam_t_tgt,
+                    'use_tpose': b_cfg.get('use_tpose', False),
+                    'angle': b_cfg['angle']
+                })
 
                 if b_cfg.get('use_tpose', False):
                     if t_pose_verts is None:
@@ -1205,16 +1205,26 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
                         self.sils_size*2, self.sils_size, target_h, target_w 
                     )
 
+                
+
                 # 在图像中垂直居中切出上述输出的的tgt_h区域
-                start_y = (h_feat - branch_h_feat) // 2
+                start_y = (self.sils_size*2 - branch_h_feat) // 2
                 end_y = start_y + branch_h_feat
                 warp_feat = warp_feat[:, :, start_y:end_y, :]
-                tgt_mask = tgt_mask[:, :, start_y:end_y, :]
-                tgt_color_flow = tgt_color_flow[:, :, start_y:end_y, :]
 
                 branch_warped_feats.append(warp_feat)
                 if self.training and self.enable_visual: 
-                    chunk_pca_tgt_list.append(self.get_pca_vis_tensor(warp_feat, tgt_mask, self.VIS_SAMPLE) * self._generate_part_stripes(self.VIS_SAMPLE, branch_h_feat, w_feat, b_cfg['parts'], rgb.device, is_vertical=b_cfg.get('vertical_pooling', False)), )
+                    tgt_mask = tgt_mask[:, :, start_y:end_y, :]
+                    tgt_color_flow = tgt_color_flow[:, :, start_y:end_y, :]
+                    # 提前取好切片并转为 float
+                    curr_mask = tgt_mask[:self.VIS_SAMPLE].float() 
+                    
+                    pca_vis = self.get_pca_vis_tensor(warp_feat, tgt_mask, self.VIS_SAMPLE)
+                    stripes = self._generate_part_stripes(self.VIS_SAMPLE, branch_h_feat, self.sils_size, b_cfg['parts'], rgb.device, is_vertical=b_cfg.get('vertical_pooling', False))
+                    
+                    # 🌟 修改后的运算行
+                    chunk_pca_tgt_list.append(pca_vis * curr_mask + stripes * (1 - curr_mask))
+                    
                     chunk_flow_tgt_list.append(tgt_color_flow)
             
             # 聚合 PCA 和其他图像
@@ -1222,7 +1232,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
             if self.training and self.enable_visual:
                 # 1. 聚合 PCA, flow 图像
                 src_pca_batch = self.get_pca_vis_tensor(human_feat, full_mask_src, self.VIS_SAMPLE)
-                src_flow_batch = self._generate_color_grid(curr_bs, h_feat, w_feat, rgb.device) * full_mask_src
+                src_flow_batch = (self._generate_color_grid(curr_bs, self.sils_size*2, self.sils_size, rgb.device) * full_mask_src)[:self.VIS_SAMPLE]
                 chunk_pca_src = torch.cat(torch.unbind(src_pca_batch, dim=0), dim=-1).unsqueeze(0)
                 chunk_flow_src = torch.cat(torch.unbind(src_flow_batch, dim=0), dim=-1).unsqueeze(0)
                 
@@ -1242,7 +1252,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
 
                 flow_row_strips = []
                 for flow in chunk_flow_tgt_list:
-                    row_strip = torch.cat(torch.unbind(flow, dim=0), dim=-1)
+                    row_strip = torch.cat(torch.unbind(flow[:self.VIS_SAMPLE], dim=0), dim=-1)
                     flow_row_strips.append(row_strip)
                 interleaved_flow_rows = []
                 for i, row in enumerate(flow_row_strips):
@@ -1263,7 +1273,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
                     'image/rgb_img': rgb_img.view(n*s, c, h, w)[:self.VIS_SAMPLE].float(),
                     **part_summaries,
                     'image/generated_3d_mask_lowres': generated_mask.view(n*s, 1, h_feat, w_feat)[:self.VIS_SAMPLE].float(),
-                    'image/generated_3d_mask_interpolated': full_mask_src.view(n*s, 1, target_h//16, target_w//16)[:self.VIS_SAMPLE].float(),
+                    'image/generated_3d_mask_interpolated': full_mask_src.view(n*s, 1, self.sils_size*2, self.sils_size)[:self.VIS_SAMPLE].float(),
                     'image/pca_before_OT': chunk_pca_src,
                     'image/pca_after_OT': chunk_pca_tgt,
                     'image/point_cloud_grid': chunk_pcd_grid,
@@ -1280,12 +1290,12 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
                     # 使用 PyTorch 原生的 checkpoint 函数
                     # 注意：需要确保输入 warp_feat_5d 有梯度（OT 输出通常是有梯度的）
                     outs = torch.utils.checkpoint.checkpoint(
-                        self.Gait_Net[b_idx].test_1, 
+                        self.Gait_Nets[b_idx].test_1, 
                         warp_feat_5d, 
                         use_reentrant=False
                     )
                 else:
-                    outs = self.Gait_Net[b_idx].test_1(warp_feat_5d)
+                    outs = self.Gait_Nets[b_idx].test_1(warp_feat_5d)
                 
                 all_outs[b_idx].append(outs)
                 
@@ -1299,7 +1309,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
         
         for b_idx in range(self.num_branches):
             branch_seq_feat = torch.cat(all_outs[b_idx], dim=2) 
-            e_list, l_list = self.Gait_Net[b_idx].test_2(branch_seq_feat, seqL)
+            e_list, l_list = self.Gait_Nets[b_idx].test_2(branch_seq_feat, seqL)
             
             # 将当前分支的结果按 FPN 头分配到对应的组里
             for i in range(self.num_FPN):
