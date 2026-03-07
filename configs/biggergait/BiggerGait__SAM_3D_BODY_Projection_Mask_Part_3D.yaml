@@ -15,7 +15,7 @@ evaluator_cfg:
   eval_func: evaluate_CCPG_part
   sampler:
     batch_shuffle: false
-    batch_size: 8
+    batch_size: 4
     sample_type: all_ordered
     frames_all_limit: 250
   metric: euc
@@ -90,6 +90,8 @@ model_cfg:
       - True  # 29
       - True  # 30
       - True  # 31
+
+    hook_sample_type: "interleave" # "chunk" or "interleave"
   
   num_unknown: 16
 
@@ -120,7 +122,7 @@ model_cfg:
       vertical_pooling: true
 
 
-  enable_visual: False  # 是否启用可视化输出（仅训练时）
+  enable_visual: true  # 是否启用可视化输出（仅训练时）
   
   Mask_Branch:
     source_dim: 1280  # 注意：这里也要改成 1280，因为 MaskBranch 也是接在 Backbone 后面
@@ -178,14 +180,14 @@ trainer_cfg:
   find_unused_parameters: True
   enable_float16: true
   fix_BN: false
-  log_iter: 100
+  log_iter: 1
   with_test: true
   restore_ckpt_strict: true
   restore_hint: 0
   save_iter: 5000
   save_name: BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share
   sync_BN: true
-  total_iter: 30000
+  total_iter: 1
   sampler:
     batch_shuffle: true
     batch_size:

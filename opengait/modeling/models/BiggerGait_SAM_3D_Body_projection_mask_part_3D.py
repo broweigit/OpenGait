@@ -689,6 +689,14 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
         src_idx_map, _ = self.get_source_vertex_index_map(
             pred_verts, pred_cam_t, cam_int_src, H_feat, W_feat, target_H, target_W
         )
+        # =========================================================
+        # 🛠️ 插入调试代码：导出 A-Pose 覆盖率点云
+        # =========================================================
+        if self.training and self.enable_visual:
+            # 仅在第一批数据时导出一次，避免覆写过多
+            if not hasattr(self, '_debug_ply_saved'):
+                self._debug_dump_apose_ply(src_idx_map, t_pose_verts, save_path="debug_apose_chunk0.ply")
+                self._debug_ply_saved = True # 标记已保存
         valid_src_mask = (mask_src.squeeze(1) > 0.5) & (src_idx_map >= 0) 
         
         flat_human_feat = rearrange(human_feat, 'b c h w -> b (h w) c')
@@ -948,6 +956,64 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
         grid = torch.cat(aligned_images, dim=-2).unsqueeze(0)
         return grid
     
+    def _debug_dump_apose_ply(self, src_idx_map, t_pose_verts, save_path="debug_apose_fixed_scale.ply", fixed_max=20):
+        import torch
+        import numpy as np
+        import matplotlib.pyplot as plt
+
+        N_verts = t_pose_verts.shape[1]
+        device = src_idx_map.device
+
+        # 1. 统计引用频率
+        valid_indices = src_idx_map[src_idx_map >= 0].long()
+        ref_counts = torch.bincount(valid_indices, minlength=N_verts).float()
+        
+        # 2. 坐标归一化与去中心化
+        verts = t_pose_verts[0].clone()
+        center = verts.mean(dim=0, keepdim=True) 
+        verts -= center 
+
+        # 3. 【核心修改】：绝对颜色映射逻辑
+        # 我们定义：0 为灰色，(0, fixed_max] 映射到 Jet 颜色条，>fixed_max 也是最红
+        colors = torch.ones((N_verts, 3), device=device) * 0.5 # 默认灰色 (R=0.5, G=0.5, B=0.5)
+        
+        has_ref_mask = ref_counts > 0
+        if has_ref_mask.any():
+            # 将计数限制在 [0, fixed_max] 之间，然后归一化到 [0, 1]
+            # 这样 20 次及以上都会变成 1.0 (最红)
+            counts_clamped = torch.clamp(ref_counts[has_ref_mask], 0, fixed_max)
+            norm_counts = counts_clamped / float(fixed_max)
+
+            # 输出统计信息
+            self.msg_mgr.log_info(f"[Debug] A-Pose Vertex Reference Counts: min={ref_counts.min().item()}, max={ref_counts.max().item()}, mean={ref_counts.mean().item():.2f}, fixed_max={fixed_max}")
+            # 输出所有计数的分布
+            unique_counts, unique_freqs = torch.unique(ref_counts, return_counts=True)
+            distribution_info = ", ".join([f"{int(c.item())}:{f.item()}" for c, f in zip(unique_counts, unique_freqs)])
+            self.msg_mgr.log_info(f"[Debug] A-Pose Vertex Reference Count Distribution: {distribution_info}")
+            
+            # 使用 Jet 色卡：蓝色(低频) -> 绿色(中频) -> 红色(高频)
+            cmap = plt.get_cmap('jet')
+            rgba = cmap(norm_counts.cpu().numpy())
+            colors[has_ref_mask] = torch.tensor(rgba[:, :3], device=device, dtype=torch.float32)
+
+        verts_np = verts.cpu().numpy()
+        colors_np = (colors.cpu().numpy() * 255).astype(np.uint8)
+
+        # 4. 写入文件
+        with open(save_path, 'w') as f:
+            f.write("ply\nformat ascii 1.0\n")
+            f.write(f"element vertex {N_verts}\n")
+            f.write("property float x\nproperty float y\nproperty float z\n")
+            f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+            f.write("end_header\n")
+            for i in range(N_verts):
+                x, y, z = verts_np[i]
+                # OpenCV -> 标准 3D 坐标系转换
+                f.write(f"{x:.4f} {-y:.4f} {-z:.4f} {colors_np[i,0]} {colors_np[i,1]} {colors_np[i,2]}\n")
+        
+        self.msg_mgr.log_info(f"[Debug] A-Pose Exported. Fixed Max: {fixed_max}. "
+                              f"Full Coverage: {(ref_counts >= fixed_max).sum()}/{N_verts}")
+
     def _generate_color_grid(self, B, H, W, device):
         """生成一个 [B, 3, H, W] 的 2D 颜色梯度网格"""
         grid_y, grid_x = torch.meshgrid(
@@ -1128,7 +1194,8 @@ class BiggerGait__SAM3DBody__Projection_Mask_Part_3D_Gaitbase_Share(BaseModel):
             step = len(features_to_use) // self.num_FPN
             
             for i in range(self.num_FPN):
-                sub_feats = features_to_use[i*step : (i+1)*step]
+                # sub_feats = features_to_use[i*step : (i+1)*step]
+                sub_feats = features_to_use[i::self.num_FPN]
                 
                 # A. 拼接特征 [B, 512, C*step(4)]
                 sub_app = torch.concat(sub_feats, dim=-1)
