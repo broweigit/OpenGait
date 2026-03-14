@@ -637,6 +637,217 @@ def evaluate_CCPG_part(data, dataset, metric='euc'):
 
     return {}
 
+
+def evaluate_CCPG_part_based(data, dataset, metric='euc'):
+    msg_mgr = get_msg_mgr()
+
+    msg_mgr.log_info("\n" + "#" * 60)
+    msg_mgr.log_info(">>> Running Standard CCPG Evaluation First...")
+    msg_mgr.log_info("#" * 60)
+    try:
+        evaluate_CCPG(data.copy(), dataset, metric)
+    except Exception as e:
+        msg_mgr.log_warning(f"Standard evaluate_CCPG failed: {e}")
+
+    msg_mgr.log_info("\n" + "#" * 60)
+    msg_mgr.log_info(">>> Running Part-based Evaluation (Based 3-Branch Layout)...")
+    msg_mgr.log_info("#" * 60)
+
+    feature = data['embeddings']
+    label = data['labels']
+    seq_type = data['types']
+    view = data['views']
+
+    if isinstance(feature, torch.Tensor):
+        feature = feature.detach().cpu().numpy()
+    if isinstance(label, torch.Tensor):
+        label = label.detach().cpu().numpy()
+    else:
+        label = np.array(label)
+
+    try:
+        if feature.ndim != 3:
+            msg_mgr.log_info(f"Error: Feature shape {feature.shape} is not [N, C, P]!")
+            return {}
+        _, _, total_parts = feature.shape
+    except ValueError:
+        return {}
+
+    TEST_PARTS = True
+    import sys
+    import yaml
+
+    cfg_path = None
+    if '--cfgs' in sys.argv:
+        cfg_idx = sys.argv.index('--cfgs') + 1
+        if cfg_idx < len(sys.argv):
+            cfg_path = sys.argv[cfg_idx]
+
+    try:
+        if cfg_path is None:
+            raise ValueError("Cannot find '--cfgs' in current argv.")
+        with open(cfg_path, 'r', encoding='utf-8') as f:
+            yaml_cfg = yaml.safe_load(f)
+
+        model_cfg = yaml_cfg['model_cfg']
+        num_fpn_heads = model_cfg['num_FPN']
+
+        if 'bin_num' not in model_cfg:
+            raise ValueError("model_cfg.bin_num is required for part-based evaluation.")
+        bin_num = model_cfg['bin_num']
+        if isinstance(bin_num, int):
+            parts_per_branch = int(bin_num)
+        elif isinstance(bin_num, list):
+            parts_per_branch = int(sum(bin_num))
+        else:
+            raise ValueError(f"Unsupported bin_num format: {bin_num}")
+
+        branch_cfgs = model_cfg.get('branch_configs', None)
+        if branch_cfgs is None:
+            num_branches = 1
+        elif isinstance(branch_cfgs, list) and len(branch_cfgs) > 0:
+            num_branches = len(branch_cfgs)
+        else:
+            raise ValueError("branch_configs exists but is empty or invalid.")
+
+        branch_parts = [parts_per_branch] * num_branches
+        msg_mgr.log_info(f"Loaded runtime config for based evaluation: {cfg_path}")
+    except Exception as e:
+        msg_mgr.log_warning(f"Failed to parse based runtime config from {cfg_path}: {e}")
+        msg_mgr.log_warning("Falling back to standard evaluate_CCPG only.")
+        return evaluate_CCPG(data, dataset, metric)
+
+    parts_per_head = total_parts // num_fpn_heads
+    expected_parts = sum(branch_parts)
+
+    msg_mgr.log_info(f"Dynamic Config: Total Parts={total_parts}, Heads={num_fpn_heads}, Parts/Head={parts_per_head}")
+    msg_mgr.log_info(f"Based Branch Layout: {len(branch_parts)} branches, parts per branch = {branch_parts}")
+
+    if total_parts % num_fpn_heads != 0:
+        msg_mgr.log_warning(
+            f"Warning: Total parts {total_parts} cannot be evenly divided by {num_fpn_heads} heads."
+        )
+        msg_mgr.log_warning("Falling back to standard evaluate_CCPG only.")
+        return evaluate_CCPG(data, dataset, metric)
+
+    if parts_per_head != expected_parts:
+        msg_mgr.log_warning(
+            f"Warning: Calculated Parts/Head ({parts_per_head}) != Expected Based Branch Parts ({expected_parts})!"
+        )
+        msg_mgr.log_warning("Falling back to standard evaluate_CCPG only.")
+        return evaluate_CCPG(data, dataset, metric)
+
+    if len(view) > 0 and "_" in view[0]:
+        view = [v.split("_")[0] for v in view]
+
+    view_np = np.array(view)
+    view_list = sorted(list(set(view)))
+    view_num = len(view_list)
+
+    probe_seq_dict = {'CCPG': [["U0_D0_BG", "U0_D0"], ["U3_D3"], ["U1_D0"], ["U0_D0_BG"]]}
+    gallery_seq_dict = {'CCPG': [["U1_D1", "U2_D2", "U3_D3"], ["U0_D3"], ["U1_D1"], ["U0_D0"]]}
+
+    def de_diag(acc, each_angle=False):
+        valid_mask = (acc != -1)
+        diag_indices = np.diag_indices_from(acc)
+        valid_mask[diag_indices] = False
+
+        sum_acc = np.sum(acc * valid_mask, axis=1)
+        count_valid = np.sum(valid_mask, axis=1)
+        count_valid[count_valid == 0] = 1.0
+        result = sum_acc / count_valid
+
+        if not each_angle:
+            valid_rows = (count_valid > 0)
+            if np.sum(valid_rows) > 0:
+                result = np.mean(result[valid_rows])
+            else:
+                result = 0.0
+        return result
+
+    def run_evaluation_core(feat_input, title_suffix=""):
+        if feat_input.ndim == 2:
+            feat_input = feat_input[:, :, np.newaxis]
+
+        final_results = []
+        for p, probe_seq in enumerate(probe_seq_dict[dataset]):
+            gallery_seq = gallery_seq_dict[dataset][p]
+
+            g_seq_mask = np.isin(seq_type, gallery_seq)
+            p_seq_mask = np.isin(seq_type, probe_seq)
+
+            if np.sum(g_seq_mask) == 0 or np.sum(p_seq_mask) == 0:
+                final_results.append(0.0)
+                continue
+
+            feat_p = feat_input[p_seq_mask]
+            feat_g = feat_input[g_seq_mask]
+            distmat = cuda_dist(feat_p, feat_g, metric).cpu().numpy()
+
+            view_p_sub = view_np[p_seq_mask]
+            view_g_sub = view_np[g_seq_mask]
+            label_p_sub = label[p_seq_mask]
+            label_g_sub = label[g_seq_mask]
+
+            acc_matrix = np.full((view_num, view_num), -1.0)
+            for v1, probe_view in enumerate(view_list):
+                for v2, gallery_view in enumerate(view_list):
+                    p_idx = np.where(view_p_sub == probe_view)[0]
+                    g_idx = np.where(view_g_sub == gallery_view)[0]
+
+                    if len(p_idx) == 0 or len(g_idx) == 0:
+                        continue
+
+                    dist_subset = distmat[np.ix_(p_idx, g_idx)]
+                    sorted_indices = np.argsort(dist_subset, axis=1)
+                    rank1_idx = sorted_indices[:, 0]
+
+                    pred_labels = label_g_sub[g_idx][rank1_idx]
+                    gt_labels = label_p_sub[p_idx]
+                    correct = (pred_labels == gt_labels)
+                    acc_matrix[v1, v2] = np.mean(correct) * 100
+
+            final_results.append(de_diag(acc_matrix))
+
+        r1_str = ', '.join([f'{x:.1f}' for x in final_results])
+        msg_mgr.log_info(f'{title_suffix:<25} | Rank-1: {r1_str}')
+
+    msg_mgr.log_info("\n" + "=" * 40)
+    msg_mgr.log_info("1. Full Feature Evaluation (Sum of Parts)")
+    msg_mgr.log_info("=" * 40)
+    run_evaluation_core(feature, title_suffix="[ALL Combined]")
+
+    if TEST_PARTS:
+        msg_mgr.log_info("\n" + "=" * 40)
+        msg_mgr.log_info("2. FPN Branch Evaluation (Based 3-Branch Layout)")
+        msg_mgr.log_info("=" * 40)
+
+        for head_idx in range(num_fpn_heads):
+            msg_mgr.log_info(f"\n>>> [FPN Head {head_idx}]")
+
+            start = head_idx * parts_per_head
+            end = start + parts_per_head
+
+            head_feat_chunk = feature[:, :, start:end]
+            run_evaluation_core(head_feat_chunk, title_suffix=f"[Head-{head_idx} Full]")
+
+            b_start = start
+            for b_idx, b_parts in enumerate(branch_parts):
+                b_end = b_start + b_parts
+                branch_feat_chunk = feature[:, :, b_start:b_end]
+                run_evaluation_core(branch_feat_chunk, title_suffix=f"  *[Branch-{b_idx} Full]")
+                b_start = b_end
+
+            current_p_idx = start
+            for b_idx, b_parts in enumerate(branch_parts):
+                for inner_p_id in range(b_parts):
+                    part_feat = feature[:, :, current_p_idx: current_p_idx + 1]
+                    title = f"    - Branch{b_idx} Part {inner_p_id:02d}"
+                    run_evaluation_core(part_feat, title_suffix=title)
+                    current_p_idx += 1
+
+    return {}
+
 def evaluate_CCPG_part_FPN6(data, dataset, metric='euc'):
     msg_mgr = get_msg_mgr()
     

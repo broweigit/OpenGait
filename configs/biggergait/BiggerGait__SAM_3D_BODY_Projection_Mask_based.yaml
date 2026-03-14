@@ -12,7 +12,7 @@ evaluator_cfg:
   restore_ckpt_strict: false
   restore_hint: 30000
   save_name: BiggerGait__SAM3DBody__Projection_Mask_Based_Gaitbase_Share
-  eval_func: evaluate_CCPG
+  eval_func: evaluate_CCPG_part_based
   sampler:
     batch_shuffle: false
     batch_size: 4
