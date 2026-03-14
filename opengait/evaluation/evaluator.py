@@ -455,19 +455,27 @@ def evaluate_CCPG_part(data, dataset, metric='euc'):
 
     # ================= [结构配置区] =================
     TEST_PARTS = True
-    # 🌟 1. 硬编码你的配置文件路径并解析
+    import sys
     import yaml
-    CONFIG_PATH = r'configs/biggergait/BiggerGait__SAM_3D_BODY_Projection_Mask_Part_3D.yaml' # ⚠️ 务必替换为你的真实配置文件路径！
+
+    cfg_path = None
+    if '--cfgs' in sys.argv:
+        cfg_idx = sys.argv.index('--cfgs') + 1
+        if cfg_idx < len(sys.argv):
+            cfg_path = sys.argv[cfg_idx]
+
     try:
-        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+        if cfg_path is None:
+            raise ValueError("Cannot find '--cfgs' in current argv.")
+        with open(cfg_path, 'r', encoding='utf-8') as f:
             yaml_cfg = yaml.safe_load(f)
         NUM_FPN_HEADS = yaml_cfg['model_cfg']['num_FPN']
-        # 提取出每个 branch 独立的 parts 数量，例如 [16, 12, 8, 16]
         branch_parts = [b['parts'] for b in yaml_cfg['model_cfg']['branch_configs']]
+        msg_mgr.log_info(f"Loaded runtime config for evaluation: {cfg_path}")
     except Exception as e:
-        msg_mgr.log_warning(f"Failed to load config from {CONFIG_PATH}: {e}. Fallback to default.")
+        msg_mgr.log_warning(f"Failed to load runtime config from {cfg_path}: {e}. Fallback to default.")
         NUM_FPN_HEADS = 4
-        branch_parts = [16] # 兜底策略
+        branch_parts = [P // NUM_FPN_HEADS]
     # ===============================================
 
     PARTS_PER_HEAD = P // NUM_FPN_HEADS  
