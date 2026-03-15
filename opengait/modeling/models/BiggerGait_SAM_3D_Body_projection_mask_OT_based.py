@@ -362,12 +362,101 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
         cam_t_tgt[:, 2] = 2.2
         return cam_int_tgt, cam_t_tgt
 
+    def generate_mhr_apose(self, pose_out):
+        device = pose_out['pred_vertices'].device
+        batch_size = pose_out['pred_vertices'].shape[0]
+
+        pred_shape = pose_out['shape'].float()
+        pred_scale = pose_out['scale'].float()
+        pred_face = pose_out['face'].float()
+
+        zero_global_trans = torch.zeros((batch_size, 3), device=device, dtype=torch.float32)
+        zero_global_rot = torch.zeros_like(pose_out['global_rot'], dtype=torch.float32)
+        zero_hand_pose = torch.zeros_like(pose_out['hand'], dtype=torch.float32)
+        apose_body = torch.zeros_like(pose_out['body_pose'], dtype=torch.float32)
+
+        angle_rad = math.radians(-20.0)
+        apose_body[:, 25] = angle_rad
+        apose_body[:, 35] = angle_rad
+
+        with torch.no_grad(), torch.amp.autocast(enabled=False, device_type='cuda'):
+            apose_outputs = self.SAM_Engine.head_pose.mhr_forward(
+                global_trans=zero_global_trans,
+                global_rot=zero_global_rot,
+                body_pose_params=apose_body,
+                hand_pose_params=zero_hand_pose,
+                scale_params=pred_scale,
+                shape_params=pred_shape,
+                expr_params=pred_face,
+                return_keypoints=True
+            )
+
+        apose_verts = apose_outputs[0]
+        apose_keypoints = apose_outputs[1][:, :70]
+        apose_verts[..., [1, 2]] *= -1
+        apose_keypoints[..., [1, 2]] *= -1
+        return apose_verts, apose_keypoints
+
+    def build_branch_geometry(self, branch_cfg, pose_out):
+        use_apose = branch_cfg.get("use_apose", False)
+        yaw = float(branch_cfg.get("yaw", 0.0))
+
+        if use_apose:
+            if not hasattr(self, "_apose_cache"):
+                self._apose_cache = {}
+            cache_key = id(pose_out)
+            if cache_key not in self._apose_cache:
+                self._apose_cache = {cache_key: self.generate_mhr_apose(pose_out)}
+            branch_verts, branch_keypoints = self._apose_cache[cache_key]
+            apply_global_rot_alignment = False
+        else:
+            branch_verts = pose_out['pred_vertices']
+            branch_keypoints = pose_out['pred_keypoints_3d']
+            apply_global_rot_alignment = True
+
+        return {
+            "verts": branch_verts,
+            "keypoints": branch_keypoints,
+            "yaw": yaw,
+            "apply_global_rot_alignment": apply_global_rot_alignment,
+        }
+
+    def rotate_branch_geometry(self, verts, keypoints, global_rot, yaw, apply_global_rot_alignment):
+        batch_size = verts.shape[0]
+        device = verts.device
+
+        midhip = (keypoints[:, 9] + keypoints[:, 10]) / 2.0
+        centered_verts = verts - midhip.unsqueeze(1)
+
+        cy, sy = math.cos(math.radians(yaw)), math.sin(math.radians(yaw))
+        r_yaw = torch.tensor(
+            [[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]],
+            device=device,
+            dtype=torch.float32,
+        ).view(1, 3, 3).expand(batch_size, 3, 3)
+
+        if apply_global_rot_alignment:
+            rot_fix = global_rot.clone()
+            rot_fix[..., [0, 1, 2]] *= -1
+            r_canon = roma.euler_to_rotmat("XYZ", rot_fix)
+            r_comp = torch.matmul(r_canon.transpose(1, 2), r_yaw.transpose(1, 2))
+        else:
+            r_comp = r_yaw.transpose(1, 2)
+
+        verts_tmp = centered_verts.clone()
+        verts_tmp[..., [1, 2]] *= -1
+        rotated_smpl = torch.bmm(verts_tmp, r_comp)
+        rotated_cv = rotated_smpl.clone()
+        rotated_cv[..., [1, 2]] *= -1
+        return rotated_cv, midhip, r_comp
+
     def warp_features_with_ot(
         self,
         human_feat,
         mask_src,
         pred_verts,
-        pred_keypoints,
+        branch_verts,
+        branch_keypoints,
         pred_cam_t,
         global_rot,
         cam_int_src,
@@ -378,6 +467,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
         target_h,
         target_w,
         yaw,
+        apply_global_rot_alignment,
     ):
         bsz, _, _, _ = human_feat.shape
         device = human_feat.device
@@ -393,28 +483,11 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
 
         safe_indices = flat_src_idx_map.clone()
         safe_indices[safe_indices < 0] = 0
-        flat_src_verts = torch.gather(pred_verts, 1, safe_indices.unsqueeze(-1).expand(-1, -1, 3))
+        flat_src_verts = torch.gather(branch_verts, 1, safe_indices.unsqueeze(-1).expand(-1, -1, 3))
 
-        midhip = (pred_keypoints[:, 9] + pred_keypoints[:, 10]) / 2.0
-        centered_verts = pred_verts - midhip.unsqueeze(1)
-
-        rot_fix = global_rot.clone()
-        rot_fix[..., [0, 1, 2]] *= -1
-        r_canon = roma.euler_to_rotmat("XYZ", rot_fix)
-
-        cy, sy = math.cos(math.radians(yaw)), math.sin(math.radians(yaw))
-        r_side = torch.tensor(
-            [[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]],
-            device=device,
-            dtype=torch.float32,
-        ).view(1, 3, 3).expand(bsz, 3, 3)
-        r_comp = torch.matmul(r_canon.transpose(1, 2), r_side.transpose(1, 2))
-
-        v_tmp = centered_verts.clone()
-        v_tmp[..., [1, 2]] *= -1
-        v_rot_smpl = torch.bmm(v_tmp, r_comp)
-        v_rot_cv = v_rot_smpl.clone()
-        v_rot_cv[..., [1, 2]] *= -1
+        v_rot_cv, midhip, r_comp = self.rotate_branch_geometry(
+            branch_verts, branch_keypoints, global_rot, yaw, apply_global_rot_alignment
+        )
 
         _, tgt_depth_map = self.get_source_vertex_index_map(
             v_rot_cv, cam_t_tgt, cam_int_tgt, h_feat, w_feat, target_h, target_w
@@ -511,9 +584,9 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
                     )
 
                 pose_out = pose_outs[-1]
+                self._apose_cache = {}
                 pred_verts = pose_out['pred_vertices']
                 pred_cam_t = pose_out['pred_cam_t']
-                pred_keypoints = pose_out['pred_keypoints_3d']
                 global_rot = pose_out['global_rot']
                 cam_int_src = dummy_batch['cam_int']
                 _, src_depth_map = self.get_source_vertex_index_map(
@@ -558,11 +631,13 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
             cam_int_tgt, cam_t_tgt = self.build_target_camera(curr_bs, rgb.device, target_h, target_w)
             branch_warped_feats = []
             for branch_cfg in self.branch_configs:
+                branch_geo = self.build_branch_geometry(branch_cfg, pose_out)
                 warp_feat, _ = self.warp_features_with_ot(
                     human_feat,
                     human_mask.float(),
                     pred_verts,
-                    pred_keypoints,
+                    branch_geo["verts"],
+                    branch_geo["keypoints"],
                     pred_cam_t,
                     global_rot,
                     cam_int_src,
@@ -572,7 +647,8 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
                     self.sils_size,
                     target_h,
                     target_w,
-                    branch_cfg["yaw"],
+                    branch_geo["yaw"],
+                    branch_geo["apply_global_rot_alignment"],
                 )
                 branch_warped_feats.append(warp_feat)
 

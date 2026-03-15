@@ -85,9 +85,12 @@ model_cfg:
   ot_dist_thresh: 0.2
   ot_iters: 8
   branch_configs:
-    - yaw: 45.0
-    - yaw: -45.0
-    - yaw: 0.0
+    - use_apose: false
+      yaw: 45.0
+    - use_apose: false
+      yaw: -45.0
+    - use_apose: true
+      yaw: 0.0
 
   Mask_Branch:
     source_dim: 1280
