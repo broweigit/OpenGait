@@ -1,0 +1,146 @@
+data_cfg:
+  dataset_name: CCPG
+  dataset_root: /data/CCPG/Released/CCPG-ratio-pkl
+  dataset_partition: ./datasets/CCPG/CCPG.json
+  data_in_use: [True, False]
+  num_workers: 8
+  remove_no_gallery: false
+  test_dataset_name: CCPG
+
+evaluator_cfg:
+  enable_float16: true
+  restore_ckpt_strict: false
+  restore_hint: 30000
+  save_name: BiggerGait__SAM3DBody__PointCloud_Based
+  eval_func: evaluate_CCPG
+  sampler:
+    batch_shuffle: false
+    batch_size: 4
+    sample_type: all_ordered
+    frames_all_limit: 250
+  metric: euc
+  transform:
+    - type: BaseRgbTransform
+
+loss_cfg:
+  - loss_term_weight: 1.0
+    margin: 0.2
+    type: TripletLoss
+    log_prefix: triplet
+  - loss_term_weight: 1.0
+    scale: 16
+    type: CrossEntropyLoss
+    log_prefix: softmax
+    log_accuracy: true
+
+model_cfg:
+  chunk_size: 8
+  model: BiggerGait__SAM3DBody__PointCloud_Based
+  pretrained_lvm: pretrained_LVMs/sam-3d-body
+  image_size: 256
+  sils_size: 32
+  source_dim: 1280
+  num_FPN: 4
+
+  layer_config:
+    hook_mask:
+      - False
+      - False
+      - False
+      - False
+      - False
+      - False
+      - False
+      - False
+      - False
+      - False
+      - False
+      - False
+      - False
+      - False
+      - False
+      - False
+      - True
+      - True
+      - True
+      - True
+      - True
+      - True
+      - True
+      - True
+      - True
+      - True
+      - True
+      - True
+      - True
+      - True
+      - True
+      - True
+    hook_sample_type: "chunk"
+
+  num_unknown: 16
+
+  point_input_num: 1024
+  point_sample_method: fps
+  pool: PPP_UDP
+  sampling: knn
+  channel: 16
+  npoints: [512, 256, 128]
+  nsample: 32
+  scale_aware: false
+  normalize_dp: true
+  scale:
+    - 32
+
+  SeparateFCs:
+    in_channels: 256
+    out_channels: 256
+    parts_num: 32
+  SeparateBNNecks:
+    class_num: 100
+    in_channels: 256
+    parts_num: 32
+  bin_num:
+    - 32
+
+optimizer_cfg:
+  lr: 0.1
+  momentum: 0.9
+  solver: SGD
+  weight_decay: 0.0005
+
+scheduler_cfg:
+  gamma: 0.1
+  milestones:
+    - 10000
+    - 20000
+  scheduler: MultiStepLR
+
+trainer_cfg:
+  find_unused_parameters: true
+  enable_float16: true
+  fix_BN: false
+  log_iter: 100
+  with_test: true
+  restore_ckpt_strict: true
+  restore_hint: 0
+  save_iter: 5000
+  save_name: BiggerGait__SAM3DBody__PointCloud_Based
+  sync_BN: true
+  total_iter: 30000
+  sampler:
+    batch_shuffle: true
+    batch_size:
+      - 8
+      - 4
+    frames_num_fixed: 30
+    frames_skip_num: 4
+    frames_num_max: 40
+    frames_num_min: 20
+    sample_type: fixed_unordered
+    type: TripletSampler
+  transform:
+    - type: Compose
+      trf_cfg:
+        - type: RandomHorizontalFlip
+        - type: BaseRgbTransform
