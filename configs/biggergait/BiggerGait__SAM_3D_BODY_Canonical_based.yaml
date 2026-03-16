@@ -109,14 +109,14 @@ trainer_cfg:
   find_unused_parameters: true
   enable_float16: true
   fix_BN: false
-  log_iter: 1
+  log_iter: 100
   with_test: true
   restore_ckpt_strict: true
   restore_hint: 0
   save_iter: 5000
   save_name: BiggerGait__SAM3DBody__Canonical_Based
   sync_BN: true
-  total_iter: 3
+  total_iter: 30000
   sampler:
     batch_shuffle: true
     batch_size:
