@@ -482,6 +482,97 @@ class Baseline_Part_Single(nn.Module):
         _, logits = self.BNNecks(embed_1)
         
         return embed_1, logits
+
+
+class HardPartPyramidPooling(nn.Module):
+    def __init__(self, parts_num):
+        super(HardPartPyramidPooling, self).__init__()
+        self.parts_num = parts_num
+
+    def forward(self, x, part_labels):
+        n, c, s, h, w = x.shape
+        if part_labels.dim() != 4:
+            raise ValueError(f"part_labels should be [n, s, h, w], got {part_labels.shape}")
+
+        if part_labels.shape[:2] != (n, s):
+            raise ValueError(
+                f"part_labels batch/time dims {part_labels.shape[:2]} do not match feature dims {(n, s)}"
+            )
+
+        if part_labels.shape[-2:] != (h, w):
+            part_labels = F.interpolate(
+                part_labels.float().view(n * s, 1, *part_labels.shape[-2:]),
+                size=(h, w),
+                mode='nearest'
+            ).view(n, s, h, w).long()
+        else:
+            part_labels = part_labels.long()
+
+        feat = rearrange(x, 'n c s h w -> (n s) c (h w)').contiguous()
+        part_labels = rearrange(part_labels, 'n s h w -> (n s) (h w)').contiguous()
+
+        if part_labels.min() < 0 or part_labels.max() >= self.parts_num:
+            raise ValueError(
+                f"part_labels should be in [0, {self.parts_num - 1}], got [{part_labels.min().item()}, {part_labels.max().item()}]"
+            )
+
+        ns = feat.shape[0]
+        label_index = part_labels.unsqueeze(1).expand(-1, c, -1)
+
+        pooled_sum = feat.new_zeros(ns, c, self.parts_num)
+        pooled_sum.scatter_add_(2, label_index, feat)
+
+        pooled_count = feat.new_zeros(ns, 1, self.parts_num)
+        pooled_count.scatter_add_(
+            2,
+            part_labels.unsqueeze(1),
+            feat.new_ones(ns, 1, feat.shape[-1])
+        )
+
+        pooled_max = feat.new_full((ns, c, self.parts_num), -100.0)
+        pooled_max.scatter_reduce_(2, label_index, feat, reduce='amax', include_self=True)
+
+        valid_mask = pooled_count > 0
+        pooled_mean = pooled_sum / pooled_count.clamp_min(1.0)
+        pooled_max = torch.where(valid_mask.expand(-1, c, -1), pooled_max, torch.zeros_like(pooled_max))
+
+        pooled = pooled_mean + pooled_max
+        return rearrange(pooled, '(n s) c p -> n c s p', n=n, s=s).contiguous()
+
+
+class Baseline_PartPP_Single(nn.Module):
+    def __init__(self, model_cfg):
+        super(Baseline_PartPP_Single, self).__init__()
+        self.pre_rgb = SetBlockWrapper(Pre_ResNet9(**model_cfg['backbone_cfg']))
+        self.post_backbone = SetBlockWrapper(Post_ResNet9(**model_cfg['backbone_cfg']))
+        self.parts_num = model_cfg['SeparateFCs']['parts_num']
+        self.PartPP = HardPartPyramidPooling(self.parts_num)
+        self.TP = PackSequenceWrapper(torch.max)
+        self.FCs = SeparateFCs(**model_cfg['SeparateFCs'])
+        self.BNNecks = SeparateBNNecks(**model_cfg['SeparateBNNecks'])
+
+    def pre_forward(self, appearance, *args, **kwargs):
+        outs = self.pre_rgb(appearance, *args, **kwargs)
+        outs = self.post_backbone(outs, *args, **kwargs)
+        return outs
+
+    def forward(self, appearance, seqL, part_labels, *args, **kwargs):
+        outs = self.pre_rgb(appearance, *args, **kwargs)
+        outs = self.post_backbone(outs, *args, **kwargs)
+        embed_1, logits = self.test_2(outs, seqL, part_labels)
+        return embed_1, logits
+
+    def test_1(self, appearance, *args, **kwargs):
+        outs = self.pre_rgb(appearance, *args, **kwargs)
+        outs = self.post_backbone(outs, *args, **kwargs)
+        return outs
+
+    def test_2(self, outs, seqL, part_labels):
+        part_feats = self.PartPP(outs, part_labels)
+        embed_1 = self.TP(part_feats, seqL, options={"dim": 2})[0]
+        embed_1 = self.FCs(embed_1)
+        _, logits = self.BNNecks(embed_1)
+        return embed_1, logits
     
 import math
 def get_timestep_embedding(timesteps, embedding_dim, max_timesteps=40, frequency_scaling=10):
@@ -649,6 +740,50 @@ class Baseline_Part_ShareTime_2B(nn.Module):
         for i in range(self.num_FPN):
             # 这里的 parts_mask 对所有 FPN 层是共用的
             embed_1, logits = self.Gait_List[i].test_2(x_list[i], seqL, parts_mask)
+            embed_list.append(embed_1)
+            log_list.append(logits)
+        return embed_list, log_list
+
+
+class Baseline_PartPP_ShareTime_2B(nn.Module):
+    def __init__(self, model_cfg):
+        super(Baseline_PartPP_ShareTime_2B, self).__init__()
+        self.num_FPN = model_cfg['num_FPN']
+        self.Gait_Net_1 = Baseline_PartPP_Single(model_cfg)
+        self.Gait_Net_2 = Baseline_PartPP_Single(model_cfg)
+        self.Gait_List = nn.ModuleList(
+            [self.Gait_Net_1 for _ in range(self.num_FPN - self.num_FPN // 2)] +
+            [self.Gait_Net_2 for _ in range(self.num_FPN // 2)]
+        )
+
+        self.t_channel = 256
+        self.temb_proj = nn.Sequential(
+            nn.Linear(self.t_channel, self.t_channel),
+            nn.ReLU(),
+            nn.Linear(self.t_channel, self.t_channel),
+        )
+
+    def forward(self, x, seqL, part_labels):
+        x = self.test_1(x)
+        embed_list, log_list = self.test_2(x, seqL, part_labels)
+        return embed_list, log_list
+
+    def test_1(self, x, *args, **kwargs):
+        n, c, s, h, w = x.shape
+        x_list = list(torch.chunk(x, self.num_FPN, dim=1))
+        t = torch.tensor(list(range(self.num_FPN))).to(x).view(1, -1).repeat(n * s, 1)
+        for i in range(self.num_FPN):
+            temb = get_timestep_embedding(t[:, i], self.t_channel, max_timesteps=self.num_FPN).to(x)
+            temb = self.temb_proj(temb)
+            x_list[i] = self.Gait_List[i].test_1(x_list[i], temb=temb, *args, **kwargs)
+        return torch.concat(x_list, dim=1)
+
+    def test_2(self, x, seqL, part_labels):
+        x_list = torch.chunk(x, self.num_FPN, dim=1)
+        embed_list = []
+        log_list = []
+        for i in range(self.num_FPN):
+            embed_1, logits = self.Gait_List[i].test_2(x_list[i], seqL, part_labels)
             embed_list.append(embed_1)
             log_list.append(logits)
         return embed_list, log_list
