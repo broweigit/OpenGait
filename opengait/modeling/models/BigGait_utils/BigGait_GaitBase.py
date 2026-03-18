@@ -389,7 +389,6 @@ class Baseline_Single(nn.Module):
 
     def test_2(self, outs, seqL):
         outs = self.TP(outs, seqL, options={"dim": 2})[0]  # [n, c, h, w]
-        # 🌟 新增：同样在 test_2 中加入转置
         if self.vertical_pooling:
             outs = outs.transpose(2, 3).contiguous()
         outs = self.HPP(outs)  # [n, c, p]
@@ -538,6 +537,70 @@ class HardPartPyramidPooling(nn.Module):
 
         pooled = pooled_mean + pooled_max
         return rearrange(pooled, '(n s) c p -> n c s p', n=n, s=s).contiguous()
+
+
+class AnchorPatchPooling(nn.Module):
+    def __init__(self, parts_num):
+        super(AnchorPatchPooling, self).__init__()
+        self.parts_num = parts_num
+
+    def forward(self, feats, part_labels, valid_mask=None):
+        if feats.dim() != 3:
+            raise ValueError(f"feats should be [n, c, k], got {feats.shape}")
+
+        n, c, k = feats.shape
+        if part_labels.dim() != 1 or part_labels.numel() != k:
+            raise ValueError(
+                f"part_labels should be [k] and match anchor dim {k}, got {part_labels.shape}"
+            )
+
+        part_labels = part_labels.long()
+        if part_labels.min() < 0 or part_labels.max() >= self.parts_num:
+            raise ValueError(
+                f"part_labels should be in [0, {self.parts_num - 1}], got "
+                f"[{part_labels.min().item()}, {part_labels.max().item()}]"
+            )
+
+        if valid_mask is None:
+            valid_mask = torch.ones(n, k, dtype=torch.bool, device=feats.device)
+        elif valid_mask.shape != (n, k):
+            raise ValueError(f"valid_mask should be {(n, k)}, got {valid_mask.shape}")
+        else:
+            valid_mask = valid_mask.bool()
+
+        label_index = part_labels.view(1, 1, k).expand(n, c, k)
+        label_index_count = part_labels.view(1, 1, k).expand(n, 1, k)
+
+        valid_feat = feats * valid_mask.unsqueeze(1).to(feats.dtype)
+
+        pooled_sum = feats.new_zeros(n, c, self.parts_num)
+        pooled_sum.scatter_add_(2, label_index, valid_feat)
+
+        pooled_count = feats.new_zeros(n, 1, self.parts_num)
+        pooled_count.scatter_add_(
+            2,
+            label_index_count,
+            valid_mask.unsqueeze(1).to(feats.dtype)
+        )
+
+        pooled_max = feats.new_full((n, c, self.parts_num), -100.0)
+        pooled_max.scatter_reduce_(2, label_index, feats, reduce='amax', include_self=True)
+
+        patch_count = feats.new_zeros(n, 1, self.parts_num)
+        patch_count.scatter_add_(
+            2,
+            label_index_count,
+            feats.new_ones(n, 1, k)
+        )
+
+        pooled_mean = pooled_sum / pooled_count.clamp_min(1.0)
+        pooled_max = torch.where(
+            patch_count.expand(-1, c, -1) > 0,
+            pooled_max,
+            torch.zeros_like(pooled_max)
+        )
+
+        return pooled_mean + pooled_max
 
 
 class Baseline_PartPP_Single(nn.Module):
@@ -784,6 +847,91 @@ class Baseline_PartPP_ShareTime_2B(nn.Module):
         log_list = []
         for i in range(self.num_FPN):
             embed_1, logits = self.Gait_List[i].test_2(x_list[i], seqL, part_labels)
+            embed_list.append(embed_1)
+            log_list.append(logits)
+        return embed_list, log_list
+
+
+class Baseline_AnchorMasked_Single(nn.Module):
+    def __init__(self, model_cfg):
+        super(Baseline_AnchorMasked_Single, self).__init__()
+        self.pre_rgb = SetBlockWrapper(Pre_ResNet9(**model_cfg['backbone_cfg']))
+        self.post_backbone = SetBlockWrapper(Post_ResNet9(**model_cfg['backbone_cfg']))
+        self.TP = PackSequenceWrapper(torch.max)
+        self.parts_num = model_cfg['SeparateFCs']['parts_num']
+        self.PatchPool = AnchorPatchPooling(self.parts_num)
+        self.FCs = SeparateFCs(**model_cfg['SeparateFCs'])
+        self.BNNecks = SeparateBNNecks(**model_cfg['SeparateBNNecks'])
+
+    def test_1(self, appearance, *args, **kwargs):
+        outs = self.pre_rgb(appearance, *args, **kwargs)
+        outs = self.post_backbone(outs, *args, **kwargs)
+        return outs
+
+    def _temporal_any(self, valid_mask, seqL):
+        if valid_mask is None:
+            return None
+
+        if seqL is None:
+            return valid_mask.any(dim=1)
+
+        seqL = seqL[0].data.cpu().numpy().tolist()
+        start = [0] + torch.tensor(seqL).cumsum(0).tolist()[:-1]
+
+        pooled_valid = []
+        for curr_start, curr_seqL in zip(start, seqL):
+            seq_valid = valid_mask.narrow(1, curr_start, curr_seqL)
+            pooled_valid.append(seq_valid.any(dim=1))
+        return torch.cat(pooled_valid, dim=0)
+
+    def test_2(self, anchor_feats, seqL, anchor_valid=None, anchor_part_labels=None):
+        if anchor_part_labels is None:
+            raise ValueError("anchor_part_labels is required for anchor patch pooling.")
+
+        pooled_anchor = self.TP(anchor_feats, seqL, options={"dim": 2})[0]
+        pooled_valid = self._temporal_any(anchor_valid, seqL)
+        embed_1 = self.PatchPool(pooled_anchor, anchor_part_labels, pooled_valid)
+        embed_1 = self.FCs(embed_1)
+        _, logits = self.BNNecks(embed_1)
+        return embed_1, logits
+
+
+class Baseline_AnchorMasked_ShareTime_2B(nn.Module):
+    def __init__(self, model_cfg):
+        super(Baseline_AnchorMasked_ShareTime_2B, self).__init__()
+        self.num_FPN = model_cfg['num_FPN']
+        self.Gait_Net_1 = Baseline_AnchorMasked_Single(model_cfg)
+        self.Gait_Net_2 = Baseline_AnchorMasked_Single(model_cfg)
+        self.Gait_List = nn.ModuleList(
+            [self.Gait_Net_1 for _ in range(self.num_FPN - self.num_FPN // 2)] +
+            [self.Gait_Net_2 for _ in range(self.num_FPN // 2)]
+        )
+
+        self.t_channel = 256
+        self.temb_proj = nn.Sequential(
+            nn.Linear(self.t_channel, self.t_channel),
+            nn.ReLU(),
+            nn.Linear(self.t_channel, self.t_channel),
+        )
+
+    def test_1(self, x, *args, **kwargs):
+        n, c, s, h, w = x.shape
+        x_list = list(torch.chunk(x, self.num_FPN, dim=1))
+        t = torch.tensor(list(range(self.num_FPN))).to(x).view(1, -1).repeat(n * s, 1)
+        for i in range(self.num_FPN):
+            temb = get_timestep_embedding(t[:, i], self.t_channel, max_timesteps=self.num_FPN).to(x)
+            temb = self.temb_proj(temb)
+            x_list[i] = self.Gait_List[i].test_1(x_list[i], temb=temb, *args, **kwargs)
+        return torch.concat(x_list, dim=1)
+
+    def test_2(self, anchor_feats, seqL, anchor_valid=None, anchor_part_labels=None):
+        feat_list = torch.chunk(anchor_feats, self.num_FPN, dim=1)
+        embed_list = []
+        log_list = []
+        for i in range(self.num_FPN):
+            embed_1, logits = self.Gait_List[i].test_2(
+                feat_list[i], seqL, anchor_valid, anchor_part_labels
+            )
             embed_list.append(embed_1)
             log_list.append(logits)
         return embed_list, log_list
