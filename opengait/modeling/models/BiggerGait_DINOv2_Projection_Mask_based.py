@@ -40,6 +40,8 @@ class BiggerGait__DINOv2__Projection_Mask_Based(BaseModel):
         self.chunk_size = model_cfg.get("chunk_size", 96)
         self.sync_hflip_prob = model_cfg.get("sync_hflip_prob", 0.5)
         self.enable_timing = model_cfg.get("enable_timing", True)
+        self.rgb_mean = torch.tensor([0.485 * 255, 0.456 * 255, 0.406 * 255], dtype=torch.float32).view(1, 3, 1, 1)
+        self.rgb_std = torch.tensor([0.229 * 255, 0.224 * 255, 0.225 * 255], dtype=torch.float32).view(1, 3, 1, 1)
 
         self.Gait_Net = Baseline_Share(model_cfg)
         self.HumanSpace_Conv = nn.ModuleList([
@@ -95,6 +97,7 @@ class BiggerGait__DINOv2__Projection_Mask_Based(BaseModel):
         self.msg_mgr.log_info("=> init successfully")
 
     def inputs_pretreament(self, inputs):
+        pretreat_start = time.perf_counter()
         seqs_batch, labs_batch, typs_batch, vies_batch, seqL_batch = inputs
         seq_trfs = self.trainer_trfs if self.training else self.evaluator_trfs
         if len(seqs_batch) != len(seq_trfs):
@@ -105,14 +108,18 @@ class BiggerGait__DINOv2__Projection_Mask_Based(BaseModel):
             )
 
         requires_grad = bool(self.training)
+        rgb_start = time.perf_counter()
         rgb = np2var(
-            np.asarray([seq_trfs[0](seq) for seq in seqs_batch[0]]),
+            np.asarray(seqs_batch[0], dtype=np.float32),
             requires_grad=requires_grad,
         ).float()
+        rgb_time = time.perf_counter() - rgb_start
 
         # Keep the offline SAM decoder frames as Python objects so we can unpack
         # pred_vertices / pred_cam_t / cam_int inside forward.
-        sam_decoder = [list(seq_trfs[1](seq)) for seq in seqs_batch[1]]
+        sam_start = time.perf_counter()
+        sam_decoder = [seq_trfs[1](seq) for seq in seqs_batch[1]]
+        sam_time = time.perf_counter() - sam_start
 
         labs = list2var(labs_batch).long()
         seqL = np2var(seqL_batch).int() if seqL_batch is not None else None
@@ -120,6 +127,13 @@ class BiggerGait__DINOv2__Projection_Mask_Based(BaseModel):
             seqL_sum = int(seqL.sum().data.cpu().numpy())
             rgb = rgb[:, :seqL_sum]
             sam_decoder = [seq[:seqL_sum] for seq in sam_decoder]
+
+        pretreat_total = time.perf_counter() - pretreat_start
+        self._last_pretreat_timing = {
+            'scalar/time/input_pretreat_rgb': rgb_time,
+            'scalar/time/input_pretreat_sam': sam_time,
+            'scalar/time/input_pretreat_misc': max(pretreat_total - rgb_time - sam_time, 0.0),
+        }
 
         return [rgb, sam_decoder], labs, typs_batch, vies_batch, seqL
 
@@ -191,9 +205,27 @@ class BiggerGait__DINOv2__Projection_Mask_Based(BaseModel):
             torch.cuda.synchronize(device)
         return time.perf_counter()
 
+    def _gpu_rgb_preprocess(self, rgb_img):
+        if rgb_img.ndim != 4:
+            raise ValueError(f"Expected 4D rgb tensor, got shape {tuple(rgb_img.shape)}")
+        if rgb_img.shape[-1] == 3:
+            rgb_img = rgb_img.permute(0, 3, 1, 2).contiguous()
+        elif rgb_img.shape[1] != 3:
+            raise ValueError(f"Unsupported rgb tensor shape {tuple(rgb_img.shape)}")
+
+        if rgb_img.shape[-1] == rgb_img.shape[-2]:
+            cutting = rgb_img.shape[-1] // 4
+            if cutting != 0:
+                rgb_img = rgb_img[..., cutting:-cutting]
+
+        mean = self.rgb_mean.to(device=rgb_img.device, dtype=rgb_img.dtype)
+        std = self.rgb_std.to(device=rgb_img.device, dtype=rgb_img.dtype)
+        return (rgb_img - mean) / std
+
     def forward(self, inputs):
         timing_info = {
             'model_hflip': 0.0,
+            'model_rgb_preprocess': 0.0,
             'model_dino': 0.0,
             'model_sam_unpack': 0.0,
             'model_project_mask': 0.0,
@@ -236,6 +268,10 @@ class BiggerGait__DINOv2__Projection_Mask_Based(BaseModel):
                 rgb_img = rearrange(rgb_chunk, 'n s c h w -> (n s) c h w').contiguous()
                 rgb_img = self._apply_sequence_hflip(rgb_img, flip_flags, s)
                 timing_info['model_hflip'] += self._perf_now(rgb.device) - stage_start
+
+                stage_start = self._perf_now(rgb.device)
+                rgb_img = self._gpu_rgb_preprocess(rgb_img)
+                timing_info['model_rgb_preprocess'] += self._perf_now(rgb.device) - stage_start
 
                 stage_start = self._perf_now(rgb.device)
                 outs = self.preprocess(rgb_img, self.image_size)

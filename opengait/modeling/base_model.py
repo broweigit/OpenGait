@@ -405,6 +405,7 @@ class BaseModel(MetaModel, nn.Module):
     def run_train(model):
         """Accept the instance object(model) here, and then run the train loop."""
         prev_end = time.perf_counter()
+        host_model = model.module if hasattr(model, 'module') else model
         for inputs in model.train_loader:
             iter_fetch_done = time.perf_counter()
             data_wait_time = iter_fetch_done - prev_end
@@ -413,6 +414,8 @@ class BaseModel(MetaModel, nn.Module):
             pretreat_start = time.perf_counter()
             ipts = model.inputs_pretreament(inputs)
             pretreat_time = time.perf_counter() - pretreat_start
+            pretreat_breakdown = getattr(host_model, '_last_pretreat_timing', None)
+            host_model._last_pretreat_timing = None
 
             forward_start = time.perf_counter()
             with autocast(enabled=model.engine_cfg['enable_float16']):
@@ -436,10 +439,17 @@ class BaseModel(MetaModel, nn.Module):
             model_forward_timed = 0.0
             timing_scalars = {
                 'scalar/time/data_wait': data_wait_time,
-                'scalar/time/input_pretreat': pretreat_time,
                 'scalar/time/loss_agg': loss_time,
                 'scalar/time/train_step': step_time,
             }
+            pretreat_accounted = 0.0
+            if pretreat_breakdown:
+                for k, v in pretreat_breakdown.items():
+                    timing_scalars[k] = float(v)
+                    pretreat_accounted += float(v)
+            else:
+                timing_scalars['scalar/time/input_pretreat'] = pretreat_time
+                pretreat_accounted = pretreat_time
             for k, v in timing_info.items():
                 timing_scalars[f'scalar/time/{k}'] = float(v)
                 model_forward_timed += float(v)
@@ -447,12 +457,12 @@ class BaseModel(MetaModel, nn.Module):
             iter_compute_total = time.perf_counter() - iter_compute_start
             misc_overhead = max(
                 iter_compute_total - (
-                    pretreat_time + model_forward_timed + loss_time + step_time
+                    pretreat_accounted + model_forward_timed + loss_time + step_time
                 ),
                 0.0
             )
             timing_scalars['scalar/time/misc_overhead'] = misc_overhead
-            timing_scalars['scalar/time/window_total'] = data_wait_time + pretreat_time + model_forward_timed + loss_time + step_time + misc_overhead
+            timing_scalars['scalar/time/window_total'] = data_wait_time + pretreat_accounted + model_forward_timed + loss_time + step_time + misc_overhead
 
             visual_summary.update(loss_info)
             visual_summary.update(timing_scalars)
