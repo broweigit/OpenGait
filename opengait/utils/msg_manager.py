@@ -80,12 +80,15 @@ class MessageManager:
         now = time.time()
         string = "Iteration {:0>5}, Cost {:.2f}s".format(
             self.iteration, now-self.time, end="")
-        for i, (k, v) in enumerate(self.info_dict.items()):
-            if 'scalar' not in k:
+        for i, (raw_k, v) in enumerate(self.info_dict.items()):
+            if 'scalar' not in raw_k:
                 continue
-            k = k.replace('scalar/', '').replace('/', '_')
+            k = raw_k.replace('scalar/', '').replace('/', '_')
             end = "\n" if i == len(self.info_dict)-1 else ""
-            string += ", {0}={1:.4f}".format(k, np.mean(v), end=end)
+            if raw_k.startswith('scalar/time/'):
+                string += ", {0}={1:.2f}s".format(k, np.sum(v), end=end)
+            else:
+                string += ", {0}={1:.4f}".format(k, np.mean(v), end=end)
         self.log_info(string)
         self.reset_time()
 

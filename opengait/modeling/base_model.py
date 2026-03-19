@@ -12,6 +12,7 @@ BaseModel.run_test(model)
 import torch
 import numpy as np
 import os.path as osp
+import time
 import torch.nn as nn
 import torch.optim as optim
 import torch.utils.data as tordata
@@ -403,21 +404,63 @@ class BaseModel(MetaModel, nn.Module):
     @ staticmethod
     def run_train(model):
         """Accept the instance object(model) here, and then run the train loop."""
+        prev_end = time.perf_counter()
         for inputs in model.train_loader:
+            iter_fetch_done = time.perf_counter()
+            data_wait_time = iter_fetch_done - prev_end
+            iter_compute_start = iter_fetch_done
+
+            pretreat_start = time.perf_counter()
             ipts = model.inputs_pretreament(inputs)
+            pretreat_time = time.perf_counter() - pretreat_start
+
+            forward_start = time.perf_counter()
             with autocast(enabled=model.engine_cfg['enable_float16']):
                 retval = model(ipts)
                 training_feat, visual_summary = retval['training_feat'], retval['visual_summary']
+                timing_info = retval.get('timing_info', {})
                 del retval
+            forward_wall_time = time.perf_counter() - forward_start
+
+            loss_start = time.perf_counter()
             loss_sum, loss_info = model.loss_aggregator(training_feat)
+            loss_time = time.perf_counter() - loss_start
+
+            step_start = time.perf_counter()
             ok = model.train_step(loss_sum)
+            step_time = time.perf_counter() - step_start
             if not ok:
+                prev_end = time.perf_counter()
                 continue
 
+            model_forward_timed = 0.0
+            timing_scalars = {
+                'scalar/time/data_wait': data_wait_time,
+                'scalar/time/input_pretreat': pretreat_time,
+                'scalar/time/loss_agg': loss_time,
+                'scalar/time/train_step': step_time,
+            }
+            for k, v in timing_info.items():
+                timing_scalars[f'scalar/time/{k}'] = float(v)
+                model_forward_timed += float(v)
+
+            iter_compute_total = time.perf_counter() - iter_compute_start
+            misc_overhead = max(
+                iter_compute_total - (
+                    pretreat_time + model_forward_timed + loss_time + step_time
+                ),
+                0.0
+            )
+            timing_scalars['scalar/time/misc_overhead'] = misc_overhead
+            timing_scalars['scalar/time/window_total'] = data_wait_time + pretreat_time + model_forward_timed + loss_time + step_time + misc_overhead
+
             visual_summary.update(loss_info)
+            visual_summary.update(timing_scalars)
             visual_summary['scalar/learning_rate'] = model.optimizer.param_groups[0]['lr']
+            loss_info.update(timing_scalars)
 
             model.msg_mgr.train_step(loss_info, visual_summary)
+            prev_end = time.perf_counter()
             if model.iteration % model.engine_cfg['save_iter'] == 0:
                 # save the checkpoint
                 model.save_ckpt(model.iteration)
