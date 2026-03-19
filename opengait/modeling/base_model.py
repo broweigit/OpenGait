@@ -477,39 +477,8 @@ class BaseModel(MetaModel, nn.Module):
                 evaluator_cfg['sampler']['batch_size'], torch.distributed.get_world_size()))
         rank = torch.distributed.get_rank()
 
-        tensor_save_dir = osp.join(model.save_path, "tensors")
-        if rank == 0:
-            mkdir(tensor_save_dir)
-
-        is_training_mode = hasattr(model, 'train_loader')
-
-        if is_training_mode:
-            USE_CACHE = False
-            cache_name = f"test_features_iter{model.iteration}.pt"
-        else:
-            USE_CACHE = True
-            cache_name = "test_features_cache.pt"
-
-        cache_path = osp.join(tensor_save_dir, cache_name)
-        info_dict = None
-
-        # 3. 尝试读取缓存
-        if USE_CACHE and osp.exists(cache_path):
-            if rank == 0:
-                model.msg_mgr.log_info(f"==> [Loader] Cache found at {cache_path}")
-                model.msg_mgr.log_info(f"==> Skipping inference & Loading...")
-                loaded_dict = torch.load(cache_path)
-                
-                info_dict = {k: (v.cpu().numpy() if isinstance(v, torch.Tensor) else np.array(v) if isinstance(v, list) else v) 
-                             for k, v in loaded_dict.items()}
-            else:
-                info_dict = None
-        else:
-            if USE_CACHE and rank == 0:
-                 model.msg_mgr.log_info(f"==> [Loader] Cache not found at {cache_path}. Running Inference...")
-            
-            with torch.no_grad():
-                info_dict = model.inference(rank)
+        with torch.no_grad():
+            info_dict = model.inference(rank)
 
         if rank == 0:
             if 'labels' not in (info_dict or {}):
@@ -521,16 +490,6 @@ class BaseModel(MetaModel, nn.Module):
                 })
                 if isinstance(info_dict['embeddings'], torch.Tensor):
                     info_dict['embeddings'] = info_dict['embeddings'].cpu().numpy()
-
-            should_save = False
-            if is_training_mode:
-                should_save = True
-            elif not osp.exists(cache_path):
-                should_save = True
-
-            if should_save:
-                model.msg_mgr.log_info(f"==> [Saver] Saving features to {cache_path}...")
-                torch.save(info_dict, cache_path)
 
             eval_func_name = evaluator_cfg.get("eval_func", "identification")
             eval_func = getattr(eval_functions, eval_func_name)

@@ -12,7 +12,7 @@ evaluator_cfg:
   restore_ckpt_strict: false
   restore_hint: 5000
   save_name: BiggerGait__SAM3DBody__Projection_Mask_Anchor_Based_Gaitbase_Share
-  eval_func: evaluate_CCPG
+  eval_func: evaluate_CCPG_part_based
   sampler:
     batch_shuffle: false
     batch_size: 8
@@ -142,14 +142,14 @@ trainer_cfg:
   find_unused_parameters: true
   enable_float16: true
   fix_BN: false
-  log_iter: 1
+  log_iter: 100
   with_test: true
   restore_ckpt_strict: true
   restore_hint: 0
   save_iter: 5000
   save_name: BiggerGait__SAM3DBody__Projection_Mask_Anchor_Based_Gaitbase_Share
   sync_BN: true
-  total_iter: 3
+  total_iter: 30000
   sampler:
     batch_shuffle: true
     batch_size:
