@@ -11,7 +11,7 @@ evaluator_cfg:
   enable_float16: true
   restore_ckpt_strict: false
   restore_hint: 5000
-  save_name: BiggerGait__SAM3DBody__Projection_Mask_Anchor_Based_Gaitbase_Share
+  save_name: BiggerGait__SAM3DBody__Projection_Mask_HeightPart_Based_Gaitbase_Share
   eval_func: evaluate_CCPG_part_based
   sampler:
     batch_shuffle: false
@@ -35,14 +35,14 @@ loss_cfg:
 
 model_cfg:
   chunk_size: 8
-  model: BiggerGait__SAM3DBody__Projection_Mask_Anchor_Based_Gaitbase_Share
+  model: BiggerGait__SAM3DBody__Projection_Mask_HeightPart_Based_Gaitbase_Share
   pretrained_lvm: pretrained_LVMs/sam-3d-body
   pretrained_mask_branch: BYPASS
   image_size: 256
   sils_size: 32
   source_dim: 1280
   num_FPN: 4
-  anchor_pt_path: pretrained_LVMs/mhr_semantic_filtered_anchor_patches_512a_32p.pt
+  anchor_pt_path: pretrained_LVMs/mhr_anchor_patches_512a_32p.pt
   anchor_depth_tol: 0.02
   projection_zoom_ratio: 1.0
   anchor_normal_offset_scale: 0.12
@@ -150,7 +150,7 @@ trainer_cfg:
   restore_ckpt_strict: true
   restore_hint: 0
   save_iter: 5000
-  save_name: BiggerGait__SAM3DBody__Projection_Mask_Anchor_Based_Gaitbase_Share
+  save_name: BiggerGait__SAM3DBody__Projection_Mask_HeightPart_Based_Gaitbase_Share
   sync_BN: true
   total_iter: 30000
   sampler:

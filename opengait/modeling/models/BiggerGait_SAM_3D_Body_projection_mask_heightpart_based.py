@@ -1,5 +1,6 @@
 import os
 import sys
+import colorsys
 
 import numpy as np
 import torch
@@ -65,7 +66,7 @@ class ResizeToHW(torch.nn.Module):
         return F.interpolate(x, size=self.target_size, mode='bilinear', align_corners=False)
 
 
-class BiggerGait__SAM3DBody__Projection_Mask_Anchor_Based_Gaitbase_Share(BaseModel):
+class BiggerGait__SAM3DBody__Projection_Mask_HeightPart_Based_Gaitbase_Share(BaseModel):
     def build_network(self, model_cfg):
         self.pretrained_lvm = model_cfg["pretrained_lvm"]
         self.pretrained_mask_branch = model_cfg["pretrained_mask_branch"]
@@ -100,7 +101,8 @@ class BiggerGait__SAM3DBody__Projection_Mask_Anchor_Based_Gaitbase_Share(BaseMod
 
         self._load_anchor_indices(model_cfg)
 
-        self.Gait_Net = Baseline_AnchorMasked_ShareTime_2B(model_cfg)
+        self.height_parts_num = model_cfg['SeparateFCs']['parts_num']
+        self.Gait_Net = Baseline_AnchorHeightPart_ShareTime_2B(model_cfg)
         self.HumanSpace_Conv = nn.ModuleList([
             nn.Sequential(
                 nn.BatchNorm2d(input_dim, affine=False),
@@ -127,31 +129,19 @@ class BiggerGait__SAM3DBody__Projection_Mask_Anchor_Based_Gaitbase_Share(BaseMod
                 raise ValueError(
                     f"Tensor anchor file should be [num_anchors, 2], got {tuple(anchor_data.shape)}"
                 )
-            anchor_patch_labels = anchor_data[:, 0].long()
             sampled_vertex_indices = anchor_data[:, 1].long()
         elif isinstance(anchor_data, dict) and 'sampled_vertex_indices' in anchor_data:
             sampled_vertex_indices = anchor_data['sampled_vertex_indices'].long()
-            anchor_patch_labels = torch.arange(sampled_vertex_indices.numel(), dtype=torch.long)
         else:
             raise KeyError(
                 f"Unsupported anchor file format in {self.anchor_pt_path}. "
                 "Expected {'sampled_vertex_indices': ...} or a [num_anchors, 2] tensor."
             )
-
-        num_patches = int(anchor_patch_labels.max().item()) + 1
-        expected_parts = model_cfg['SeparateFCs']['parts_num']
-        if num_patches != expected_parts:
-            raise ValueError(
-                f"Loaded {num_patches} anchor patches from {self.anchor_pt_path}, "
-                f"but SeparateFCs.parts_num is {expected_parts}"
-            )
         self.register_buffer("sampled_vertex_indices", sampled_vertex_indices, persistent=False)
-        self.register_buffer("anchor_patch_labels", anchor_patch_labels, persistent=False)
         self.num_anchors = sampled_vertex_indices.numel()
-        self.num_anchor_patches = num_patches
         self.msg_mgr.log_info(
-            f"[Anchor] Loaded {self.num_anchors} sampled vertices grouped into "
-            f"{self.num_anchor_patches} patches from {self.anchor_pt_path}"
+            f"[Anchor] Loaded {self.num_anchors} sampled vertices from {self.anchor_pt_path} "
+            f"for dynamic z-height partitioning"
         )
 
     def init_SAM_Backbone(self):
@@ -329,17 +319,27 @@ class BiggerGait__SAM3DBody__Projection_Mask_Anchor_Based_Gaitbase_Share(BaseMod
             return False
         return ((self.iteration + 1) % log_iter) == 0
 
-    def _build_anchor_debug_overlay_batch(self, feat_map, anchor_u_cont, anchor_v_cont, visible_mask, max_frames=5):
+    def _get_part_palette(self):
+        palette = []
+        for idx in range(self.height_parts_num):
+            hue = idx / max(self.height_parts_num, 1)
+            rgb = colorsys.hsv_to_rgb(hue, 0.75, 1.0)
+            palette.append(tuple(int(round(v * 255)) for v in rgb))
+        return palette
+
+    def _build_anchor_debug_overlay_batch(self, feat_map, anchor_u_cont, anchor_v_cont, part_labels, visible_mask, max_frames=5):
         feat_map = feat_map.detach().float().cpu()
         anchor_u_cont = anchor_u_cont.detach().float().cpu()
         anchor_v_cont = anchor_v_cont.detach().float().cpu()
+        part_labels = part_labels.detach().long().cpu()
         visible_mask = visible_mask.detach().bool().cpu()
 
         num_frames = min(max_frames, feat_map.shape[0])
         vis_frames = []
         scale = 8
-        gray_r = 0.6
-        white_r = 0.9
+        part_r = 0.75
+        white_r = 0.35
+        palette = self._get_part_palette()
 
         for idx in range(num_frames):
             curr_feat = feat_map[idx]
@@ -359,10 +359,10 @@ class BiggerGait__SAM3DBody__Projection_Mask_Anchor_Based_Gaitbase_Share(BaseMod
             overlay = Image.fromarray(pca_img).resize((width * scale, height * scale), Image.Resampling.NEAREST)
             draw = ImageDraw.Draw(overlay)
 
-            for uu, vv in zip(anchor_u_cont[idx].tolist(), anchor_v_cont[idx].tolist()):
+            for uu, vv, part_id in zip(anchor_u_cont[idx].tolist(), anchor_v_cont[idx].tolist(), part_labels[idx].tolist()):
                 cx = uu * scale
                 cy = vv * scale
-                draw.ellipse((cx - gray_r, cy - gray_r, cx + gray_r, cy + gray_r), fill=(150, 150, 150))
+                draw.ellipse((cx - part_r, cy - part_r, cx + part_r, cy + part_r), fill=palette[part_id])
 
             for uu, vv, vis in zip(anchor_u_cont[idx].tolist(), anchor_v_cont[idx].tolist(), visible_mask[idx].tolist()):
                 if vis:
@@ -376,6 +376,14 @@ class BiggerGait__SAM3DBody__Projection_Mask_Anchor_Based_Gaitbase_Share(BaseMod
         if not vis_frames:
             return None
         return torch.stack(vis_frames, dim=0)
+
+    def _build_height_part_labels(self, anchor_vertices):
+        z_coord = anchor_vertices[..., 2]
+        z_min = z_coord.min(dim=1, keepdim=True).values
+        z_max = z_coord.max(dim=1, keepdim=True).values
+        z_norm = (z_coord - z_min) / (z_max - z_min).clamp_min(1e-6)
+        part_labels = torch.clamp((z_norm * self.height_parts_num).long(), max=self.height_parts_num - 1)
+        return part_labels
 
     def project_vertices_to_mask(self, vertices, cam_t, cam_int, h_feat, w_feat, target_h, target_w):
         bsz, _, _ = vertices.shape
@@ -527,6 +535,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_Anchor_Based_Gaitbase_Share(BaseMod
         anchor_overlay_summary = None
         all_anchor_feats = []
         all_anchor_valid = []
+        all_anchor_part_labels = []
         target_h, target_w = self.image_size * 2, self.image_size
         h_feat, w_feat = target_h // 16, target_w // 16
 
@@ -618,6 +627,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_Anchor_Based_Gaitbase_Share(BaseMod
                 pred_verts, pred_cam_t, cam_int, out_h, out_w, target_h, target_w
             )[1]
             anchor_vertices = pred_verts[:, self.sampled_vertex_indices, :]
+            anchor_height_part_labels_flat = self._build_height_part_labels(anchor_vertices)
             if vertex_normals is not None:
                 anchor_normals = vertex_normals[:, self.sampled_vertex_indices, :]
                 anchor_vertices_for_projection = anchor_vertices + self.anchor_normal_offset_scale * anchor_normals
@@ -647,19 +657,23 @@ class BiggerGait__SAM3DBody__Projection_Mask_Anchor_Based_Gaitbase_Share(BaseMod
                     anchor_feat_map[:5],
                     anchor_debug['u_cont'][:5],
                     anchor_debug['v_cont'][:5],
+                    anchor_height_part_labels_flat[:5],
                     anchor_valid_flat[:5],
                 )
 
             anchor_feats = rearrange(anchor_feats_flat, '(n s) k c -> n c s k', n=n, s=s).contiguous()
             anchor_valid = rearrange(anchor_valid_flat, '(n s) k -> n s k', n=n, s=s).contiguous()
+            anchor_part_labels = rearrange(anchor_height_part_labels_flat, '(n s) k -> n s k', n=n, s=s).contiguous()
 
             all_anchor_feats.append(anchor_feats)
             all_anchor_valid.append(anchor_valid)
+            all_anchor_part_labels.append(anchor_part_labels)
 
         all_anchor_feats = torch.cat(all_anchor_feats, dim=2)
         all_anchor_valid = torch.cat(all_anchor_valid, dim=1)
+        all_anchor_part_labels = torch.cat(all_anchor_part_labels, dim=1)
         embed_list, log_list = self.Gait_Net.test_2(
-            all_anchor_feats, seqL, all_anchor_valid, self.anchor_patch_labels
+            all_anchor_feats, seqL, all_anchor_valid, all_anchor_part_labels
         )
         embeddings = torch.concat(embed_list, dim=-1)
 
