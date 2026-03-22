@@ -48,6 +48,87 @@ class AttentionFusion(nn.Module):
             retun += feat_list[i]*score[:,:,i]
         return retun
 
+
+class HorizontalWidthTokenPyramid(nn.Module):
+    def __init__(self, bin_num=None, width_token_num=4):
+        super(HorizontalWidthTokenPyramid, self).__init__()
+        if bin_num is None:
+            bin_num = [16, 8, 4, 2, 1]
+        self.bin_num = bin_num
+        self.width_token_num = width_token_num
+
+    def forward(self, x):
+        """
+            x  : [n, c, s, h, w]
+            ret: [n, c, s, p, k]
+        """
+        n, c, s, h, w = x.size()
+        features = []
+        for b in self.bin_num:
+            if h % b != 0:
+                raise ValueError(f"Feature height {h} must be divisible by bin size {b}.")
+            z = x.view(n, c, s, b, h // b, w)
+            z = z.mean(-2) + z.max(-2)[0]
+            z = rearrange(z, 'n c s p w -> (n s p) c w').contiguous()
+            z = F.adaptive_avg_pool1d(z, self.width_token_num) + F.adaptive_max_pool1d(z, self.width_token_num)
+            z = rearrange(
+                z, '(n s p) c k -> n c s p k',
+                n=n, s=s, p=b, k=self.width_token_num
+            ).contiguous()
+            features.append(z)
+        return torch.cat(features, dim=3)
+
+
+class WidthTokenTemporalMixer(nn.Module):
+    def __init__(self, channels, kernel_size=3):
+        super(WidthTokenTemporalMixer, self).__init__()
+        padding = kernel_size // 2
+        self.dwconv = nn.Conv1d(
+            channels, channels, kernel_size=kernel_size,
+            padding=padding, groups=channels, bias=False
+        )
+        self.bn = nn.BatchNorm1d(channels)
+        self.act = nn.GELU()
+        self.pwconv = nn.Conv1d(channels, channels, kernel_size=1, bias=False)
+
+    def forward(self, x):
+        """
+            x  : [n, c, s, p, k]
+            ret: [n, c, s, p, k]
+        """
+        n, c, s, p, k = x.shape
+        z = rearrange(x, 'n c s p k -> (n p k) c s').contiguous()
+        z = self.dwconv(z)
+        z = self.bn(z)
+        z = self.act(z)
+        z = self.pwconv(z)
+        z = rearrange(z, '(n p k) c s -> n c s p k', n=n, p=p, k=k).contiguous()
+        return x + z
+
+
+class WidthTokenAttentionPooling(nn.Module):
+    def __init__(self, channels, hidden_ratio=4):
+        super(WidthTokenAttentionPooling, self).__init__()
+        hidden_dim = max(channels // hidden_ratio, 16)
+        self.score = nn.Sequential(
+            nn.Conv1d(channels, hidden_dim, kernel_size=1, bias=False),
+            nn.BatchNorm1d(hidden_dim),
+            nn.GELU(),
+            nn.Conv1d(hidden_dim, 1, kernel_size=1, bias=True),
+        )
+
+    def forward(self, x):
+        """
+            x  : [n, c, p, k]
+            ret: [n, c, p]
+        """
+        n, c, p, k = x.shape
+        z = rearrange(x, 'n c p k -> (n p) c k').contiguous()
+        attn = self.score(z)
+        attn = F.softmax(attn, dim=-1)
+        pooled = (z * attn).sum(dim=-1)
+        return rearrange(pooled, '(n p) c -> n c p', n=n, p=p).contiguous()
+
 from typing import Optional, Callable
 class BasicBlock_Time(nn.Module):
     expansion: int = 1
@@ -811,6 +892,96 @@ class Baseline_ShareTime_2B(nn.Module):
     def test_2(self, x, seqL):
         # x: [n, c, s, h, w]
         # embed_1: [n, c, p]
+        x_list = torch.chunk(x, self.num_FPN, dim=1)
+        embed_list = []
+        log_list = []
+        for i in range(self.num_FPN):
+            embed_1, logits = self.Gait_List[i].test_2(x_list[i], seqL)
+            embed_list.append(embed_1)
+            log_list.append(logits)
+        return embed_list, log_list
+
+
+class Baseline_HPPWidthToken_Single(nn.Module):
+    def __init__(self, model_cfg):
+        super(Baseline_HPPWidthToken_Single, self).__init__()
+        self.pre_rgb = SetBlockWrapper(Pre_ResNet9(**model_cfg['backbone_cfg']))
+        self.post_backbone = SetBlockWrapper(Post_ResNet9(**model_cfg['backbone_cfg']))
+        self.FCs = SeparateFCs(**model_cfg['SeparateFCs'])
+        self.BNNecks = SeparateBNNecks(**model_cfg['SeparateBNNecks'])
+        self.TP = PackSequenceWrapper(torch.max)
+        self.WidthTokenPyramid = HorizontalWidthTokenPyramid(
+            bin_num=model_cfg['bin_num'],
+            width_token_num=model_cfg.get('width_token_num', 4)
+        )
+        self.WidthTemporal = WidthTokenTemporalMixer(
+            channels=model_cfg['SeparateFCs']['in_channels'],
+            kernel_size=model_cfg.get('width_temporal_kernel_size', 3)
+        )
+        self.WidthPool = WidthTokenAttentionPooling(
+            channels=model_cfg['SeparateFCs']['in_channels'],
+            hidden_ratio=model_cfg.get('width_attention_hidden_ratio', 4)
+        )
+        self.vertical_pooling = model_cfg.get('vertical_pooling', False)
+        expected_parts = model_cfg['SeparateFCs']['parts_num']
+        actual_parts = sum(model_cfg['bin_num'])
+        if actual_parts != expected_parts:
+            raise ValueError(
+                f"Width-token branch expects sum(bin_num) == SeparateFCs.parts_num, "
+                f"got {actual_parts} vs {expected_parts}."
+            )
+
+    def test_1(self, appearance, *args, **kwargs):
+        outs = self.pre_rgb(appearance, *args, **kwargs)
+        outs = self.post_backbone(outs, *args, **kwargs)
+        return outs
+
+    def test_2(self, outs, seqL):
+        if self.vertical_pooling:
+            outs = outs.transpose(3, 4).contiguous()
+        outs = self.WidthTokenPyramid(outs)
+        outs = self.WidthTemporal(outs)
+        outs = self.TP(outs, seqL, options={"dim": 2})[0]
+        outs = self.WidthPool(outs)
+        embed_1 = self.FCs(outs)
+        _, logits = self.BNNecks(embed_1)
+        return embed_1, logits
+
+
+class Baseline_HPPWidthToken_ShareTime_2B(nn.Module):
+    def __init__(self, model_cfg):
+        super(Baseline_HPPWidthToken_ShareTime_2B, self).__init__()
+        self.num_FPN = model_cfg['num_FPN']
+        self.Gait_Net_1 = Baseline_HPPWidthToken_Single(model_cfg)
+        self.Gait_Net_2 = Baseline_HPPWidthToken_Single(model_cfg)
+        self.Gait_List = nn.ModuleList(
+            [self.Gait_Net_1 for _ in range(self.num_FPN - self.num_FPN // 2)] +
+            [self.Gait_Net_2 for _ in range(self.num_FPN // 2)]
+        )
+
+        self.t_channel = 256
+        self.temb_proj = nn.Sequential(
+            nn.Linear(self.t_channel, self.t_channel),
+            nn.ReLU(),
+            nn.Linear(self.t_channel, self.t_channel),
+        )
+
+    def forward(self, x, seqL):
+        x = self.test_1(x)
+        embed_list, log_list = self.test_2(x, seqL)
+        return embed_list, log_list
+
+    def test_1(self, x, *args, **kwargs):
+        n, c, s, h, w = x.shape
+        x_list = list(torch.chunk(x, self.num_FPN, dim=1))
+        t = torch.tensor(list(range(self.num_FPN))).to(x).view(1, -1).repeat(n * s, 1)
+        for i in range(self.num_FPN):
+            temb = get_timestep_embedding(t[:, i], self.t_channel, max_timesteps=self.num_FPN).to(x)
+            temb = self.temb_proj(temb)
+            x_list[i] = self.Gait_List[i].test_1(x_list[i], temb=temb, *args, **kwargs)
+        return torch.concat(x_list, dim=1)
+
+    def test_2(self, x, seqL):
         x_list = torch.chunk(x, self.num_FPN, dim=1)
         embed_list = []
         log_list = []
