@@ -67,10 +67,24 @@ class HorizontalWidthTokenPyramid(nn.Module):
         for b in self.bin_num:
             if h % b != 0:
                 raise ValueError(f"Feature height {h} must be divisible by bin size {b}.")
-            z = x.view(n, c, s, b, h // b, w)
-            z = z.mean(-2) + z.max(-2)[0]
+            part_h = h // b
+            z = x.view(n, c, s, b, part_h, w)
+            if part_h == 1:
+                # Avoid materializing both mean and max when the part already
+                # collapses to a single row, which otherwise doubles peak memory.
+                z = z.squeeze(-2)
+                scale_after_pool = 2.0
+            else:
+                z_mean = z.mean(-2)
+                z_max = z.max(-2)[0]
+                z = z_mean.add_(z_max)
+                scale_after_pool = 1.0
             z = rearrange(z, 'n c s p w -> (n s p) c w').contiguous()
-            z = F.adaptive_avg_pool1d(z, self.width_token_num) + F.adaptive_max_pool1d(z, self.width_token_num)
+            z_avg = F.adaptive_avg_pool1d(z, self.width_token_num)
+            z_max = F.adaptive_max_pool1d(z, self.width_token_num)
+            z = z_avg.add_(z_max)
+            if scale_after_pool != 1.0:
+                z.mul_(scale_after_pool)
             z = rearrange(
                 z, '(n s p) c k -> n c s p k',
                 n=n, s=s, p=b, k=self.width_token_num
