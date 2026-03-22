@@ -45,6 +45,7 @@ model_cfg:
   width_token_num: 4
   width_temporal_kernel_size: 3
   width_attention_hidden_ratio: 4
+  debug_pca_vis: true
 
   layer_config:
     hook_mask:

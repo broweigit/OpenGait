@@ -1,5 +1,6 @@
 import sys
 
+import numpy as np
 import torch
 import torch.nn as nn
 from einops import rearrange
@@ -8,6 +9,7 @@ from functools import partial
 
 from ..base_model import BaseModel
 from .BigGait_utils.BigGait_GaitBase import *
+from .BigGait_utils.save_img import pca_image
 
 
 class infoDistillation(nn.Module):
@@ -71,6 +73,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_HPP_WidthToken_Based_Gaitbase_Share
         self.num_unknown = model_cfg["num_unknown"]
         self.num_FPN = model_cfg["num_FPN"]
         self.chunk_size = model_cfg.get("chunk_size", 96)
+        self.debug_pca_vis = model_cfg.get("debug_pca_vis", False)
 
         layer_cfg = model_cfg.get("layer_config", {})
         self.hook_mask = layer_cfg.get("hook_mask", [False] * 16 + [True] * 16)
@@ -251,17 +254,59 @@ class BiggerGait__SAM3DBody__Projection_Mask_HPP_WidthToken_Based_Gaitbase_Share
     def min_max_norm(self, x):
         return (x - x.min()) / (x.max() - x.min())
 
+    def _should_log_visual_summary(self):
+        if not self.training:
+            return False
+        log_iter = self.engine_cfg.get('log_iter', None)
+        if not log_iter:
+            return False
+        return ((self.iteration + 1) % log_iter) == 0
+
+    def _build_pca_vis_batch(self, feat_map, max_frames=5):
+        feat_map = feat_map.detach().float().cpu()
+        num_frames = min(max_frames, feat_map.shape[0])
+        vis_frames = []
+        for idx in range(num_frames):
+            curr_feat = feat_map[idx]
+            _, height, width = curr_feat.shape
+            feat_np = rearrange(curr_feat.numpy(), 'c h w -> 1 (h w) c')
+            mask_np = np.ones((1, height * width), dtype=np.uint8)
+            pca_img = pca_image(
+                data={'embeddings': feat_np, 'h': height, 'w': width},
+                mask=mask_np,
+                root=None,
+                model_name=None,
+                dataset=None,
+                n_components=3,
+                is_return=True,
+            )[0, 0]
+            vis_frames.append(torch.from_numpy(pca_img).float() / 255.0)
+        if not vis_frames:
+            return None
+        return torch.stack(vis_frames, dim=0)
+
+    def _build_part_pca_vis_batch(self, part_feat, max_frames=5, vis_width=8):
+        part_feat = part_feat.detach().float().cpu()
+        if part_feat.dim() != 3:
+            raise ValueError(f"part_feat should be [n, c, p], got {part_feat.shape}")
+        part_feat = part_feat.unsqueeze(-1).repeat(1, 1, 1, vis_width)
+        return self._build_pca_vis_batch(part_feat, max_frames=max_frames)
+
     def forward(self, inputs):
         ipts, labs, _, _, seqL = inputs
         rgb = ipts[0]
         del ipts
 
         rgb_chunks = torch.chunk(rgb, (rgb.size(1) // self.chunk_size) + 1, dim=1)
+        num_rgb_chunks = len(rgb_chunks)
+        should_log_pca_vis = self.debug_pca_vis and self._should_log_visual_summary()
+        pca_after_cnn_summary = None
+        pca_before_fc_summary = None
         all_outs = []
         target_h, target_w = self.image_size * 2, self.image_size
         h_feat, w_feat = target_h // 16, target_w // 16
 
-        for _, rgb_img in enumerate(rgb_chunks):
+        for chunk_idx, rgb_img in enumerate(rgb_chunks):
             n, s, c, h, w = rgb_img.size()
             rgb_img = rearrange(rgb_img, 'n s c h w -> (n s) c h w').contiguous()
             curr_bs = rgb_img.shape[0]
@@ -342,20 +387,37 @@ class BiggerGait__SAM3DBody__Projection_Mask_HPP_WidthToken_Based_Gaitbase_Share
             ).contiguous()
 
             outs = self.Gait_Net.test_1(human_feat)
+            if should_log_pca_vis and chunk_idx == num_rgb_chunks - 1:
+                pca_after_cnn_summary = self._build_pca_vis_batch(
+                    rearrange(outs, 'n c s h w -> (n s) c h w').contiguous()[:5]
+                )
             all_outs.append(outs)
 
-        embed_list, log_list = self.Gait_Net.test_2(torch.cat(all_outs, dim=2), seqL)
+        gait_outputs = self.Gait_Net.test_2(
+            torch.cat(all_outs, dim=2), seqL, return_debug=should_log_pca_vis
+        )
+        if should_log_pca_vis:
+            embed_list, log_list, debug_list = gait_outputs
+            pre_fc_feat = torch.cat([item['pre_fc_feat'] for item in debug_list], dim=-1)
+            pca_before_fc_summary = self._build_part_pca_vis_batch(pre_fc_feat[:5])
+        else:
+            embed_list, log_list = gait_outputs
 
         if self.training:
+            visual_summary = {
+                'image/rgb_img': rgb_img.view(n * s, c, h, w)[:5].float(),
+                'image/generated_3d_mask_lowres': generated_mask.view(n * s, 1, h_feat, w_feat)[:5].float(),
+            }
+            if pca_after_cnn_summary is not None:
+                visual_summary['image/pca_after_cnn'] = pca_after_cnn_summary.float()
+            if pca_before_fc_summary is not None:
+                visual_summary['image/pca_before_fc_after_widthtoken'] = pca_before_fc_summary.float()
             retval = {
                 'training_feat': {
                     'triplet': {'embeddings': torch.concat(embed_list, dim=-1), 'labels': labs},
                     'softmax': {'logits': torch.concat(log_list, dim=-1), 'labels': labs},
                 },
-                'visual_summary': {
-                    'image/rgb_img': rgb_img.view(n * s, c, h, w)[:5].float(),
-                    'image/generated_3d_mask_lowres': generated_mask.view(n * s, 1, h_feat, w_feat)[:5].float(),
-                },
+                'visual_summary': visual_summary,
                 'inference_feat': {
                     'embeddings': torch.concat(embed_list, dim=-1),
                     **{f'embeddings_{i}': embed_list[i] for i in range(self.num_FPN)}

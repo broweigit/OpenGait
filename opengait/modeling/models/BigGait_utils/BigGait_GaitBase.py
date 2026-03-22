@@ -936,15 +936,17 @@ class Baseline_HPPWidthToken_Single(nn.Module):
         outs = self.post_backbone(outs, *args, **kwargs)
         return outs
 
-    def test_2(self, outs, seqL):
+    def test_2(self, outs, seqL, return_debug=False):
         if self.vertical_pooling:
             outs = outs.transpose(3, 4).contiguous()
         outs = self.WidthTokenPyramid(outs)
         outs = self.WidthTemporal(outs)
         outs = self.TP(outs, seqL, options={"dim": 2})[0]
-        outs = self.WidthPool(outs)
-        embed_1 = self.FCs(outs)
+        pre_fc_feat = self.WidthPool(outs)
+        embed_1 = self.FCs(pre_fc_feat)
         _, logits = self.BNNecks(embed_1)
+        if return_debug:
+            return embed_1, logits, {'pre_fc_feat': pre_fc_feat}
         return embed_1, logits
 
 
@@ -981,14 +983,22 @@ class Baseline_HPPWidthToken_ShareTime_2B(nn.Module):
             x_list[i] = self.Gait_List[i].test_1(x_list[i], temb=temb, *args, **kwargs)
         return torch.concat(x_list, dim=1)
 
-    def test_2(self, x, seqL):
+    def test_2(self, x, seqL, return_debug=False):
         x_list = torch.chunk(x, self.num_FPN, dim=1)
         embed_list = []
         log_list = []
+        debug_list = []
         for i in range(self.num_FPN):
-            embed_1, logits = self.Gait_List[i].test_2(x_list[i], seqL)
+            outputs = self.Gait_List[i].test_2(x_list[i], seqL, return_debug=return_debug)
+            if return_debug:
+                embed_1, logits, debug_info = outputs
+                debug_list.append(debug_info)
+            else:
+                embed_1, logits = outputs
             embed_list.append(embed_1)
             log_list.append(logits)
+        if return_debug:
+            return embed_list, log_list, debug_list
         return embed_list, log_list
     
 class Baseline_Part_ShareTime_2B(nn.Module):
