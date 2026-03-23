@@ -955,12 +955,15 @@ class Baseline_HPPWidthToken_Single(nn.Module):
             outs = outs.transpose(3, 4).contiguous()
         outs = self.WidthTokenPyramid(outs)
         outs = self.WidthTemporal(outs)
-        outs = self.TP(outs, seqL, options={"dim": 2})[0]
-        pre_fc_feat = self.WidthPool(outs)
+        widthtoken_feat = self.TP(outs, seqL, options={"dim": 2})[0]
+        pre_fc_feat = self.WidthPool(widthtoken_feat)
         embed_1 = self.FCs(pre_fc_feat)
         _, logits = self.BNNecks(embed_1)
         if return_debug:
-            return embed_1, logits, {'pre_fc_feat': pre_fc_feat}
+            return embed_1, logits, {
+                'pre_fc_feat': pre_fc_feat,
+                'widthtoken_feat': widthtoken_feat,
+            }
         return embed_1, logits
 
 

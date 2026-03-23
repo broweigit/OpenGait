@@ -292,6 +292,14 @@ class BiggerGait__SAM3DBody__Projection_Mask_HPP_WidthToken_Based_Gaitbase_Share
         part_feat = part_feat.unsqueeze(-1).repeat(1, 1, 1, vis_width)
         return self._build_pca_vis_batch(part_feat, max_frames=max_frames)
 
+    def _build_widthtoken_pca_vis_batch(self, widthtoken_feat, max_frames=5):
+        widthtoken_feat = widthtoken_feat.detach().float().cpu()
+        if widthtoken_feat.dim() != 4:
+            raise ValueError(
+                f"widthtoken_feat should be [n, c, p, k], got {widthtoken_feat.shape}"
+            )
+        return self._build_pca_vis_batch(widthtoken_feat, max_frames=max_frames)
+
     def forward(self, inputs):
         ipts, labs, _, _, seqL = inputs
         rgb = ipts[0]
@@ -301,6 +309,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_HPP_WidthToken_Based_Gaitbase_Share
         num_rgb_chunks = len(rgb_chunks)
         should_log_pca_vis = self.debug_pca_vis and self._should_log_visual_summary()
         pca_after_cnn_summary = None
+        pca_after_widthtoken_summary = None
         pca_before_fc_summary = None
         all_outs = []
         target_h, target_w = self.image_size * 2, self.image_size
@@ -398,7 +407,11 @@ class BiggerGait__SAM3DBody__Projection_Mask_HPP_WidthToken_Based_Gaitbase_Share
         )
         if should_log_pca_vis:
             embed_list, log_list, debug_list = gait_outputs
-            pre_fc_feat = torch.cat([item['pre_fc_feat'] for item in debug_list], dim=-1)
+            # Merge FPN heads into channels for visualization so PCA reflects
+            # per-part representations instead of head-boundary differences.
+            widthtoken_feat = torch.cat([item['widthtoken_feat'] for item in debug_list], dim=1)
+            pre_fc_feat = torch.cat([item['pre_fc_feat'] for item in debug_list], dim=1)
+            pca_after_widthtoken_summary = self._build_widthtoken_pca_vis_batch(widthtoken_feat[:5])
             pca_before_fc_summary = self._build_part_pca_vis_batch(pre_fc_feat[:5])
         else:
             embed_list, log_list = gait_outputs
@@ -410,6 +423,10 @@ class BiggerGait__SAM3DBody__Projection_Mask_HPP_WidthToken_Based_Gaitbase_Share
             }
             if pca_after_cnn_summary is not None:
                 visual_summary['image/pca_after_cnn'] = pca_after_cnn_summary.float()
+            if pca_after_widthtoken_summary is not None:
+                visual_summary['image/pca_after_widthtoken_before_attnpool'] = (
+                    pca_after_widthtoken_summary.float()
+                )
             if pca_before_fc_summary is not None:
                 visual_summary['image/pca_before_fc_after_widthtoken'] = pca_before_fc_summary.float()
             retval = {
