@@ -377,6 +377,26 @@ class BiggerGait__SAM3DBody__Projection_Mask_Anchor_Based_Gaitbase_Share(BaseMod
             return None
         return torch.stack(vis_frames, dim=0)
 
+    def _build_feature_norm_vis_batch(self, feat_map, max_frames=5):
+        feat_map = feat_map.detach().float().cpu()
+        num_frames = min(max_frames, feat_map.shape[0])
+        vis_frames = []
+
+        for idx in range(num_frames):
+            curr_feat = feat_map[idx]
+            norm_map = torch.linalg.vector_norm(curr_feat, ord=2, dim=0, keepdim=True)
+            min_val = norm_map.min()
+            max_val = norm_map.max()
+            if (max_val - min_val) > 1e-6:
+                norm_map = (norm_map - min_val) / (max_val - min_val)
+            else:
+                norm_map = torch.zeros_like(norm_map)
+            vis_frames.append(norm_map)
+
+        if not vis_frames:
+            return None
+        return torch.stack(vis_frames, dim=0)
+
     def project_vertices_to_mask(self, vertices, cam_t, cam_int, h_feat, w_feat, target_h, target_w):
         bsz, _, _ = vertices.shape
         device = vertices.device
@@ -525,6 +545,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_Anchor_Based_Gaitbase_Share(BaseMod
         num_rgb_chunks = len(rgb_chunks)
         should_log_anchor_vis = self.debug_anchor_vis and self._should_log_visual_summary()
         anchor_overlay_summary = None
+        cnn_layer2_norm_summary = None
         all_anchor_feats = []
         all_anchor_valid = []
         target_h, target_w = self.image_size * 2, self.image_size
@@ -611,7 +632,14 @@ class BiggerGait__SAM3DBody__Projection_Mask_Anchor_Based_Gaitbase_Share(BaseMod
                 'n s c h w -> n c s h w'
             ).contiguous()
 
-            outs = self.Gait_Net.test_1(human_feat)
+            debug_test_1 = should_log_anchor_vis and (chunk_idx == num_rgb_chunks - 1)
+            test_1_outputs = self.Gait_Net.test_1(human_feat, return_debug=debug_test_1)
+            if debug_test_1:
+                outs, gait_debug = test_1_outputs
+                layer2_feat = rearrange(gait_debug['layer2_feat'], 'n c s h w -> (n s) c h w').contiguous()
+                cnn_layer2_norm_summary = self._build_feature_norm_vis_batch(layer2_feat[:5])
+            else:
+                outs = test_1_outputs
             out_h, out_w = outs.shape[-2:]
 
             dense_depth_map = self.get_source_vertex_index_map(
@@ -670,6 +698,8 @@ class BiggerGait__SAM3DBody__Projection_Mask_Anchor_Based_Gaitbase_Share(BaseMod
             }
             if anchor_overlay_summary is not None:
                 visual_summary['image/anchor_overlay_pca'] = anchor_overlay_summary.float()
+            if cnn_layer2_norm_summary is not None:
+                visual_summary['image/cnn_layer2_l2norm'] = cnn_layer2_norm_summary.float()
             retval = {
                 'training_feat': {
                     'triplet': {'embeddings': embeddings, 'labels': labs},

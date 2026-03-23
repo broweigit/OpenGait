@@ -42,7 +42,7 @@ model_cfg:
   sils_size: 32
   source_dim: 1280
   num_FPN: 4
-  anchor_pt_path: pretrained_LVMs/mhr_semantic_filtered_anchor_patches_512a_32p.pt
+  anchor_pt_path: pretrained_LVMs/mhr_anchor_patches_512a_32p.pt
   anchor_depth_tol: 0.02
   projection_zoom_ratio: 1.0
   anchor_normal_offset_scale: 0.12
@@ -145,14 +145,14 @@ trainer_cfg:
   find_unused_parameters: true
   enable_float16: true
   fix_BN: false
-  log_iter: 100
+  log_iter: 1
   with_test: true
   restore_ckpt_strict: true
   restore_hint: 0
   save_iter: 5000
   save_name: BiggerGait__SAM3DBody__Projection_Mask_Anchor_Based_Gaitbase_Share
   sync_BN: true
-  total_iter: 30000
+  total_iter: 3
   sampler:
     batch_shuffle: true
     batch_size:

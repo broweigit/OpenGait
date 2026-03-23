@@ -788,10 +788,22 @@ class Baseline_PartPP_Single(nn.Module):
         embed_1, logits = self.test_2(outs, seqL, part_labels)
         return embed_1, logits
 
-    def test_1(self, appearance, *args, **kwargs):
+    def test_1(self, appearance, return_debug=False, *args, **kwargs):
         outs = self.pre_rgb(appearance, *args, **kwargs)
-        outs = self.post_backbone(outs, *args, **kwargs)
-        return outs
+        if not return_debug:
+            outs = self.post_backbone(outs, *args, **kwargs)
+            return outs
+
+        n, c, s, h, w = outs.shape
+        x = outs.transpose(1, 2).reshape(-1, c, h, w)
+        post_block = self.post_backbone.forward_block
+        layer2_feat = post_block.layer2(x, *args, **kwargs)
+        x = post_block.layer3(layer2_feat, *args, **kwargs)
+        x = post_block.layer4(x, *args, **kwargs)
+
+        final_outs = x.reshape(n, s, *x.shape[1:]).transpose(1, 2).contiguous()
+        layer2_feat = layer2_feat.reshape(n, s, *layer2_feat.shape[1:]).transpose(1, 2).contiguous()
+        return final_outs, {'layer2_feat': layer2_feat}
 
     def test_2(self, outs, seqL, part_labels):
         part_feats = self.PartPP(outs, part_labels)
@@ -945,10 +957,22 @@ class Baseline_HPPWidthToken_Single(nn.Module):
                 f"got {actual_parts} vs {expected_parts}."
             )
 
-    def test_1(self, appearance, *args, **kwargs):
+    def test_1(self, appearance, return_debug=False, *args, **kwargs):
         outs = self.pre_rgb(appearance, *args, **kwargs)
-        outs = self.post_backbone(outs, *args, **kwargs)
-        return outs
+        if not return_debug:
+            outs = self.post_backbone(outs, *args, **kwargs)
+            return outs
+
+        n, c, s, h, w = outs.shape
+        x = outs.transpose(1, 2).reshape(-1, c, h, w)
+        post_block = self.post_backbone.forward_block
+        layer2_feat = post_block.layer2(x, *args, **kwargs)
+        x = post_block.layer3(layer2_feat, *args, **kwargs)
+        x = post_block.layer4(x, *args, **kwargs)
+
+        final_outs = x.reshape(n, s, *x.shape[1:]).transpose(1, 2).contiguous()
+        layer2_feat = layer2_feat.reshape(n, s, *layer2_feat.shape[1:]).transpose(1, 2).contiguous()
+        return final_outs, {'layer2_feat': layer2_feat}
 
     def test_2(self, outs, seqL, return_debug=False):
         if self.vertical_pooling:
@@ -990,15 +1014,26 @@ class Baseline_HPPWidthToken_ShareTime_2B(nn.Module):
         embed_list, log_list = self.test_2(x, seqL)
         return embed_list, log_list
 
-    def test_1(self, x, *args, **kwargs):
+    def test_1(self, x, return_debug=False, *args, **kwargs):
         n, c, s, h, w = x.shape
         x_list = list(torch.chunk(x, self.num_FPN, dim=1))
         t = torch.tensor(list(range(self.num_FPN))).to(x).view(1, -1).repeat(n * s, 1)
+        debug_layer2_list = []
         for i in range(self.num_FPN):
             temb = get_timestep_embedding(t[:, i], self.t_channel, max_timesteps=self.num_FPN).to(x)
             temb = self.temb_proj(temb)
-            x_list[i] = self.Gait_List[i].test_1(x_list[i], temb=temb, *args, **kwargs)
-        return torch.concat(x_list, dim=1)
+            outputs = self.Gait_List[i].test_1(
+                x_list[i], return_debug=return_debug, temb=temb, *args, **kwargs
+            )
+            if return_debug:
+                x_list[i], debug_info = outputs
+                debug_layer2_list.append(debug_info['layer2_feat'])
+            else:
+                x_list[i] = outputs
+        final_outs = torch.concat(x_list, dim=1)
+        if return_debug:
+            return final_outs, {'layer2_feat': torch.concat(debug_layer2_list, dim=1)}
+        return final_outs
 
     def test_2(self, x, seqL, return_debug=False):
         x_list = torch.chunk(x, self.num_FPN, dim=1)
@@ -1097,15 +1132,26 @@ class Baseline_PartPP_ShareTime_2B(nn.Module):
         embed_list, log_list = self.test_2(x, seqL, part_labels)
         return embed_list, log_list
 
-    def test_1(self, x, *args, **kwargs):
+    def test_1(self, x, return_debug=False, *args, **kwargs):
         n, c, s, h, w = x.shape
         x_list = list(torch.chunk(x, self.num_FPN, dim=1))
         t = torch.tensor(list(range(self.num_FPN))).to(x).view(1, -1).repeat(n * s, 1)
+        debug_layer2_list = []
         for i in range(self.num_FPN):
             temb = get_timestep_embedding(t[:, i], self.t_channel, max_timesteps=self.num_FPN).to(x)
             temb = self.temb_proj(temb)
-            x_list[i] = self.Gait_List[i].test_1(x_list[i], temb=temb, *args, **kwargs)
-        return torch.concat(x_list, dim=1)
+            outputs = self.Gait_List[i].test_1(
+                x_list[i], return_debug=return_debug, temb=temb, *args, **kwargs
+            )
+            if return_debug:
+                x_list[i], debug_info = outputs
+                debug_layer2_list.append(debug_info['layer2_feat'])
+            else:
+                x_list[i] = outputs
+        final_outs = torch.concat(x_list, dim=1)
+        if return_debug:
+            return final_outs, {'layer2_feat': torch.concat(debug_layer2_list, dim=1)}
+        return final_outs
 
     def test_2(self, x, seqL, part_labels):
         x_list = torch.chunk(x, self.num_FPN, dim=1)
@@ -1129,10 +1175,22 @@ class Baseline_AnchorMasked_Single(nn.Module):
         self.FCs = SeparateFCs(**model_cfg['SeparateFCs'])
         self.BNNecks = SeparateBNNecks(**model_cfg['SeparateBNNecks'])
 
-    def test_1(self, appearance, *args, **kwargs):
+    def test_1(self, appearance, return_debug=False, *args, **kwargs):
         outs = self.pre_rgb(appearance, *args, **kwargs)
-        outs = self.post_backbone(outs, *args, **kwargs)
-        return outs
+        if not return_debug:
+            outs = self.post_backbone(outs, *args, **kwargs)
+            return outs
+
+        n, c, s, h, w = outs.shape
+        x = outs.transpose(1, 2).reshape(-1, c, h, w)
+        post_block = self.post_backbone.forward_block
+        layer2_feat = post_block.layer2(x, *args, **kwargs)
+        x = post_block.layer3(layer2_feat, *args, **kwargs)
+        x = post_block.layer4(x, *args, **kwargs)
+
+        final_outs = x.reshape(n, s, *x.shape[1:]).transpose(1, 2).contiguous()
+        layer2_feat = layer2_feat.reshape(n, s, *layer2_feat.shape[1:]).transpose(1, 2).contiguous()
+        return final_outs, {'layer2_feat': layer2_feat}
 
     def _temporal_any(self, valid_mask, seqL):
         if valid_mask is None:
@@ -1180,15 +1238,26 @@ class Baseline_AnchorMasked_ShareTime_2B(nn.Module):
             nn.Linear(self.t_channel, self.t_channel),
         )
 
-    def test_1(self, x, *args, **kwargs):
+    def test_1(self, x, return_debug=False, *args, **kwargs):
         n, c, s, h, w = x.shape
         x_list = list(torch.chunk(x, self.num_FPN, dim=1))
         t = torch.tensor(list(range(self.num_FPN))).to(x).view(1, -1).repeat(n * s, 1)
+        debug_layer2_list = []
         for i in range(self.num_FPN):
             temb = get_timestep_embedding(t[:, i], self.t_channel, max_timesteps=self.num_FPN).to(x)
             temb = self.temb_proj(temb)
-            x_list[i] = self.Gait_List[i].test_1(x_list[i], temb=temb, *args, **kwargs)
-        return torch.concat(x_list, dim=1)
+            outputs = self.Gait_List[i].test_1(
+                x_list[i], return_debug=return_debug, temb=temb, *args, **kwargs
+            )
+            if return_debug:
+                x_list[i], debug_info = outputs
+                debug_layer2_list.append(debug_info['layer2_feat'])
+            else:
+                x_list[i] = outputs
+        final_outs = torch.concat(x_list, dim=1)
+        if return_debug:
+            return final_outs, {'layer2_feat': torch.concat(debug_layer2_list, dim=1)}
+        return final_outs
 
     def test_2(self, anchor_feats, seqL, anchor_valid=None, anchor_part_labels=None):
         feat_list = torch.chunk(anchor_feats, self.num_FPN, dim=1)
