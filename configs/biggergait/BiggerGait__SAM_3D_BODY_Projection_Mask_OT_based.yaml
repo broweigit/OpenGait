@@ -42,6 +42,7 @@ model_cfg:
   sils_size: 32
   source_dim: 1280
   num_FPN: 4
+  debug_pca_vis: true
 
   layer_config:
     hook_mask:

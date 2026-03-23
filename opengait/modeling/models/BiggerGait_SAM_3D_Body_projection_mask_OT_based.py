@@ -2,6 +2,7 @@ import copy
 import math
 import sys
 
+import numpy as np
 import roma
 import torch
 import torch.nn as nn
@@ -12,6 +13,7 @@ from functools import partial
 
 from ..base_model import BaseModel
 from .BigGait_utils.BigGait_GaitBase import *
+from .BigGait_utils.save_img import pca_image
 
 
 class infoDistillation(nn.Module):
@@ -121,6 +123,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
         self.num_unknown = model_cfg["num_unknown"]
         self.num_FPN = model_cfg["num_FPN"]
         self.chunk_size = model_cfg.get("chunk_size", 96)
+        self.debug_pca_vis = model_cfg.get("debug_pca_vis", False)
 
         layer_cfg = model_cfg.get("layer_config", {})
         self.hook_mask = layer_cfg.get("hook_mask", [False] * 16 + [True] * 16)
@@ -538,17 +541,103 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
     def min_max_norm(self, x):
         return (x - x.min()) / (x.max() - x.min())
 
+    def _should_log_visual_summary(self):
+        if not self.training:
+            return False
+        log_iter = self.engine_cfg.get('log_iter', None)
+        if not log_iter:
+            return False
+        return ((self.iteration + 1) % log_iter) == 0
+
+    def _build_pca_vis_batch(self, feat_map, max_frames=5):
+        feat_map = feat_map.detach().float().cpu()
+        num_frames = min(max_frames, feat_map.shape[0])
+        vis_frames = []
+        for idx in range(num_frames):
+            curr_feat = feat_map[idx]
+            _, height, width = curr_feat.shape
+            feat_np = rearrange(curr_feat.numpy(), 'c h w -> 1 (h w) c')
+            mask_np = np.ones((1, height * width), dtype=np.uint8)
+            pca_img = pca_image(
+                data={'embeddings': feat_np, 'h': height, 'w': width},
+                mask=mask_np,
+                root=None,
+                model_name=None,
+                dataset=None,
+                n_components=3,
+                is_return=True,
+            )[0, 0]
+            vis_frames.append(torch.from_numpy(pca_img).float() / 255.0)
+        if not vis_frames:
+            return None
+        return torch.stack(vis_frames, dim=0)
+
+    def _build_feature_norm_vis_batch(self, rgb_frames, feat_map, max_frames=5):
+        rgb_frames = rgb_frames.detach().float().cpu()
+        feat_map = feat_map.detach().float().cpu()
+        num_frames = min(max_frames, feat_map.shape[0])
+        vis_frames = []
+
+        for idx in range(num_frames):
+            rgb_frame = rgb_frames[idx]
+            curr_feat = feat_map[idx]
+            norm_map = torch.linalg.vector_norm(curr_feat, ord=2, dim=0, keepdim=True)
+            min_val = norm_map.min()
+            max_val = norm_map.max()
+            if (max_val - min_val) > 1e-6:
+                norm_map = (norm_map - min_val) / (max_val - min_val)
+            else:
+                norm_map = torch.zeros_like(norm_map)
+
+            norm_map = F.interpolate(
+                norm_map.unsqueeze(0),
+                size=rgb_frame.shape[-2:],
+                mode='bilinear',
+                align_corners=False,
+            ).squeeze(0)
+
+            if rgb_frame.min() < 0 or rgb_frame.max() > 1:
+                rgb_min = rgb_frame.amin(dim=(-2, -1), keepdim=True)
+                rgb_max = rgb_frame.amax(dim=(-2, -1), keepdim=True)
+                rgb_frame = (rgb_frame - rgb_min) / (rgb_max - rgb_min + 1e-6)
+            else:
+                rgb_frame = rgb_frame.clamp(0, 1)
+
+            x = norm_map[0].clamp(0, 1)
+            heat_r = (1.5 - torch.abs(4.0 * x - 3.0)).clamp(0.0, 1.0)
+            heat_g = (1.5 - torch.abs(4.0 * x - 2.0)).clamp(0.0, 1.0)
+            heat_b = (1.5 - torch.abs(4.0 * x - 1.0)).clamp(0.0, 1.0)
+            heat_map = torch.stack([heat_r, heat_g, heat_b], dim=0)
+            alpha = 0.7 * norm_map.pow(0.85)
+            vis_frame = rgb_frame * (1.0 - alpha) + heat_map * alpha
+            vis_frames.append(vis_frame.clamp(0, 1))
+
+        if not vis_frames:
+            return None
+        return torch.stack(vis_frames, dim=0)
+
+    def _stack_branch_vis(self, branch_vis_list):
+        valid_vis = [vis for vis in branch_vis_list if vis is not None]
+        if not valid_vis:
+            return None
+        num_frames = min(vis.shape[0] for vis in valid_vis)
+        return torch.cat([vis[:num_frames] for vis in valid_vis], dim=2)
+
     def forward(self, inputs):
         ipts, labs, _, _, seqL = inputs
         rgb = ipts[0]
         del ipts
 
         rgb_chunks = torch.chunk(rgb, (rgb.size(1) // self.chunk_size) + 1, dim=1)
+        should_log_pca_vis = self.debug_pca_vis and self._should_log_visual_summary()
+        branch_pca_after_cnn = [None] * self.num_branches
+        branch_layer2_norm = [None] * self.num_branches
         all_outs = [[] for _ in range(self.num_branches)]
         target_h, target_w = self.image_size * 2, self.image_size
         h_feat, w_feat = target_h // 16, target_w // 16
 
-        for _, rgb_img in enumerate(rgb_chunks):
+        num_rgb_chunks = len(rgb_chunks)
+        for chunk_idx, rgb_img in enumerate(rgb_chunks):
             n, s, c, h, w = rgb_img.size()
             rgb_img = rearrange(rgb_img, 'n s c h w -> (n s) c h w').contiguous()
             curr_bs = rgb_img.shape[0]
@@ -652,9 +741,23 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
                 )
                 branch_warped_feats.append(warp_feat)
 
+            debug_test_1 = should_log_pca_vis and (chunk_idx == num_rgb_chunks - 1)
             for b_idx, warp_feat in enumerate(branch_warped_feats):
                 warp_feat_5d = rearrange(warp_feat, '(n s) c h w -> n c s h w', n=n, s=s).contiguous()
-                if self.training:
+                if debug_test_1:
+                    outs, gait_debug = self.Gait_Nets[b_idx].test_1(
+                        warp_feat_5d, return_debug=True
+                    )
+                    layer2_feat = rearrange(
+                        gait_debug['layer2_feat'], 'n c s h w -> (n s) c h w'
+                    ).contiguous()
+                    branch_layer2_norm[b_idx] = self._build_feature_norm_vis_batch(
+                        rgb_img[:5], layer2_feat[:5]
+                    )
+                    branch_pca_after_cnn[b_idx] = self._build_pca_vis_batch(
+                        rearrange(outs, 'n c s h w -> (n s) c h w').contiguous()[:5]
+                    )
+                elif self.training:
                     outs = torch.utils.checkpoint.checkpoint(
                         self.Gait_Nets[b_idx].test_1,
                         warp_feat_5d,
@@ -676,6 +779,8 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
 
         embed_list = [torch.cat(feats, dim=-1) for feats in embed_grouped]
         log_list = [torch.cat(logits, dim=-1) for logits in log_grouped]
+        pca_after_cnn_summary = self._stack_branch_vis(branch_pca_after_cnn)
+        cnn_layer2_norm_summary = self._stack_branch_vis(branch_layer2_norm)
 
         if self.training:
             retval = {
@@ -693,6 +798,10 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
                     **{f'embeddings_{i}': embed_list[i] for i in range(self.num_FPN)}
                 }
             }
+            if pca_after_cnn_summary is not None:
+                retval['visual_summary']['image/pca_after_cnn'] = pca_after_cnn_summary.float()
+            if cnn_layer2_norm_summary is not None:
+                retval['visual_summary']['image/cnn_layer2_l2norm'] = cnn_layer2_norm_summary.float()
         else:
             retval = {
                 'training_feat': {},

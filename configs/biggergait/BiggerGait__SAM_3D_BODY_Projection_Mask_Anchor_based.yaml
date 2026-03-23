@@ -43,6 +43,7 @@ model_cfg:
   source_dim: 1280
   num_FPN: 4
   anchor_pt_path: pretrained_LVMs/mhr_anchor_patches_512a_32p.pt
+  anchor_sampling_mode: bilinear
   anchor_depth_tol: 0.02
   projection_zoom_ratio: 1.0
   anchor_normal_offset_scale: 0.12

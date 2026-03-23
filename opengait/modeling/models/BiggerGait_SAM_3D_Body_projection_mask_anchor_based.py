@@ -77,6 +77,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_Anchor_Based_Gaitbase_Share(BaseMod
         self.chunk_size = model_cfg.get("chunk_size", 96)
         self.anchor_pt_path = model_cfg["anchor_pt_path"]
         self.anchor_depth_tol = model_cfg.get("anchor_depth_tol", 0.02)
+        self.anchor_sampling_mode = model_cfg.get("anchor_sampling_mode", "bilinear")
         self.projection_zoom_ratio = model_cfg.get("projection_zoom_ratio", 1.0)
         self.anchor_normal_offset_scale = model_cfg.get("anchor_normal_offset_scale", 0.0)
         self.debug_anchor_vis = model_cfg.get("debug_anchor_vis", False)
@@ -525,16 +526,37 @@ class BiggerGait__SAM3DBody__Projection_Mask_Anchor_Based_Gaitbase_Share(BaseMod
         is_visible = front_valid & (z <= (sparse_min_depth + 1e-4))
 
         feat_flat = rearrange(feat_map, 'b c h w -> b (h w) c').contiguous()
-        anchor_feats = feat_map.new_zeros(bsz, self.num_anchors, channels)
-        anchor_valid = torch.zeros(bsz, self.num_anchors, dtype=torch.bool, device=device)
+        if self.anchor_sampling_mode == "bilinear":
+            if w_feat > 1:
+                grid_x = (u_cont / (w_feat - 1)) * 2.0 - 1.0
+            else:
+                grid_x = torch.zeros_like(u_cont)
+            if h_feat > 1:
+                grid_y = (v_cont / (h_feat - 1)) * 2.0 - 1.0
+            else:
+                grid_y = torch.zeros_like(v_cont)
+            sample_grid = torch.stack([grid_x, grid_y], dim=-1).unsqueeze(1)
+            sampled_feat = F.grid_sample(
+                feat_map,
+                sample_grid,
+                mode='bilinear',
+                padding_mode='zeros',
+                align_corners=True,
+            )
+            anchor_feats = rearrange(sampled_feat, 'b c 1 k -> b k c').contiguous()
+            anchor_valid = is_visible
+            anchor_feats = anchor_feats * anchor_valid.unsqueeze(-1).to(anchor_feats.dtype)
+        else:
+            anchor_feats = feat_map.new_zeros(bsz, self.num_anchors, channels)
+            anchor_valid = torch.zeros(bsz, self.num_anchors, dtype=torch.bool, device=device)
 
-        for b_idx in range(bsz):
-            visible_idx = is_visible[b_idx].nonzero(as_tuple=False).squeeze(1)
-            if visible_idx.numel() == 0:
-                continue
-            pixel_idx = flat_pixel_indices[b_idx, visible_idx]
-            anchor_feats[b_idx, visible_idx] = feat_flat[b_idx, pixel_idx]
-            anchor_valid[b_idx, visible_idx] = True
+            for b_idx in range(bsz):
+                visible_idx = is_visible[b_idx].nonzero(as_tuple=False).squeeze(1)
+                if visible_idx.numel() == 0:
+                    continue
+                pixel_idx = flat_pixel_indices[b_idx, visible_idx]
+                anchor_feats[b_idx, visible_idx] = feat_flat[b_idx, pixel_idx]
+                anchor_valid[b_idx, visible_idx] = True
 
         if return_debug:
             unique_cells = []
