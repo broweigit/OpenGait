@@ -15,7 +15,7 @@ evaluator_cfg:
   eval_func: evaluate_CCPG_part_based
   sampler:
     batch_shuffle: false
-    batch_size: 4
+    batch_size: 8
     sample_type: all_ordered
     frames_all_limit: 250
   metric: euc
@@ -42,6 +42,7 @@ model_cfg:
   sils_size: 32
   source_dim: 1280
   num_FPN: 4
+  debug_pca_vis: true
 
   layer_config:
     hook_mask:

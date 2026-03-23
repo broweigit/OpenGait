@@ -477,10 +477,22 @@ class Baseline_Single(nn.Module):
         _, logits = self.BNNecks(embed_1)  # [n, c, p]
         return embed_1, logits
     
-    def test_1(self, appearance, *args, **kwargs):
+    def test_1(self, appearance, return_debug=False, *args, **kwargs):
         outs = self.pre_rgb(appearance, *args, **kwargs)  # [n, c, s, h, w]
-        outs = self.post_backbone(outs, *args, **kwargs)
-        return outs
+        if not return_debug:
+            outs = self.post_backbone(outs, *args, **kwargs)
+            return outs
+
+        n, c, s, h, w = outs.shape
+        x = outs.transpose(1, 2).reshape(-1, c, h, w)
+        post_block = self.post_backbone.forward_block
+        layer2_feat = post_block.layer2(x, *args, **kwargs)
+        x = post_block.layer3(layer2_feat, *args, **kwargs)
+        x = post_block.layer4(x, *args, **kwargs)
+
+        final_outs = x.reshape(n, s, *x.shape[1:]).transpose(1, 2).contiguous()
+        layer2_feat = layer2_feat.reshape(n, s, *layer2_feat.shape[1:]).transpose(1, 2).contiguous()
+        return final_outs, {'layer2_feat': layer2_feat}
 
     def test_2(self, outs, seqL):
         outs = self.TP(outs, seqL, options={"dim": 2})[0]  # [n, c, h, w]
@@ -901,18 +913,28 @@ class Baseline_ShareTime_2B(nn.Module):
         embed_list, log_list = self.test_2(x, seqL)
         return embed_list, log_list
 
-    def test_1(self, x, *args, **kwargs):
+    def test_1(self, x, return_debug=False, *args, **kwargs):
         # x: [n, c, s, h, w]
         n,c,s,h,w = x.shape
         x_list = list(torch.chunk(x, self.num_FPN, dim=1))
         t = torch.tensor(list(range(self.num_FPN))).to(x).view(1,-1).repeat(n*s,1)
+        debug_layer2_list = []
         for i in range(self.num_FPN):
             
             temb = get_timestep_embedding(t[:,i], self.t_channel, max_timesteps=self.num_FPN).to(x)
             temb = self.temb_proj(temb)
 
-            x_list[i] = self.Gait_List[i].test_1(x_list[i], temb=temb, *args, **kwargs)
+            outputs = self.Gait_List[i].test_1(
+                x_list[i], return_debug=return_debug, temb=temb, *args, **kwargs
+            )
+            if return_debug:
+                x_list[i], debug_info = outputs
+                debug_layer2_list.append(debug_info['layer2_feat'])
+            else:
+                x_list[i] = outputs
         x = torch.concat(x_list, dim=1)
+        if return_debug:
+            return x, {'layer2_feat': torch.concat(debug_layer2_list, dim=1)}
         return x
 
     def test_2(self, x, seqL):
