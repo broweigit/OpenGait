@@ -148,7 +148,7 @@ trainer_cfg:
   log_iter: 100
   with_test: true
   restore_ckpt_strict: true
-  restore_hint: 10000
+  restore_hint: 0
   save_iter: 5000
   save_name: BiggerGait__SAM3DBody__Projection_Mask_Anchor_Based_Gaitbase_Share
   sync_BN: true
