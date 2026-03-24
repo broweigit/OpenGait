@@ -533,7 +533,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
         )
 
         warped_feat = rearrange(transported_feats, 'b (h w) c -> b c h w', h=h_feat)
-        return warped_feat, valid_tgt_mask.view(bsz, 1, h_feat, w_feat)
+        return warped_feat, valid_tgt_mask.view(bsz, 1, h_feat, w_feat), tgt_depth_map
 
     def preprocess(self, sils, h, w, mode='bilinear'):
         return F.interpolate(sils, (h, w), mode=mode, align_corners=False)
@@ -616,6 +616,60 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
             return None
         return torch.stack(vis_frames, dim=0)
 
+    def _build_feature_norm_on_depth_vis_batch(self, depth_maps, feat_map, max_frames=5):
+        depth_maps = depth_maps.detach().float().cpu()
+        feat_map = feat_map.detach().float().cpu()
+        num_frames = min(max_frames, feat_map.shape[0], depth_maps.shape[0])
+        vis_frames = []
+
+        for idx in range(num_frames):
+            depth_map = depth_maps[idx]
+            curr_feat = feat_map[idx]
+            if depth_map.dim() == 2:
+                depth_map = depth_map.unsqueeze(0)
+
+            valid_mask = depth_map[0] < 1e5
+            inv_depth = torch.zeros_like(depth_map[0])
+            if valid_mask.any():
+                valid_depth = depth_map[0][valid_mask].clamp(min=1e-6)
+                inv_valid_depth = 1.0 / valid_depth
+                inv_min = inv_valid_depth.min()
+                inv_max = inv_valid_depth.max()
+                if (inv_max - inv_min) > 1e-6:
+                    inv_depth[valid_mask] = (inv_valid_depth - inv_min) / (inv_max - inv_min)
+                else:
+                    inv_depth[valid_mask] = 1.0
+
+            base_frame = inv_depth.unsqueeze(0).repeat(3, 1, 1)
+
+            norm_map = torch.linalg.vector_norm(curr_feat, ord=2, dim=0, keepdim=True)
+            min_val = norm_map.min()
+            max_val = norm_map.max()
+            if (max_val - min_val) > 1e-6:
+                norm_map = (norm_map - min_val) / (max_val - min_val)
+            else:
+                norm_map = torch.zeros_like(norm_map)
+
+            norm_map = F.interpolate(
+                norm_map.unsqueeze(0),
+                size=base_frame.shape[-2:],
+                mode='bilinear',
+                align_corners=False,
+            ).squeeze(0)
+
+            x = norm_map[0].clamp(0, 1)
+            heat_r = (1.5 - torch.abs(4.0 * x - 3.0)).clamp(0.0, 1.0)
+            heat_g = (1.5 - torch.abs(4.0 * x - 2.0)).clamp(0.0, 1.0)
+            heat_b = (1.5 - torch.abs(4.0 * x - 1.0)).clamp(0.0, 1.0)
+            heat_map = torch.stack([heat_r, heat_g, heat_b], dim=0)
+            alpha = 0.7 * norm_map.pow(0.85) * valid_mask.unsqueeze(0).float()
+            vis_frame = base_frame * (1.0 - alpha) + heat_map * alpha
+            vis_frames.append(vis_frame.clamp(0, 1))
+
+        if not vis_frames:
+            return None
+        return torch.stack(vis_frames, dim=0)
+
     def _stack_branch_vis(self, branch_vis_list):
         valid_vis = [vis for vis in branch_vis_list if vis is not None]
         if not valid_vis:
@@ -632,6 +686,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
         should_log_pca_vis = self.debug_pca_vis and self._should_log_visual_summary()
         branch_pca_after_cnn = [None] * self.num_branches
         branch_layer2_norm = [None] * self.num_branches
+        branch_target_depth = [None] * self.num_branches
         all_outs = [[] for _ in range(self.num_branches)]
         target_h, target_w = self.image_size * 2, self.image_size
         h_feat, w_feat = target_h // 16, target_w // 16
@@ -719,9 +774,9 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
 
             cam_int_tgt, cam_t_tgt = self.build_target_camera(curr_bs, rgb.device, target_h, target_w)
             branch_warped_feats = []
-            for branch_cfg in self.branch_configs:
+            for b_idx, branch_cfg in enumerate(self.branch_configs):
                 branch_geo = self.build_branch_geometry(branch_cfg, pose_out)
-                warp_feat, _ = self.warp_features_with_ot(
+                warp_feat, _, tgt_depth_map = self.warp_features_with_ot(
                     human_feat,
                     human_mask.float(),
                     pred_verts,
@@ -740,6 +795,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
                     branch_geo["apply_global_rot_alignment"],
                 )
                 branch_warped_feats.append(warp_feat)
+                branch_target_depth[b_idx] = tgt_depth_map
 
             debug_test_1 = should_log_pca_vis and (chunk_idx == num_rgb_chunks - 1)
             for b_idx, warp_feat in enumerate(branch_warped_feats):
@@ -751,8 +807,8 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
                     layer2_feat = rearrange(
                         gait_debug['layer2_feat'], 'n c s h w -> (n s) c h w'
                     ).contiguous()
-                    branch_layer2_norm[b_idx] = self._build_feature_norm_vis_batch(
-                        rgb_img[:5], layer2_feat[:5]
+                    branch_layer2_norm[b_idx] = self._build_feature_norm_on_depth_vis_batch(
+                        branch_target_depth[b_idx][:5], layer2_feat[:5]
                     )
                     branch_pca_after_cnn[b_idx] = self._build_pca_vis_batch(
                         rearrange(outs, 'n c s h w -> (n s) c h w').contiguous()[:5]
