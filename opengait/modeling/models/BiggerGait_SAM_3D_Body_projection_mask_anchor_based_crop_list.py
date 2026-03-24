@@ -645,6 +645,9 @@ class BiggerGait__SAM3DBody__Projection_Mask_Anchor_Based_CropList_Gaitbase_Shar
         }
 
     def _run_crop_list_test1(self, human_feat, debug_test_1=False):
+        if not self.training:
+            return self.Gait_Net.test_1(human_feat, return_debug=debug_test_1)
+
         groups = torch.chunk(human_feat, len(self.crop_list), dim=0)
         if len(groups) != len(self.crop_list):
             raise ValueError(
