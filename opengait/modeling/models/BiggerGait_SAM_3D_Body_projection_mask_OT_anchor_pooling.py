@@ -24,6 +24,12 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Anchor_Pooling_Gaitbase_Share(
         self.anchor_pt_path = model_cfg["anchor_pt_path"]
         self.anchor_depth_tol = model_cfg.get("anchor_depth_tol", 0.02)
         self.anchor_sampling_mode = model_cfg.get("anchor_sampling_mode", "bilinear")
+        self.anchor_visibility_mode = model_cfg.get("anchor_visibility_mode", "nearest")
+        if self.anchor_visibility_mode not in {"nearest", "all"}:
+            raise ValueError(
+                f"Unsupported anchor_visibility_mode: {self.anchor_visibility_mode}. "
+                "Expected 'nearest' or 'all'."
+            )
 
         super().build_network(model_cfg)
         self._load_anchor_indices(model_cfg)
@@ -193,13 +199,16 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Anchor_Pooling_Gaitbase_Share(
         flat_pixel_indices = v_feat * w_feat + u_feat
 
         front_valid = torch.ones_like(z, dtype=torch.bool)
-        sparse_depth_flat = torch.full((bsz, h_feat * w_feat), 1e6, device=device)
-        masked_z = torch.where(front_valid, z, torch.full_like(z, 1e6))
-        sparse_depth_flat.scatter_reduce_(
-            1, flat_pixel_indices, masked_z, reduce="amin", include_self=False
-        )
-        sparse_min_depth = torch.gather(sparse_depth_flat, 1, flat_pixel_indices)
-        is_visible = front_valid & (z <= (sparse_min_depth + 1e-4))
+        if self.anchor_visibility_mode == "all":
+            is_visible = front_valid
+        else:
+            sparse_depth_flat = torch.full((bsz, h_feat * w_feat), 1e6, device=device)
+            masked_z = torch.where(front_valid, z, torch.full_like(z, 1e6))
+            sparse_depth_flat.scatter_reduce_(
+                1, flat_pixel_indices, masked_z, reduce="amin", include_self=False
+            )
+            sparse_min_depth = torch.gather(sparse_depth_flat, 1, flat_pixel_indices)
+            is_visible = front_valid & (z <= (sparse_min_depth + 1e-4))
 
         if self.anchor_sampling_mode == "bilinear":
             if w_feat > 1:

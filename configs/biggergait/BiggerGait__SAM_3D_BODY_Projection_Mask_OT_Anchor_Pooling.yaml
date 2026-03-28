@@ -49,6 +49,7 @@ model_cfg:
   reset_iteration_after_restore: true
   anchor_pt_path: pretrained_LVMs/mhr_anchor_patches_512a_32p.pt
   anchor_sampling_mode: bilinear
+  anchor_visibility_mode: nearest
   anchor_depth_tol: 0.02
 
   layer_config:
