@@ -13,15 +13,12 @@ from .BiggerGait_SAM_3D_Body_projection_mask_OT_based import (
 class BiggerGait__SAM3DBody__Projection_Mask_OT_PostCNN_Mask_Gaitbase_Share(
     BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share
 ):
-    def _apply_post_cnn_target_mask(self, outs, tgt_depth_map):
-        target_mask = (tgt_depth_map < 1e5).float().unsqueeze(1)
-        n, _, s, h, w = outs.shape
-        resized_mask = F.interpolate(target_mask, size=(h, w), mode="nearest")
-        resized_mask = rearrange(
-            resized_mask, "(n s) c h w -> n c s h w", n=n, s=s
-        ).contiguous()
-        masked_outs = outs * resized_mask.to(dtype=outs.dtype)
-        return masked_outs, resized_mask
+    @staticmethod
+    def _mask_to_vis(mask, max_frames=5):
+        mask = mask.detach().float()
+        if mask.dim() == 4 and mask.size(1) == 1:
+            mask = mask.repeat(1, 3, 1, 1)
+        return mask[:max_frames].clamp(0, 1)
 
     def forward(self, inputs):
         ipts, labs, _, _, seqL = inputs
@@ -31,9 +28,10 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_PostCNN_Mask_Gaitbase_Share(
         rgb_chunks = torch.chunk(rgb, (rgb.size(1) // self.chunk_size) + 1, dim=1)
         should_log_pca_vis = self.debug_pca_vis and self._should_log_visual_summary()
         branch_pca_after_cnn = [None] * self.num_branches
+        branch_pca_after_ot = [None] * self.num_branches
         branch_layer2_norm = [None] * self.num_branches
         branch_target_depth = [None] * self.num_branches
-        branch_postcnn_mask = [None] * self.num_branches
+        branch_postot_target_mask = [None] * self.num_branches
         all_outs = [[] for _ in range(self.num_branches)]
         target_h, target_w = self.image_size * 2, self.image_size
         h_feat, w_feat = target_h // 16, target_w // 16
@@ -118,16 +116,49 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_PostCNN_Mask_Gaitbase_Share(
                 generated_mask, self.sils_size * 2, self.sils_size
             ).detach().clone()
             human_feat = human_feat * (human_mask > 0.5).to(human_feat)
+            human_feat_5d = rearrange(
+                human_feat, "(n s) c h w -> n c s h w", n=n, s=s
+            ).contiguous()
 
             cam_int_tgt, cam_t_tgt = self.build_target_camera(
                 curr_bs, rgb.device, target_h, target_w
             )
-            branch_warped_feats = []
+            debug_test_1 = should_log_pca_vis and (chunk_idx == num_rgb_chunks - 1)
             for b_idx, branch_cfg in enumerate(self.branch_configs):
                 branch_geo = self.build_branch_geometry(branch_cfg, pose_out)
-                warp_feat, _, tgt_depth_map = self.warp_features_with_ot(
-                    human_feat,
-                    human_mask.float(),
+                if debug_test_1:
+                    outs, gait_debug = self.Gait_Nets[b_idx].test_1(
+                        human_feat_5d, return_debug=True
+                    )
+                    layer2_feat = rearrange(
+                        gait_debug["layer2_feat"], "n c s h w -> (n s) c h w"
+                    ).contiguous()
+                    branch_layer2_norm[b_idx] = self._build_feature_norm_vis_batch(
+                        rgb_img[:5], layer2_feat[:5]
+                    )
+                    branch_pca_after_cnn[b_idx] = self._build_pca_vis_batch(
+                        rearrange(outs, "n c s h w -> (n s) c h w").contiguous()[:5]
+                    )
+                elif self.training:
+                    outs = torch.utils.checkpoint.checkpoint(
+                        self.Gait_Nets[b_idx].test_1,
+                        human_feat_5d,
+                        use_reentrant=False,
+                    )
+                else:
+                    outs = self.Gait_Nets[b_idx].test_1(human_feat_5d)
+
+                post_cnn_feat = rearrange(
+                    outs, "n c s h w -> (n s) c h w"
+                ).contiguous()
+                out_h, out_w = post_cnn_feat.shape[-2:]
+                src_mask_postcnn = F.interpolate(
+                    generated_mask, size=(out_h, out_w), mode="nearest"
+                ).detach().clone()
+
+                warped_post_cnn_feat, target_valid_mask, tgt_depth_map = self.warp_features_with_ot(
+                    post_cnn_feat,
+                    src_mask_postcnn.float(),
                     pred_verts,
                     branch_geo["verts"],
                     branch_geo["keypoints"],
@@ -136,51 +167,24 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_PostCNN_Mask_Gaitbase_Share(
                     cam_int_src,
                     cam_int_tgt,
                     cam_t_tgt,
-                    self.sils_size * 2,
-                    self.sils_size,
+                    out_h,
+                    out_w,
                     target_h,
                     target_w,
                     branch_geo["yaw"],
                     branch_geo["apply_global_rot_alignment"],
                 )
-                branch_warped_feats.append(warp_feat)
                 branch_target_depth[b_idx] = tgt_depth_map
-
-            debug_test_1 = should_log_pca_vis and (chunk_idx == num_rgb_chunks - 1)
-            for b_idx, warp_feat in enumerate(branch_warped_feats):
-                warp_feat_5d = rearrange(
-                    warp_feat, "(n s) c h w -> n c s h w", n=n, s=s
+                outs = rearrange(
+                    warped_post_cnn_feat, "(n s) c h w -> n c s h w", n=n, s=s
                 ).contiguous()
-                if debug_test_1:
-                    outs, gait_debug = self.Gait_Nets[b_idx].test_1(
-                        warp_feat_5d, return_debug=True
-                    )
-                    layer2_feat = rearrange(
-                        gait_debug["layer2_feat"], "n c s h w -> (n s) c h w"
-                    ).contiguous()
-                    branch_layer2_norm[b_idx] = self._build_feature_norm_on_depth_vis_batch(
-                        branch_target_depth[b_idx][:5], layer2_feat[:5]
-                    )
-                elif self.training:
-                    outs = torch.utils.checkpoint.checkpoint(
-                        self.Gait_Nets[b_idx].test_1,
-                        warp_feat_5d,
-                        use_reentrant=False,
-                    )
-                else:
-                    outs = self.Gait_Nets[b_idx].test_1(warp_feat_5d)
 
-                outs, post_cnn_mask = self._apply_post_cnn_target_mask(
-                    outs, branch_target_depth[b_idx]
-                )
                 if debug_test_1:
-                    branch_pca_after_cnn[b_idx] = self._build_pca_vis_batch(
-                        rearrange(outs, "n c s h w -> (n s) c h w").contiguous()[:5]
+                    branch_pca_after_ot[b_idx] = self._build_pca_vis_batch(
+                        warped_post_cnn_feat[:5]
                     )
-                    branch_postcnn_mask[b_idx] = (
-                        rearrange(post_cnn_mask, "n c s h w -> (n s) c h w")
-                        .contiguous()[:5]
-                        .repeat(1, 3, 1, 1)
+                    branch_postot_target_mask[b_idx] = self._mask_to_vis(
+                        target_valid_mask
                     )
                 all_outs[b_idx].append(outs)
 
@@ -197,8 +201,9 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_PostCNN_Mask_Gaitbase_Share(
         embed_list = [torch.cat(feats, dim=-1) for feats in embed_grouped]
         log_list = [torch.cat(logits, dim=-1) for logits in log_grouped]
         pca_after_cnn_summary = self._stack_branch_vis(branch_pca_after_cnn)
+        pca_after_ot_summary = self._stack_branch_vis(branch_pca_after_ot)
         cnn_layer2_norm_summary = self._stack_branch_vis(branch_layer2_norm)
-        post_cnn_mask_summary = self._stack_branch_vis(branch_postcnn_mask)
+        post_ot_target_mask_summary = self._stack_branch_vis(branch_postot_target_mask)
 
         if self.training:
             retval = {
@@ -222,13 +227,15 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_PostCNN_Mask_Gaitbase_Share(
             }
             if pca_after_cnn_summary is not None:
                 retval["visual_summary"]["image/pca_after_cnn"] = pca_after_cnn_summary.float()
+            if pca_after_ot_summary is not None:
+                retval["visual_summary"]["image/pca_after_ot"] = pca_after_ot_summary.float()
             if cnn_layer2_norm_summary is not None:
                 retval["visual_summary"]["image/cnn_layer2_l2norm"] = (
                     cnn_layer2_norm_summary.float()
                 )
-            if post_cnn_mask_summary is not None:
-                retval["visual_summary"]["image/post_cnn_target_mask"] = (
-                    post_cnn_mask_summary.float()
+            if post_ot_target_mask_summary is not None:
+                retval["visual_summary"]["image/post_ot_target_mask"] = (
+                    post_ot_target_mask_summary.float()
                 )
         else:
             retval = {
