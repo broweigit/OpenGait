@@ -31,6 +31,51 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_PostCNN_TargetMask_Gaitbase_Shar
         masked_outs = outs * resized_mask.to(dtype=outs.dtype)
         return masked_outs, resized_mask
 
+    @staticmethod
+    def _masked_hpp(x, mask, bin_num):
+        n, c = x.size()[:2]
+        features = []
+        mask = mask.float()
+        for b in bin_num:
+            feat_bin = x.view(n, c, b, -1)
+            mask_bin = mask.view(n, 1, b, -1)
+            valid_count = mask_bin.sum(-1).clamp_min(1.0)
+            feat_mean = (feat_bin * mask_bin).sum(-1) / valid_count
+
+            valid_part = mask_bin.sum(-1) > 0
+            feat_max = feat_bin.masked_fill(
+                ~valid_part.unsqueeze(-1).expand(-1, -1, -1, feat_bin.size(-1)),
+                -100.0,
+            ).max(-1)[0]
+            feat_max = torch.where(
+                valid_part.expand(-1, c, -1), feat_max, torch.zeros_like(feat_max)
+            )
+            features.append(feat_mean + feat_max)
+        return torch.cat(features, dim=-1)
+
+    def _masked_single_test_2(self, gait_single, outs, mask, seqL):
+        outs = gait_single.TP(outs, seqL, options={"dim": 2})[0]
+        mask = gait_single.TP(mask, seqL, options={"dim": 2})[0]
+        if gait_single.vertical_pooling:
+            outs = outs.transpose(2, 3).contiguous()
+            mask = mask.transpose(2, 3).contiguous()
+        outs = self._masked_hpp(outs, mask, gait_single.HPP.bin_num)
+        embed_1 = gait_single.FCs(outs)
+        _, logits = gait_single.BNNecks(embed_1)
+        return embed_1, logits
+
+    def _masked_test_2(self, gait_net, x, mask, seqL):
+        x_list = torch.chunk(x, gait_net.num_FPN, dim=1)
+        embed_list = []
+        log_list = []
+        for i in range(gait_net.num_FPN):
+            embed_1, logits = self._masked_single_test_2(
+                gait_net.Gait_List[i], x_list[i], mask, seqL
+            )
+            embed_list.append(embed_1)
+            log_list.append(logits)
+        return embed_list, log_list
+
     def forward(self, inputs):
         ipts, labs, _, _, seqL = inputs
         rgb = ipts[0]
@@ -43,6 +88,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_PostCNN_TargetMask_Gaitbase_Shar
         branch_target_depth = [None] * self.num_branches
         branch_postcnn_mask = [None] * self.num_branches
         all_outs = [[] for _ in range(self.num_branches)]
+        all_masks = [[] for _ in range(self.num_branches)]
         target_h, target_w = self.image_size * 2, self.image_size
         h_feat, w_feat = target_h // 16, target_w // 16
 
@@ -193,13 +239,17 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_PostCNN_TargetMask_Gaitbase_Shar
                         .repeat(1, 3, 1, 1)
                     )
                 all_outs[b_idx].append(outs)
+                all_masks[b_idx].append(post_cnn_mask)
 
         embed_grouped = [[] for _ in range(self.num_FPN)]
         log_grouped = [[] for _ in range(self.num_FPN)]
 
         for b_idx in range(self.num_branches):
             branch_seq_feat = torch.cat(all_outs[b_idx], dim=2)
-            e_list, l_list = self.Gait_Nets[b_idx].test_2(branch_seq_feat, seqL)
+            branch_seq_mask = torch.cat(all_masks[b_idx], dim=2)
+            e_list, l_list = self._masked_test_2(
+                self.Gait_Nets[b_idx], branch_seq_feat, branch_seq_mask, seqL
+            )
             for i in range(self.num_FPN):
                 embed_grouped[i].append(e_list[i])
                 log_grouped[i].append(l_list[i])
