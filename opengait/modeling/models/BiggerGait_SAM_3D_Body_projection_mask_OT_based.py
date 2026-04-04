@@ -621,6 +621,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
         feat_map = feat_map.detach().float().cpu()
         num_frames = min(max_frames, feat_map.shape[0], depth_maps.shape[0])
         vis_frames = []
+        invalid_gray = 0.25
 
         for idx in range(num_frames):
             depth_map = depth_maps[idx]
@@ -641,6 +642,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
                     inv_depth[valid_mask] = 1.0
 
             base_frame = inv_depth.unsqueeze(0).repeat(3, 1, 1)
+            base_frame[:, ~valid_mask] = invalid_gray
 
             norm_map = torch.linalg.vector_norm(curr_feat, ord=2, dim=0, keepdim=True)
             min_val = norm_map.min()
