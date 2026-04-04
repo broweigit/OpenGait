@@ -664,7 +664,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
             heat_g = (1.5 - torch.abs(4.0 * x - 2.0)).clamp(0.0, 1.0)
             heat_b = (1.5 - torch.abs(4.0 * x - 1.0)).clamp(0.0, 1.0)
             heat_map = torch.stack([heat_r, heat_g, heat_b], dim=0)
-            alpha = 0.7 * norm_map.pow(0.85) * valid_mask.unsqueeze(0).float()
+            alpha = 0.7 * norm_map.pow(0.85)
             vis_frame = base_frame * (1.0 - alpha) + heat_map * alpha
             vis_frames.append(vis_frame.clamp(0, 1))
 
