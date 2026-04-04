@@ -484,15 +484,22 @@ class Baseline_Single(nn.Module):
             return outs
 
         n, c, s, h, w = outs.shape
+        layer1_feat = outs.contiguous()
         x = outs.transpose(1, 2).reshape(-1, c, h, w)
         post_block = self.post_backbone.forward_block
         layer2_feat = post_block.layer2(x, *args, **kwargs)
-        x = post_block.layer3(layer2_feat, *args, **kwargs)
-        x = post_block.layer4(x, *args, **kwargs)
+        layer3_feat = post_block.layer3(layer2_feat, *args, **kwargs)
+        layer4_feat = post_block.layer4(layer3_feat, *args, **kwargs)
 
-        final_outs = x.reshape(n, s, *x.shape[1:]).transpose(1, 2).contiguous()
+        final_outs = layer4_feat.reshape(n, s, *layer4_feat.shape[1:]).transpose(1, 2).contiguous()
         layer2_feat = layer2_feat.reshape(n, s, *layer2_feat.shape[1:]).transpose(1, 2).contiguous()
-        return final_outs, {'layer2_feat': layer2_feat}
+        layer3_feat = layer3_feat.reshape(n, s, *layer3_feat.shape[1:]).transpose(1, 2).contiguous()
+        return final_outs, {
+            'layer1_feat': layer1_feat,
+            'layer2_feat': layer2_feat,
+            'layer3_feat': layer3_feat,
+            'layer4_feat': final_outs,
+        }
 
     def test_2(self, outs, seqL):
         outs = self.TP(outs, seqL, options={"dim": 2})[0]  # [n, c, h, w]
@@ -918,7 +925,12 @@ class Baseline_ShareTime_2B(nn.Module):
         n,c,s,h,w = x.shape
         x_list = list(torch.chunk(x, self.num_FPN, dim=1))
         t = torch.tensor(list(range(self.num_FPN))).to(x).view(1,-1).repeat(n*s,1)
-        debug_layer2_list = []
+        debug_layer_feats = {
+            'layer1_feat': [],
+            'layer2_feat': [],
+            'layer3_feat': [],
+            'layer4_feat': [],
+        }
         for i in range(self.num_FPN):
             
             temb = get_timestep_embedding(t[:,i], self.t_channel, max_timesteps=self.num_FPN).to(x)
@@ -929,12 +941,19 @@ class Baseline_ShareTime_2B(nn.Module):
             )
             if return_debug:
                 x_list[i], debug_info = outputs
-                debug_layer2_list.append(debug_info['layer2_feat'])
+                for key in debug_layer_feats.keys():
+                    debug_layer_feats[key].append(debug_info[key])
             else:
                 x_list[i] = outputs
         x = torch.concat(x_list, dim=1)
         if return_debug:
-            return x, {'layer2_feat': torch.concat(debug_layer2_list, dim=1)}
+            debug_info = {
+                key: torch.concat(feats, dim=1)
+                for key, feats in debug_layer_feats.items()
+            }
+            for key, feats in debug_layer_feats.items():
+                debug_info[f"{key}_list"] = feats
+            return x, debug_info
         return x
 
     def test_2(self, x, seqL):
@@ -948,6 +967,487 @@ class Baseline_ShareTime_2B(nn.Module):
             embed_list.append(embed_1)
             log_list.append(logits)
         return embed_list, log_list
+
+
+class LatentFactorPooling(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        latent_num,
+        horizontal_stripes=1,
+        latent_per_stripe=None,
+        support_kernel_size=3,
+        temperature=0.125,
+        presence_topk_ratio=0.125,
+        active_gate_threshold=0.05,
+        eps=1.0e-6,
+    ):
+        super(LatentFactorPooling, self).__init__()
+        self.latent_num = latent_num
+        self.horizontal_stripes = max(1, int(horizontal_stripes))
+        if latent_per_stripe is None:
+            if latent_num % self.horizontal_stripes != 0:
+                raise ValueError(
+                    f"latent_num={latent_num} must be divisible by horizontal_stripes={self.horizontal_stripes}."
+                )
+            latent_per_stripe = latent_num // self.horizontal_stripes
+        self.latent_per_stripe = int(latent_per_stripe)
+        if self.horizontal_stripes * self.latent_per_stripe != latent_num:
+            raise ValueError(
+                "horizontal_stripes * latent_per_stripe must equal latent_num, got "
+                f"{self.horizontal_stripes} * {self.latent_per_stripe} != {latent_num}."
+            )
+        self.competition_latent_num = self.latent_per_stripe
+        self.support_kernel_size = support_kernel_size
+        self.temperature = temperature
+        self.presence_topk_ratio = presence_topk_ratio
+        self.active_gate_threshold = active_gate_threshold
+        self.eps = eps
+        latent_basis = torch.zeros(
+            self.horizontal_stripes, self.latent_per_stripe, in_channels
+        )
+        nn.init.xavier_uniform_(latent_basis.view(-1, in_channels))
+        self.latent_basis = nn.Parameter(latent_basis)
+
+    def _build_active_mask(self, x):
+        feat_energy = x.detach().float().pow(2).mean(dim=1)
+        feat_energy = feat_energy / feat_energy.amax(dim=(-2, -1), keepdim=True).clamp_min(self.eps)
+        active_mask = (feat_energy > self.active_gate_threshold).float()
+
+        fallback_mask = (feat_energy > 0).float()
+        use_fallback = active_mask.sum(dim=(-2, -1), keepdim=True) <= 0
+        active_mask = torch.where(use_fallback, fallback_mask, active_mask)
+
+        active_mask = rearrange(active_mask, 'n h w -> n (h w)').contiguous()
+        feat_energy = rearrange(feat_energy, 'n h w -> n (h w)').contiguous()
+        return active_mask, feat_energy
+
+    def forward(self, x, return_debug=False, return_aux=False):
+        if x.dim() != 4:
+            raise ValueError(f"LatentFactorPooling expects [n, c, h, w], got {x.shape}")
+
+        n, c, h, w = x.shape
+        stripe_num = self.horizontal_stripes
+        if h % stripe_num != 0:
+            raise ValueError(
+                f"Feature height {h} must be divisible by horizontal_stripes={stripe_num}."
+            )
+        stripe_h = h // stripe_num
+
+        stripe_feat = rearrange(
+            x, 'n c (g hs) w -> (n g) c hs w', g=stripe_num, hs=stripe_h
+        ).contiguous()
+        support_feat = F.avg_pool2d(
+            stripe_feat,
+            kernel_size=self.support_kernel_size,
+            stride=1,
+            padding=self.support_kernel_size // 2,
+        )
+
+        feat_flat = rearrange(
+            stripe_feat, '(n g) c hs w -> n g (hs w) c', n=n, g=stripe_num, hs=stripe_h, w=w
+        ).contiguous()
+        support_flat = rearrange(
+            support_feat, '(n g) c hs w -> n g (hs w) c', n=n, g=stripe_num, hs=stripe_h, w=w
+        ).contiguous()
+
+        active_mask, active_energy = self._build_active_mask(stripe_feat)
+        active_mask = rearrange(
+            active_mask, '(n g) p -> n g p', n=n, g=stripe_num
+        ).contiguous()
+        active_energy = rearrange(
+            active_energy, '(n g) p -> n g p', n=n, g=stripe_num
+        ).contiguous()
+        support_flat = F.normalize(support_flat.float(), p=2, dim=-1)
+        latent_basis = F.normalize(self.latent_basis.float(), p=2, dim=-1)
+        support_logits = torch.einsum(
+            'ngpc,gkc->ngpk', support_flat, latent_basis
+        ) / self.temperature
+        route_prob = F.softmax(support_logits, dim=-1)
+        active_mask = active_mask.to(route_prob.dtype)
+        support = route_prob * active_mask.unsqueeze(-1)
+
+        pool_weights = support / support.sum(dim=2, keepdim=True).clamp_min(self.eps)
+        tokens = torch.einsum('ngpk,ngpc->ngkc', pool_weights, feat_flat.float())
+        tokens = rearrange(tokens, 'n g k c -> n c (g k)').contiguous()
+
+        position_count = support.shape[2]
+        topk = max(1, min(position_count, int(position_count * self.presence_topk_ratio)))
+        presence = support.topk(topk, dim=2).values.mean(dim=2)
+        presence = rearrange(presence, 'n g k -> n (g k)').contiguous()
+        presence = presence / presence.sum(dim=1, keepdim=True).clamp_min(self.eps)
+
+        support_map_local = rearrange(
+            support, 'n g (hs w) k -> n g k hs w', hs=stripe_h, w=w
+        ).contiguous()
+        pool_weights_local = rearrange(
+            pool_weights, 'n g (hs w) k -> n g k hs w', hs=stripe_h, w=w
+        ).contiguous()
+        support_map = support.new_zeros(n, stripe_num, self.latent_per_stripe, h, w)
+        pool_weights_map = pool_weights.new_zeros(n, stripe_num, self.latent_per_stripe, h, w)
+        for stripe_idx in range(stripe_num):
+            h_start = stripe_idx * stripe_h
+            h_end = h_start + stripe_h
+            support_map[:, stripe_idx, :, h_start:h_end, :] = support_map_local[:, stripe_idx]
+            pool_weights_map[:, stripe_idx, :, h_start:h_end, :] = pool_weights_local[:, stripe_idx]
+        support_map = rearrange(support_map, 'n g k h w -> n (g k) h w').contiguous()
+        pool_weights_map = rearrange(pool_weights_map, 'n g k h w -> n (g k) h w').contiguous()
+        support_flat_global = rearrange(support_map, 'n k h w -> n (h w) k').contiguous()
+        pool_weights_flat_global = rearrange(
+            pool_weights_map, 'n k h w -> n (h w) k'
+        ).contiguous()
+        active_mask_map = rearrange(
+            active_mask, 'n g (hs w) -> n 1 (g hs) w', hs=stripe_h, w=w
+        ).contiguous()
+        active_energy_map = rearrange(
+            active_energy, 'n g (hs w) -> n 1 (g hs) w', hs=stripe_h, w=w
+        ).contiguous()
+
+        if not return_debug and not return_aux:
+            return tokens.to(x.dtype), presence.to(x.dtype)
+
+        aux_info = {
+            'active_mask_flat': rearrange(
+                active_mask_map, 'n 1 h w -> n (h w)'
+            ).contiguous().to(x.dtype),
+            'active_energy_flat': rearrange(
+                active_energy_map, 'n 1 h w -> n (h w)'
+            ).contiguous().to(x.dtype),
+            'support_flat': support_flat_global.to(x.dtype),
+            'pool_weights_flat': pool_weights_flat_global.to(x.dtype),
+        }
+        if return_debug:
+            aux_info.update({
+                'support_map': support_map.to(x.dtype),
+                'pool_weights': pool_weights_map.to(x.dtype),
+                'active_mask': active_mask_map.to(x.dtype),
+                'active_energy': active_energy_map.to(x.dtype),
+            })
+        return tokens.to(x.dtype), presence.to(x.dtype), aux_info
+
+
+class Baseline_LatentSet_Single(nn.Module):
+    def __init__(self, model_cfg):
+        super(Baseline_LatentSet_Single, self).__init__()
+        self.pre_rgb = SetBlockWrapper(Pre_ResNet9(**model_cfg['backbone_cfg']))
+        self.post_backbone = SetBlockWrapper(Post_ResNet9(**model_cfg['backbone_cfg']))
+        self.TP = PackSequenceWrapper(torch.max)
+        self.TP_mean = PackSequenceWrapper(torch.mean)
+        self.vertical_pooling = model_cfg.get('vertical_pooling', False)
+
+        latent_cfg = model_cfg.get('latent_cfg', {})
+        latent_reg_cfg = model_cfg.get('latent_reg_cfg', {})
+        latent_bin_num = model_cfg['bin_num']
+        latent_num = int(latent_bin_num) if isinstance(latent_bin_num, int) else sum(latent_bin_num)
+        expected_parts = model_cfg['SeparateFCs']['parts_num']
+        if latent_num != expected_parts:
+            raise ValueError(
+                f"Latent branch expects sum(bin_num) == SeparateFCs.parts_num, got {latent_num} vs {expected_parts}."
+            )
+
+        in_channels = model_cfg['SeparateFCs']['in_channels']
+        self.LatentPool = LatentFactorPooling(
+            in_channels=in_channels,
+            latent_num=latent_num,
+            horizontal_stripes=latent_cfg.get('horizontal_stripes', 1),
+            latent_per_stripe=latent_cfg.get('latent_per_stripe', None),
+            support_kernel_size=latent_cfg.get('support_kernel_size', 3),
+            temperature=latent_cfg.get('temperature', 0.125),
+            presence_topk_ratio=latent_cfg.get('presence_topk_ratio', 0.125),
+            active_gate_threshold=latent_cfg.get('active_gate_threshold', 0.05),
+        )
+        self.latent_reg_cfg = {
+            'basis_orth_weight': float(latent_reg_cfg.get('basis_orth_weight', 0.0)),
+            'token_decor_weight': float(latent_reg_cfg.get('token_decor_weight', 0.0)),
+            'overlap_weight': float(latent_reg_cfg.get('overlap_weight', 0.0)),
+            'balance_weight': float(latent_reg_cfg.get('balance_weight', 0.0)),
+            'coverage_weight': float(latent_reg_cfg.get('coverage_weight', 0.0)),
+            'support_competition_weight': float(latent_reg_cfg.get('support_competition_weight', 0.0)),
+            'support_balance_weight': float(latent_reg_cfg.get('support_balance_weight', 0.0)),
+            'support_overlap_weight': float(latent_reg_cfg.get('support_overlap_weight', 0.0)),
+        }
+        self.FCs = SeparateFCs(**model_cfg['SeparateFCs'])
+        self.BNNecks = SeparateBNNecks(**model_cfg['SeparateBNNecks'])
+
+    @staticmethod
+    def _offdiag_square_mean(gram):
+        if gram.dim() == 2:
+            gram = gram.unsqueeze(0)
+        k = gram.size(-1)
+        if k <= 1:
+            return gram.new_tensor(0.0)
+        eye = torch.eye(k, device=gram.device, dtype=gram.dtype).unsqueeze(0)
+        offdiag = gram * (1.0 - eye)
+        return offdiag.pow(2).sum(dim=(-2, -1)).mean() / (k * (k - 1))
+
+    def _compute_latent_regularization(self, tokens, token_weights, aux_info):
+        reg_losses = {}
+        reg_cfg = self.latent_reg_cfg
+        if all(weight <= 0 for weight in reg_cfg.values()):
+            return reg_losses
+
+        support_flat = aux_info['support_flat'].float()
+        active_mask = aux_info['active_mask_flat'].float()
+        support_prob = support_flat / support_flat.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+        if reg_cfg['basis_orth_weight'] > 0:
+            latent_basis = F.normalize(self.LatentPool.latent_basis.float(), p=2, dim=-1)
+            basis_gram = latent_basis.matmul(latent_basis.transpose(1, 2))
+            reg_losses['latent_reg/basis_orth'] = (
+                self._offdiag_square_mean(basis_gram) * reg_cfg['basis_orth_weight']
+            )
+
+        if reg_cfg['token_decor_weight'] > 0:
+            token_feat = F.normalize(tokens.float().transpose(1, 2), p=2, dim=-1)
+            token_gram = token_feat.matmul(token_feat.transpose(1, 2))
+            reg_losses['latent_reg/token_decor'] = (
+                self._offdiag_square_mean(token_gram) * reg_cfg['token_decor_weight']
+            )
+
+        if reg_cfg['support_competition_weight'] > 0:
+            entropy_norm = torch.log(torch.tensor(
+                float(max(self.LatentPool.competition_latent_num, 2)),
+                device=support_prob.device,
+                dtype=support_prob.dtype,
+            )).clamp_min(1e-6)
+            support_entropy = -(support_prob * support_prob.clamp_min(1e-6).log()).sum(dim=-1)
+            support_entropy = support_entropy / entropy_norm
+            active_count = active_mask.sum(dim=1).clamp_min(1.0)
+            support_entropy = (support_entropy * active_mask).sum(dim=1) / active_count
+            reg_losses['latent_reg/support_competition'] = (
+                support_entropy.mean() * reg_cfg['support_competition_weight']
+            )
+
+        if reg_cfg['support_balance_weight'] > 0:
+            mean_support_prob = (
+                support_prob * active_mask.unsqueeze(-1)
+            ).sum(dim=(0, 1)) / active_mask.sum().clamp_min(1.0)
+            target_support_prob = torch.full_like(
+                mean_support_prob, 1.0 / mean_support_prob.numel()
+            )
+            reg_losses['latent_reg/support_balance'] = (
+                F.mse_loss(mean_support_prob, target_support_prob) * reg_cfg['support_balance_weight']
+            )
+
+        if reg_cfg['support_overlap_weight'] > 0:
+            masked_support_prob = support_prob * active_mask.unsqueeze(-1)
+            masked_support_prob = masked_support_prob / masked_support_prob.norm(
+                p=2, dim=1, keepdim=True
+            ).clamp_min(1e-6)
+            support_gram = masked_support_prob.transpose(1, 2).matmul(masked_support_prob)
+            reg_losses['latent_reg/support_overlap'] = (
+                self._offdiag_square_mean(support_gram) * reg_cfg['support_overlap_weight']
+            )
+
+        if reg_cfg['overlap_weight'] > 0:
+            pool_weights = aux_info['pool_weights_flat'].float()
+            pool_weights = pool_weights / pool_weights.norm(p=2, dim=1, keepdim=True).clamp_min(1e-6)
+            overlap_gram = pool_weights.transpose(1, 2).matmul(pool_weights)
+            reg_losses['latent_reg/spatial_overlap'] = (
+                self._offdiag_square_mean(overlap_gram) * reg_cfg['overlap_weight']
+            )
+
+        if reg_cfg['balance_weight'] > 0:
+            mean_presence = token_weights.float().mean(dim=0)
+            target_presence = torch.full_like(mean_presence, 1.0 / mean_presence.numel())
+            reg_losses['latent_reg/usage_balance'] = (
+                F.mse_loss(mean_presence, target_presence) * reg_cfg['balance_weight']
+            )
+
+        if reg_cfg['coverage_weight'] > 0:
+            active_target = active_mask
+            active_target = active_target / active_target.sum(dim=1, keepdim=True).clamp_min(1e-6)
+            coverage_map = aux_info['pool_weights_flat'].float().sum(dim=-1)
+            coverage_map = coverage_map / coverage_map.sum(dim=1, keepdim=True).clamp_min(1e-6)
+            reg_losses['latent_reg/coverage'] = (
+                F.l1_loss(coverage_map, active_target) * reg_cfg['coverage_weight']
+            )
+
+        return reg_losses
+
+    def pre_forward(self, appearance, *args, **kwargs):
+        outs = self.pre_rgb(appearance, *args, **kwargs)
+        outs = self.post_backbone(outs, *args, **kwargs)
+        return outs
+
+    def forward(self, appearance, seqL, *args, **kwargs):
+        outs = self.pre_rgb(appearance, *args, **kwargs)
+        outs = self.post_backbone(outs, *args, **kwargs)
+        embed, logits, token_weights = self.test_2(outs, seqL)
+        return embed, logits, token_weights
+
+    def test_1(self, appearance, return_debug=False, *args, **kwargs):
+        outs = self.pre_rgb(appearance, *args, **kwargs)
+        if not return_debug:
+            outs = self.post_backbone(outs, *args, **kwargs)
+            return outs
+
+        n, c, s, h, w = outs.shape
+        x = outs.transpose(1, 2).reshape(-1, c, h, w)
+        post_block = self.post_backbone.forward_block
+        layer2_feat = post_block.layer2(x, *args, **kwargs)
+        x = post_block.layer3(layer2_feat, *args, **kwargs)
+        x = post_block.layer4(x, *args, **kwargs)
+
+        final_outs = x.reshape(n, s, *x.shape[1:]).transpose(1, 2).contiguous()
+        layer2_feat = layer2_feat.reshape(n, s, *layer2_feat.shape[1:]).transpose(1, 2).contiguous()
+        return final_outs, {'layer2_feat': layer2_feat}
+
+    def test_2(self, outs, seqL, return_debug=False, return_reg=False):
+        if self.vertical_pooling:
+            outs = outs.transpose(3, 4).contiguous()
+
+        n, c, s, h, w = outs.shape
+        frame_outs = rearrange(outs, 'n c s h w -> (n s) c h w').contiguous()
+
+        need_aux = return_debug or return_reg
+        if need_aux:
+            frame_tokens, frame_token_weights, aux_info = self.LatentPool(
+                frame_outs, return_debug=return_debug, return_aux=True
+            )
+        else:
+            frame_tokens, frame_token_weights = self.LatentPool(frame_outs, return_debug=False)
+
+        token_seq = rearrange(frame_tokens, '(n s) c k -> n c s k', n=n, s=s).contiguous()
+        token_weight_seq = rearrange(frame_token_weights, '(n s) k -> n k s', n=n, s=s).contiguous()
+
+        tokens = self.TP(token_seq, seqL, options={"dim": 2})[0]
+        token_weights = self.TP_mean(token_weight_seq, seqL, options={"dim": 2})
+        embed = self.FCs(tokens)
+        _, logits = self.BNNecks(embed)
+
+        reg_losses = self._compute_latent_regularization(
+            frame_tokens, frame_token_weights, aux_info
+        ) if return_reg else {}
+
+        if return_debug:
+            debug_info = {
+                'support_map': rearrange(
+                    aux_info['support_map'],
+                    '(n s) k h w -> n s k h w',
+                    n=n, s=s,
+                ).contiguous(),
+                'pool_weights': rearrange(
+                    aux_info['pool_weights'],
+                    '(n s) k h w -> n s k h w',
+                    n=n, s=s,
+                ).contiguous(),
+                'active_mask': rearrange(
+                    aux_info['active_mask'],
+                    '(n s) c h w -> n s c h w',
+                    n=n, s=s,
+                ).contiguous(),
+                'active_energy': rearrange(
+                    aux_info['active_energy'],
+                    '(n s) c h w -> n s c h w',
+                    n=n, s=s,
+                ).contiguous(),
+            }
+            aux_info.update({
+                'token_weights': token_weights,
+                'frame_token_weights': rearrange(
+                    frame_token_weights, '(n s) k -> n s k', n=n, s=s
+                ).contiguous(),
+                'frame_tokens': token_seq,
+                'tokens': tokens,
+                'embeddings': embed,
+            })
+            debug_info.update({
+                'token_weights': token_weights,
+                'frame_token_weights': aux_info['frame_token_weights'],
+                'frame_tokens': aux_info['frame_tokens'],
+                'tokens': tokens,
+                'embeddings': embed,
+            })
+            if return_reg:
+                return embed, logits, token_weights, reg_losses, debug_info
+            return embed, logits, token_weights, debug_info
+        if return_reg:
+            return embed, logits, token_weights, reg_losses
+        return embed, logits, token_weights
+
+
+class Baseline_LatentSet_ShareTime_2B(nn.Module):
+    def __init__(self, model_cfg):
+        super(Baseline_LatentSet_ShareTime_2B, self).__init__()
+        self.num_FPN = model_cfg['num_FPN']
+        self.Gait_Net_1 = Baseline_LatentSet_Single(model_cfg)
+        self.Gait_Net_2 = Baseline_LatentSet_Single(model_cfg)
+        self.Gait_List = nn.ModuleList(
+            [self.Gait_Net_1 for _ in range(self.num_FPN - self.num_FPN // 2)] +
+            [self.Gait_Net_2 for _ in range(self.num_FPN // 2)]
+        )
+
+        self.t_channel = 256
+        self.temb_proj = nn.Sequential(
+            nn.Linear(self.t_channel, self.t_channel),
+            nn.ReLU(),
+            nn.Linear(self.t_channel, self.t_channel),
+        )
+
+    def forward(self, x, seqL):
+        x = self.test_1(x)
+        embed_list, log_list, weight_list = self.test_2(x, seqL)
+        return embed_list, log_list, weight_list
+
+    def test_1(self, x, return_debug=False, *args, **kwargs):
+        n, c, s, h, w = x.shape
+        x_list = list(torch.chunk(x, self.num_FPN, dim=1))
+        t = torch.tensor(list(range(self.num_FPN))).to(x).view(1, -1).repeat(n * s, 1)
+        debug_layer2_list = []
+        for i in range(self.num_FPN):
+            temb = get_timestep_embedding(t[:, i], self.t_channel, max_timesteps=self.num_FPN).to(x)
+            temb = self.temb_proj(temb)
+
+            outputs = self.Gait_List[i].test_1(
+                x_list[i], return_debug=return_debug, temb=temb, *args, **kwargs
+            )
+            if return_debug:
+                x_list[i], debug_info = outputs
+                debug_layer2_list.append(debug_info['layer2_feat'])
+            else:
+                x_list[i] = outputs
+
+        x = torch.concat(x_list, dim=1)
+        if return_debug:
+            return x, {'layer2_feat': torch.concat(debug_layer2_list, dim=1)}
+        return x
+
+    def test_2(self, x, seqL, return_debug=False, return_reg=False):
+        x_list = torch.chunk(x, self.num_FPN, dim=1)
+        embed_list = []
+        log_list = []
+        weight_list = []
+        reg_list = []
+        debug_list = []
+        for i in range(self.num_FPN):
+            outputs = self.Gait_List[i].test_2(
+                x_list[i], seqL, return_debug=return_debug, return_reg=return_reg
+            )
+            if return_debug:
+                if return_reg:
+                    embed_1, logits, token_weights, reg_losses, debug_info = outputs
+                    reg_list.append(reg_losses)
+                else:
+                    embed_1, logits, token_weights, debug_info = outputs
+                debug_list.append(debug_info)
+            else:
+                if return_reg:
+                    embed_1, logits, token_weights, reg_losses = outputs
+                    reg_list.append(reg_losses)
+                else:
+                    embed_1, logits, token_weights = outputs
+            embed_list.append(embed_1)
+            log_list.append(logits)
+            weight_list.append(token_weights)
+
+        if return_debug:
+            if return_reg:
+                return embed_list, log_list, weight_list, reg_list, debug_list
+            return embed_list, log_list, weight_list, debug_list
+        if return_reg:
+            return embed_list, log_list, weight_list, reg_list
+        return embed_list, log_list, weight_list
 
 
 class Baseline_HPPWidthToken_Single(nn.Module):
