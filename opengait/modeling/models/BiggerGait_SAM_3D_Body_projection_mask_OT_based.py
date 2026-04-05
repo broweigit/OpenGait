@@ -694,6 +694,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
         rgb_chunks = torch.chunk(rgb, (rgb.size(1) // self.chunk_size) + 1, dim=1)
         should_log_pca_vis = self.debug_pca_vis and self._should_log_visual_summary()
         branch_layer1_norm = [None] * self.num_branches
+        branch_pca_before_cnn = [None] * self.num_branches
         branch_pca_after_cnn = [None] * self.num_branches
         branch_layer2_norm = [None] * self.num_branches
         branch_layer3_norm = [None] * self.num_branches
@@ -813,6 +814,14 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
             for b_idx, warp_feat in enumerate(branch_warped_feats):
                 warp_feat_5d = rearrange(warp_feat, '(n s) c h w -> n c s h w', n=n, s=s).contiguous()
                 if debug_test_1:
+                    pca_before_vis = []
+                    for in_chunk in torch.chunk(warp_feat_5d, self.num_FPN, dim=1):
+                        pca_before_vis.append(
+                            self._build_pca_vis_batch(
+                                rearrange(in_chunk, 'n c s h w -> (n s) c h w').contiguous()[:5]
+                            )
+                        )
+                    branch_pca_before_cnn[b_idx] = self._stack_fpn_vis(pca_before_vis)
                     outs, gait_debug = self.Gait_Nets[b_idx].test_1(
                         warp_feat_5d, return_debug=True
                     )
@@ -888,6 +897,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
         embed_list = [torch.cat(feats, dim=-1) for feats in embed_grouped]
         log_list = [torch.cat(logits, dim=-1) for logits in log_grouped]
         cnn_layer1_norm_summary = self._stack_branch_vis(branch_layer1_norm)
+        pca_before_cnn_summary = self._stack_branch_vis(branch_pca_before_cnn)
         pca_after_cnn_summary = self._stack_branch_vis(branch_pca_after_cnn)
         cnn_layer2_norm_summary = self._stack_branch_vis(branch_layer2_norm)
         cnn_layer3_norm_summary = self._stack_branch_vis(branch_layer3_norm)
@@ -911,6 +921,8 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
             }
             if cnn_layer1_norm_summary is not None:
                 retval['visual_summary']['image/cnn_layer1_l2norm'] = cnn_layer1_norm_summary.float()
+            if pca_before_cnn_summary is not None:
+                retval['visual_summary']['image/pca_before_cnn'] = pca_before_cnn_summary.float()
             if pca_after_cnn_summary is not None:
                 retval['visual_summary']['image/pca_after_cnn'] = pca_after_cnn_summary.float()
             if cnn_layer2_norm_summary is not None:
