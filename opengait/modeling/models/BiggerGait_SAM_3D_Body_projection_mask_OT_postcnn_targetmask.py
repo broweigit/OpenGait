@@ -25,13 +25,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_PostCNN_TargetMask_Gaitbase_Shar
         resized_mask = F.interpolate(
             target_valid_mask.float(), size=(h, w), mode="nearest"
         )
-        original_mask = (resized_mask > 0.5).float()
-        dilated_mask = original_mask
-        for _ in range(3):
-            dilated_mask = F.max_pool2d(
-                dilated_mask, kernel_size=3, stride=1, padding=1
-            )
-        resized_mask = (dilated_mask - original_mask).clamp_(0.0, 1.0)
+        resized_mask = (resized_mask > 0.5).float()
         resized_mask = rearrange(
             resized_mask, "(n s) c h w -> n c s h w", n=n, s=s
         ).contiguous()
