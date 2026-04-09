@@ -43,6 +43,7 @@ model_cfg:
   source_dim: 1280
   num_FPN: 4
   debug_pca_vis: true
+  debug_uv_export: true
 
   layer_config:
     hook_mask:
@@ -145,14 +146,14 @@ trainer_cfg:
   find_unused_parameters: true
   enable_float16: true
   fix_BN: false
-  log_iter: 100
+  log_iter: 1
   with_test: true
   restore_ckpt_strict: true
   restore_hint: 0
   save_iter: 5000
   save_name: BiggerGait__SAM3DBody__Projection_UV_Based_Gaitbase_Share
   sync_BN: true
-  total_iter: 30000
+  total_iter: 10
   sampler:
     batch_shuffle: true
     batch_size:

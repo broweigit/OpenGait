@@ -1,10 +1,13 @@
 import math
+import colorsys
+import os
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from functools import partial
+from PIL import Image, ImageDraw
 
 from .BiggerGait_SAM_3D_Body_projection_mask_based import (
     BiggerGait__SAM3DBody__Projection_Mask_Based_Gaitbase_Share,
@@ -18,6 +21,7 @@ class BiggerGait__SAM3DBody__Projection_UV_Based_Gaitbase_Share(
     def build_network(self, model_cfg):
         super().build_network(model_cfg)
         uv_cfg = model_cfg.get("uv_cfg", {})
+        self.debug_uv_export = model_cfg.get("debug_uv_export", False)
         atlas_size = uv_cfg.get("atlas_size", [64, 64])
         if len(atlas_size) != 2:
             raise ValueError(f"uv_cfg.atlas_size must be [H, W], got {atlas_size}")
@@ -157,6 +161,37 @@ class BiggerGait__SAM3DBody__Projection_UV_Based_Gaitbase_Share(
         vertex_valid = vertex_count.squeeze(-1) > 0
         return vertex_feat, vertex_valid
 
+    def accumulate_pixel_features_to_vertices_with_counts(
+        self, feat_map, vertex_index_map, num_verts
+    ):
+        bsz, channels, _, _ = feat_map.shape
+        flat_feat = rearrange(feat_map, "b c h w -> b (h w) c")
+        flat_idx = vertex_index_map.view(bsz, -1)
+        valid_mask = flat_idx >= 0
+
+        vertex_feat = feat_map.new_zeros((bsz * num_verts, channels))
+        vertex_count = feat_map.new_zeros((bsz * num_verts, 1))
+
+        if valid_mask.any():
+            batch_offsets = (
+                torch.arange(bsz, device=feat_map.device).unsqueeze(1) * num_verts
+            )
+            global_ids = (flat_idx + batch_offsets).reshape(-1)
+            valid_flat = valid_mask.reshape(-1)
+            global_ids = global_ids[valid_flat]
+            valid_feat = flat_feat.reshape(-1, channels)[valid_flat]
+
+            vertex_feat.index_add_(0, global_ids, valid_feat)
+            vertex_count.index_add_(
+                0, global_ids, vertex_count.new_ones((global_ids.numel(), 1))
+            )
+
+        vertex_feat = vertex_feat.view(bsz, num_verts, channels)
+        vertex_count = vertex_count.view(bsz, num_verts, 1)
+        vertex_feat = vertex_feat / vertex_count.clamp_min(1.0)
+        vertex_valid = vertex_count.squeeze(-1) > 0
+        return vertex_feat, vertex_valid, vertex_count.squeeze(-1)
+
     def scatter_vertices_to_uv(self, vertex_feat, vertex_valid, uv_coords):
         bsz, num_verts, channels = vertex_feat.shape
         uv_x = (uv_coords[..., 0] * (self.uv_w - 1)).round().long().clamp(0, self.uv_w - 1)
@@ -191,17 +226,41 @@ class BiggerGait__SAM3DBody__Projection_UV_Based_Gaitbase_Share(
         )
         return uv_feat, uv_valid
 
-    def build_uv_atlas(self, human_feat, pose_out, pred_verts, pred_cam_t, cam_int, target_h, target_w):
+    def build_uv_atlas(
+        self,
+        human_feat,
+        pose_out,
+        pred_verts,
+        pred_cam_t,
+        cam_int,
+        target_h,
+        target_w,
+        src_idx_map=None,
+        return_aux=False,
+    ):
         feat_h, feat_w = human_feat.shape[-2:]
-        src_idx_map, _ = self.get_source_vertex_index_map(
-            pred_verts, pred_cam_t, cam_int, feat_h, feat_w, target_h, target_w
-        )
-        vertex_feat, vertex_valid = self.accumulate_pixel_features_to_vertices(
-            human_feat, src_idx_map, pred_verts.shape[1]
+        if src_idx_map is None:
+            src_idx_map, _ = self.get_source_vertex_index_map(
+                pred_verts, pred_cam_t, cam_int, feat_h, feat_w, target_h, target_w
+            )
+        vertex_feat, vertex_valid, vertex_count = (
+            self.accumulate_pixel_features_to_vertices_with_counts(
+                human_feat, src_idx_map, pred_verts.shape[1]
+            )
         )
         canonical_verts = self.generate_mhr_apose_vertices(pose_out)
         uv_coords = self.build_cylindrical_pseudo_uv(canonical_verts)
-        return self.scatter_vertices_to_uv(vertex_feat, vertex_valid, uv_coords)
+        uv_feat, uv_valid = self.scatter_vertices_to_uv(vertex_feat, vertex_valid, uv_coords)
+        if not return_aux:
+            return uv_feat, uv_valid
+        return uv_feat, uv_valid, {
+            "src_idx_map": src_idx_map,
+            "vertex_feat": vertex_feat,
+            "vertex_valid": vertex_valid,
+            "vertex_count": vertex_count,
+            "canonical_verts": canonical_verts,
+            "uv_coords": uv_coords,
+        }
 
     def uv_grid_pool(self, x):
         n, c, h, w = x.shape
@@ -354,6 +413,167 @@ class BiggerGait__SAM3DBody__Projection_UV_Based_Gaitbase_Share(
             return None
         return torch.stack(vis_frames, dim=0)
 
+    def _get_uv_debug_export_root(self):
+        return os.path.join(self.save_path, "uv_debug", f"iter_{self.iteration + 1:05d}")
+
+    def _save_ascii_ply(self, verts, colors, save_path, valid_mask=None):
+        verts = verts.detach().float().cpu()
+        colors = colors.detach().float().cpu()
+
+        if valid_mask is not None:
+            valid_mask = valid_mask.detach().bool().cpu()
+            if int(valid_mask.sum().item()) == 0:
+                self.msg_mgr.log_warning(f"[UV] No valid vertices to save: {save_path}")
+                return
+            verts = verts[valid_mask]
+            colors = colors[valid_mask]
+
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        verts_np = verts.numpy()
+        colors_np = (colors.clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
+
+        with open(save_path, "w", encoding="utf-8") as f:
+            f.write("ply\nformat ascii 1.0\n")
+            f.write(f"element vertex {verts_np.shape[0]}\n")
+            f.write("property float x\nproperty float y\nproperty float z\n")
+            f.write("property uchar red\nproperty uchar green\nproperty uchar blue\n")
+            f.write("end_header\n")
+            for (x, y, z), (r, g, b) in zip(verts_np, colors_np):
+                f.write(f"{x:.6f} {-y:.6f} {-z:.6f} {int(r)} {int(g)} {int(b)}\n")
+
+    def _feature_pca_colors(self, feats, valid_mask):
+        feats = feats.detach().float().cpu()
+        valid_mask = valid_mask.detach().bool().cpu()
+        colors = torch.full((feats.shape[0], 3), 0.18, dtype=torch.float32)
+        if int(valid_mask.sum().item()) < 3:
+            return colors
+
+        valid_feats = feats[valid_mask]
+        valid_feats = valid_feats - valid_feats.mean(dim=0, keepdim=True)
+        q = min(3, valid_feats.shape[0], valid_feats.shape[1])
+        _, _, v = torch.pca_lowrank(valid_feats, q=q)
+        proj = valid_feats @ v[:, :q]
+        if q < 3:
+            proj = F.pad(proj, (0, 3 - q))
+
+        proj_min = proj.min(dim=0, keepdim=True)[0]
+        proj_max = proj.max(dim=0, keepdim=True)[0]
+        proj = (proj - proj_min) / (proj_max - proj_min + 1e-6)
+        colors[valid_mask] = 0.1 + 0.9 * proj
+        return colors
+
+    def _height_angle_colors(self, canonical_verts):
+        canonical_verts = canonical_verts.detach().float().cpu()
+        x, y, z = canonical_verts.unbind(-1)
+        y_min = y.min()
+        y_max = y.max()
+        height = (y - y_min) / (y_max - y_min + 1e-6)
+        angle = (torch.atan2(x, z) + math.pi) / (2.0 * math.pi)
+
+        colors = []
+        for ang, hgt in zip(angle.tolist(), height.tolist()):
+            r, g, b = colorsys.hsv_to_rgb(ang, 0.9, 0.25 + 0.75 * hgt)
+            colors.append((r, g, b))
+        return torch.tensor(colors, dtype=torch.float32)
+
+    def _save_uv_reference_png(
+        self, uv_coords, colors, save_path, valid_mask=None, canvas_hw=(768, 768)
+    ):
+        uv_coords = uv_coords.detach().float().cpu()
+        colors = colors.detach().float().cpu()
+        if valid_mask is not None:
+            valid_mask = valid_mask.detach().bool().cpu()
+        else:
+            valid_mask = torch.ones(uv_coords.shape[0], dtype=torch.bool)
+
+        canvas_h, canvas_w = canvas_hw
+        img = Image.new("RGB", (canvas_w, canvas_h), (18, 18, 18))
+        draw = ImageDraw.Draw(img)
+
+        grid_color = (55, 55, 55)
+        for row in range(self.uv_pool_rows + 1):
+            y = int(round(row * (canvas_h - 1) / self.uv_pool_rows))
+            draw.line((0, y, canvas_w - 1, y), fill=grid_color, width=1)
+        for col in range(self.uv_pool_cols + 1):
+            x = int(round(col * (canvas_w - 1) / self.uv_pool_cols))
+            draw.line((x, 0, x, canvas_h - 1), fill=grid_color, width=1)
+
+        draw.rectangle((0, 0, canvas_w - 1, canvas_h - 1), outline=(180, 180, 180), width=2)
+
+        for idx in range(uv_coords.shape[0]):
+            if not bool(valid_mask[idx]):
+                continue
+            u, v = uv_coords[idx].tolist()
+            x = int(round(u * (canvas_w - 1)))
+            y = int(round(v * (canvas_h - 1)))
+            color = tuple(int(255 * c) for c in colors[idx].tolist())
+            radius = 3
+            draw.ellipse((x - radius, y - radius, x + radius, y + radius), fill=color)
+
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        img.save(save_path)
+
+    def _export_uv_debug_artifacts(
+        self,
+        label_value,
+        canonical_verts,
+        uv_coords,
+        per_fpn_vertex_feat,
+        per_fpn_vertex_valid,
+    ):
+        if not self.training or not torch.distributed.is_initialized():
+            return
+        if torch.distributed.get_rank() != 0:
+            return
+
+        save_root = self._get_uv_debug_export_root()
+        os.makedirs(save_root, exist_ok=True)
+        label_str = str(int(label_value)) if torch.is_tensor(label_value) else str(label_value)
+
+        canonical_verts = canonical_verts.detach().float().cpu()
+        uv_coords = uv_coords.detach().float().cpu()
+
+        geom_colors = self._height_angle_colors(canonical_verts)
+        geom_ply_path = os.path.join(save_root, f"seq0_label{label_str}_geom_height_angle.ply")
+        self._save_ascii_ply(canonical_verts, geom_colors, geom_ply_path)
+
+        uv_png_path = os.path.join(save_root, f"seq0_label{label_str}_geom_height_angle_uv.png")
+        self._save_uv_reference_png(uv_coords, geom_colors, uv_png_path)
+
+        body_span = canonical_verts[:, 0].max() - canonical_verts[:, 0].min()
+        spacing = max(float(body_span.item()) * 1.8, 0.8)
+        pca_verts_all = []
+        pca_colors_all = []
+
+        for fpn_idx, (vertex_feat, vertex_valid) in enumerate(
+            zip(per_fpn_vertex_feat, per_fpn_vertex_valid)
+        ):
+            vertex_feat = vertex_feat.detach().float().cpu()
+            vertex_valid = vertex_valid.detach().bool().cpu()
+            shifted_verts = canonical_verts.clone()
+            shifted_verts[:, 0] += fpn_idx * spacing
+            pca_colors = self._feature_pca_colors(vertex_feat, vertex_valid)
+
+            if int(vertex_valid.sum().item()) == 0:
+                continue
+            pca_verts_all.append(shifted_verts[vertex_valid])
+            pca_colors_all.append(pca_colors[vertex_valid])
+
+        if pca_verts_all:
+            pca_ply_path = os.path.join(save_root, f"seq0_label{label_str}_fpn_feature_pca.ply")
+            self._save_ascii_ply(
+                torch.cat(pca_verts_all, dim=0),
+                torch.cat(pca_colors_all, dim=0),
+                pca_ply_path,
+            )
+            self.msg_mgr.log_info(
+                f"[UV] Saved temporary UV debug exports to {save_root}"
+            )
+        else:
+            self.msg_mgr.log_warning(
+                f"[UV] No valid FPN vertex features found for temporary export at {save_root}"
+            )
+
     def forward(self, inputs):
         ipts, labs, _, _, seqL = inputs
         rgb = ipts[0]
@@ -361,6 +581,7 @@ class BiggerGait__SAM3DBody__Projection_UV_Based_Gaitbase_Share(
 
         rgb_chunks = torch.chunk(rgb, (rgb.size(1) // self.chunk_size) + 1, dim=1)
         should_log_pca_vis = self.debug_pca_vis and self._should_log_visual_summary()
+        should_export_uv_debug = self.debug_uv_export and self._should_log_visual_summary()
         pca_uv_before_cnn_summary = None
         pca_uv_after_cnn_summary = None
         uv_valid_mask_summary = None
@@ -368,6 +589,11 @@ class BiggerGait__SAM3DBody__Projection_UV_Based_Gaitbase_Share(
         uv_layer2_norm_summary = None
         uv_layer3_norm_summary = None
         uv_layer4_norm_summary = None
+        debug_seq0_feat_sum = None
+        debug_seq0_feat_count = None
+        debug_seq0_canonical_sum = None
+        debug_seq0_uv_sum = None
+        debug_seq0_frame_count = 0
         all_outs = []
         target_h, target_w = self.image_size * 2, self.image_size
         h_feat, w_feat = target_h // 16, target_w // 16
@@ -444,15 +670,45 @@ class BiggerGait__SAM3DBody__Projection_UV_Based_Gaitbase_Share(
                 reduced_feat = self.HumanSpace_Conv[i](sub_app)
                 processed_feat_list.append(reduced_feat)
 
-            human_feat = torch.concat(processed_feat_list, dim=1)
             human_mask = self.preprocess(
                 generated_mask, self.sils_size * 2, self.sils_size
             ).detach().clone()
-            human_feat = human_feat * (human_mask > 0.5).to(human_feat)
+            human_mask_bool = (human_mask > 0.5).to(dtype=processed_feat_list[0].dtype)
+            processed_feat_list = [feat * human_mask_bool for feat in processed_feat_list]
+            human_feat = torch.concat(processed_feat_list, dim=1)
 
-            uv_feat, uv_valid_mask = self.build_uv_atlas(
-                human_feat, pose_out, pred_verts, pred_cam_t, cam_int, target_h, target_w
+            src_idx_map, _ = self.get_source_vertex_index_map(
+                pred_verts,
+                pred_cam_t,
+                cam_int,
+                human_feat.shape[-2],
+                human_feat.shape[-1],
+                target_h,
+                target_w,
             )
+            if should_log_pca_vis or should_export_uv_debug:
+                uv_feat, uv_valid_mask, uv_aux = self.build_uv_atlas(
+                    human_feat,
+                    pose_out,
+                    pred_verts,
+                    pred_cam_t,
+                    cam_int,
+                    target_h,
+                    target_w,
+                    src_idx_map=src_idx_map,
+                    return_aux=True,
+                )
+            else:
+                uv_feat, uv_valid_mask = self.build_uv_atlas(
+                    human_feat,
+                    pose_out,
+                    pred_verts,
+                    pred_cam_t,
+                    cam_int,
+                    target_h,
+                    target_w,
+                    src_idx_map=src_idx_map,
+                )
             uv_feat = uv_feat * uv_valid_mask.to(dtype=uv_feat.dtype)
             uv_feat_5d = rearrange(
                 uv_feat.view(n, s, -1, self.uv_h, self.uv_w),
@@ -462,6 +718,52 @@ class BiggerGait__SAM3DBody__Projection_UV_Based_Gaitbase_Share(
                 uv_valid_mask.view(n, s, 1, self.uv_h, self.uv_w),
                 "n s c h w -> n c s h w",
             ).contiguous()
+
+            if should_export_uv_debug:
+                num_verts = pred_verts.shape[1]
+                if debug_seq0_feat_sum is None:
+                    debug_seq0_feat_sum = [
+                        torch.zeros(
+                            (num_verts, processed_feat_list[i].shape[1]),
+                            device=processed_feat_list[i].device,
+                            dtype=torch.float32,
+                        )
+                        for i in range(self.num_FPN)
+                    ]
+                    debug_seq0_feat_count = [
+                        torch.zeros((num_verts,), device=processed_feat_list[i].device, dtype=torch.float32)
+                        for i in range(self.num_FPN)
+                    ]
+                    debug_seq0_canonical_sum = torch.zeros(
+                        (num_verts, 3),
+                        device=uv_aux["canonical_verts"].device,
+                        dtype=torch.float32,
+                    )
+                    debug_seq0_uv_sum = torch.zeros(
+                        (num_verts, 2),
+                        device=uv_aux["uv_coords"].device,
+                        dtype=torch.float32,
+                    )
+
+                seq0_src_idx = src_idx_map.view(n, s, human_feat.shape[-2], human_feat.shape[-1])[0]
+                seq0_canonical = uv_aux["canonical_verts"].view(n, s, num_verts, 3)[0].detach().float()
+                seq0_uv = uv_aux["uv_coords"].view(n, s, num_verts, 2)[0].detach().float()
+
+                debug_seq0_canonical_sum += seq0_canonical.sum(dim=0)
+                debug_seq0_uv_sum += seq0_uv.sum(dim=0)
+                debug_seq0_frame_count += seq0_canonical.shape[0]
+
+                for i in range(self.num_FPN):
+                    seq0_feat_map = processed_feat_list[i].view(
+                        n, s, processed_feat_list[i].shape[1], human_feat.shape[-2], human_feat.shape[-1]
+                    )[0]
+                    vertex_feat, _, vertex_count = self.accumulate_pixel_features_to_vertices_with_counts(
+                        seq0_feat_map, seq0_src_idx, num_verts
+                    )
+                    debug_seq0_feat_sum[i] += (
+                        vertex_feat * vertex_count.unsqueeze(-1)
+                    ).sum(dim=0).detach().float()
+                    debug_seq0_feat_count[i] += vertex_count.sum(dim=0).detach().float()
 
             debug_test_1 = should_log_pca_vis and (chunk_idx == num_rgb_chunks - 1)
             test_1_outputs = self.Gait_Net.test_1(uv_feat_5d, return_debug=debug_test_1)
@@ -533,6 +835,21 @@ class BiggerGait__SAM3DBody__Projection_UV_Based_Gaitbase_Share(
         embed_list, log_list = self.uv_test_2(
             self.Gait_Net, torch.cat(all_outs, dim=2), seqL
         )
+
+        if should_export_uv_debug and debug_seq0_frame_count > 0:
+            mean_canonical = debug_seq0_canonical_sum / float(debug_seq0_frame_count)
+            mean_uv = debug_seq0_uv_sum / float(debug_seq0_frame_count)
+            per_fpn_vertex_feat = []
+            per_fpn_vertex_valid = []
+            for i in range(self.num_FPN):
+                valid = debug_seq0_feat_count[i] > 0
+                feat = debug_seq0_feat_sum[i] / debug_seq0_feat_count[i].unsqueeze(-1).clamp_min(1.0)
+                per_fpn_vertex_feat.append(feat)
+                per_fpn_vertex_valid.append(valid)
+
+            self._export_uv_debug_artifacts(
+                labs[0], mean_canonical, mean_uv, per_fpn_vertex_feat, per_fpn_vertex_valid
+            )
 
         if self.training:
             retval = {

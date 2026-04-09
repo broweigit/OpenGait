@@ -25,57 +25,42 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_PostCNN_TargetMask_Gaitbase_Shar
         resized_mask = F.interpolate(
             target_valid_mask.float(), size=(h, w), mode="nearest"
         )
-        resized_mask = (resized_mask > 0.5).float()
+        resized_mask = 1.0 - (resized_mask > 0.5).float()
         resized_mask = rearrange(
             resized_mask, "(n s) c h w -> n c s h w", n=n, s=s
         ).contiguous()
         masked_outs = outs * resized_mask.to(dtype=outs.dtype)
         return masked_outs, resized_mask
 
-    @staticmethod
-    def _masked_hpp(x, mask, bin_num):
-        n, c = x.size()[:2]
-        features = []
-        mask = mask.float()
-        for b in bin_num:
-            feat_bin = x.view(n, c, b, -1)
-            mask_bin = mask.view(n, 1, b, -1)
-            valid_count = mask_bin.sum(-1).clamp_min(1.0)
-            feat_mean = (feat_bin * mask_bin).sum(-1) / valid_count
+    def _build_reverse_mask_grad_vis(
+        self, precnn_feat, reverse_masked_outs, depth_maps, max_frames=5
+    ):
+        input_chunks = torch.chunk(precnn_feat, self.num_FPN, dim=1)
+        output_chunks = torch.chunk(reverse_masked_outs, self.num_FPN, dim=1)
+        grad_vis = []
 
-            valid_part = mask_bin.sum(-1) > 0
-            feat_max = feat_bin.masked_fill(
-                ~valid_part.unsqueeze(-1).expand(-1, -1, -1, feat_bin.size(-1)),
-                -100.0,
-            ).max(-1)[0]
-            feat_max = torch.where(
-                valid_part.expand(-1, c, -1), feat_max, torch.zeros_like(feat_max)
+        for i, out_chunk in enumerate(output_chunks):
+            out_flat = rearrange(out_chunk, "n c s h w -> (n s) c h w").contiguous()
+            num_frames = min(max_frames, out_flat.shape[0], depth_maps.shape[0])
+            if num_frames == 0:
+                grad_vis.append(None)
+                continue
+
+            score = out_flat[:num_frames].pow(2).sum()
+            grad_all = torch.autograd.grad(
+                score, precnn_feat, retain_graph=True, allow_unused=False
+            )[0]
+            grad_chunk = torch.chunk(grad_all, self.num_FPN, dim=1)[i]
+            contrib = (grad_chunk * input_chunks[i]).abs()
+            contrib_flat = rearrange(
+                contrib, "n c s h w -> (n s) c h w"
+            ).contiguous()[:num_frames]
+            grad_vis.append(
+                self._build_feature_norm_on_depth_vis_batch(
+                    depth_maps[:num_frames], contrib_flat
+                )
             )
-            features.append(feat_mean + feat_max)
-        return torch.cat(features, dim=-1)
-
-    def _masked_single_test_2(self, gait_single, outs, mask, seqL):
-        outs = gait_single.TP(outs, seqL, options={"dim": 2})[0]
-        mask = gait_single.TP(mask, seqL, options={"dim": 2})[0]
-        if gait_single.vertical_pooling:
-            outs = outs.transpose(2, 3).contiguous()
-            mask = mask.transpose(2, 3).contiguous()
-        outs = self._masked_hpp(outs, mask, gait_single.HPP.bin_num)
-        embed_1 = gait_single.FCs(outs)
-        _, logits = gait_single.BNNecks(embed_1)
-        return embed_1, logits
-
-    def _masked_test_2(self, gait_net, x, mask, seqL):
-        x_list = torch.chunk(x, gait_net.num_FPN, dim=1)
-        embed_list = []
-        log_list = []
-        for i in range(gait_net.num_FPN):
-            embed_1, logits = self._masked_single_test_2(
-                gait_net.Gait_List[i], x_list[i], mask, seqL
-            )
-            embed_list.append(embed_1)
-            log_list.append(logits)
-        return embed_list, log_list
+        return self._stack_fpn_vis(grad_vis)
 
     def forward(self, inputs):
         ipts, labs, _, _, seqL = inputs
@@ -92,8 +77,8 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_PostCNN_TargetMask_Gaitbase_Shar
         branch_layer4_norm = [None] * self.num_branches
         branch_target_depth = [None] * self.num_branches
         branch_postcnn_mask = [None] * self.num_branches
+        branch_reversemask_grad = [None] * self.num_branches
         all_outs = [[] for _ in range(self.num_branches)]
-        all_masks = [[] for _ in range(self.num_branches)]
         target_h, target_w = self.image_size * 2, self.image_size
         h_feat, w_feat = target_h // 16, target_w // 16
 
@@ -221,8 +206,14 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_PostCNN_TargetMask_Gaitbase_Shar
                             )
                         )
                     branch_pca_before_cnn[b_idx] = self._stack_fpn_vis(pca_before_vis)
-                    outs, gait_debug = self.Gait_Nets[b_idx].test_1(
-                        warp_feat_5d, return_debug=True
+                    grad_input = warp_feat_5d.detach().requires_grad_(True)
+                    debug_outs, gait_debug = self.Gait_Nets[b_idx].test_1(
+                        grad_input, return_debug=True
+                    )
+                    reverse_masked_debug_outs, debug_post_cnn_mask = (
+                        self._apply_post_cnn_target_mask(
+                            debug_outs, branch_valid_masks[b_idx]
+                        )
                     )
                     layer1_vis = []
                     layer2_vis = []
@@ -265,7 +256,27 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_PostCNN_TargetMask_Gaitbase_Shar
                     branch_layer2_norm[b_idx] = self._stack_fpn_vis(layer2_vis)
                     branch_layer3_norm[b_idx] = self._stack_fpn_vis(layer3_vis)
                     branch_layer4_norm[b_idx] = self._stack_fpn_vis(layer4_vis)
-                elif self.training:
+                    branch_reversemask_grad[b_idx] = self._build_reverse_mask_grad_vis(
+                        grad_input,
+                        reverse_masked_debug_outs,
+                        branch_target_depth[b_idx][:5],
+                    )
+                    pca_vis = []
+                    for out_chunk in torch.chunk(
+                        reverse_masked_debug_outs, self.num_FPN, dim=1
+                    ):
+                        pca_vis.append(
+                            self._build_pca_vis_batch(
+                                rearrange(out_chunk, "n c s h w -> (n s) c h w").contiguous()[:5]
+                            )
+                        )
+                    branch_pca_after_cnn[b_idx] = self._stack_fpn_vis(pca_vis)
+                    branch_postcnn_mask[b_idx] = (
+                        rearrange(debug_post_cnn_mask, "n c s h w -> (n s) c h w")
+                        .contiguous()[:5]
+                        .repeat(1, 3, 1, 1)
+                    )
+                if self.training:
                     outs = torch.utils.checkpoint.checkpoint(
                         self.Gait_Nets[b_idx].test_1,
                         warp_feat_5d,
@@ -274,35 +285,17 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_PostCNN_TargetMask_Gaitbase_Shar
                 else:
                     outs = self.Gait_Nets[b_idx].test_1(warp_feat_5d)
 
-                outs, post_cnn_mask = self._apply_post_cnn_target_mask(
+                outs, _ = self._apply_post_cnn_target_mask(
                     outs, branch_valid_masks[b_idx]
                 )
-                if debug_test_1:
-                    pca_vis = []
-                    for out_chunk in torch.chunk(outs, self.num_FPN, dim=1):
-                        pca_vis.append(
-                            self._build_pca_vis_batch(
-                                rearrange(out_chunk, "n c s h w -> (n s) c h w").contiguous()[:5]
-                            )
-                        )
-                    branch_pca_after_cnn[b_idx] = self._stack_fpn_vis(pca_vis)
-                    branch_postcnn_mask[b_idx] = (
-                        rearrange(post_cnn_mask, "n c s h w -> (n s) c h w")
-                        .contiguous()[:5]
-                        .repeat(1, 3, 1, 1)
-                    )
                 all_outs[b_idx].append(outs)
-                all_masks[b_idx].append(post_cnn_mask)
 
         embed_grouped = [[] for _ in range(self.num_FPN)]
         log_grouped = [[] for _ in range(self.num_FPN)]
 
         for b_idx in range(self.num_branches):
             branch_seq_feat = torch.cat(all_outs[b_idx], dim=2)
-            branch_seq_mask = torch.cat(all_masks[b_idx], dim=2)
-            e_list, l_list = self._masked_test_2(
-                self.Gait_Nets[b_idx], branch_seq_feat, branch_seq_mask, seqL
-            )
+            e_list, l_list = self.Gait_Nets[b_idx].test_2(branch_seq_feat, seqL)
             for i in range(self.num_FPN):
                 embed_grouped[i].append(e_list[i])
                 log_grouped[i].append(l_list[i])
@@ -316,6 +309,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_PostCNN_TargetMask_Gaitbase_Shar
         cnn_layer3_norm_summary = self._stack_branch_vis(branch_layer3_norm)
         cnn_layer4_norm_summary = self._stack_branch_vis(branch_layer4_norm)
         post_cnn_mask_summary = self._stack_branch_vis(branch_postcnn_mask)
+        reversemask_grad_summary = self._stack_branch_vis(branch_reversemask_grad)
 
         if self.training:
             retval = {
@@ -362,6 +356,10 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_PostCNN_TargetMask_Gaitbase_Shar
             if post_cnn_mask_summary is not None:
                 retval["visual_summary"]["image/post_cnn_target_mask"] = (
                     post_cnn_mask_summary.float()
+                )
+            if reversemask_grad_summary is not None:
+                retval["visual_summary"]["image/reversemask_grad_attribution"] = (
+                    reversemask_grad_summary.float()
                 )
         else:
             retval = {
