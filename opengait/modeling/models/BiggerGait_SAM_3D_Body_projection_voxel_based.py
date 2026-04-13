@@ -354,6 +354,9 @@ class BiggerGait__SAM3DBody__Projection_Voxel_Based_Gaitbase_Share(
         self.grid_w = int(grid_size[2])
         self.depth_center_mode = voxel_cfg.get("depth_center_mode", "bbox_mid")
         self.depth_center_offset = float(voxel_cfg.get("depth_center_offset", 0.0))
+        self.temporal_window = int(voxel_cfg.get("temporal_window", 1))
+        if self.temporal_window < 1:
+            raise ValueError(f"voxel_cfg.temporal_window must be >= 1, got {self.temporal_window}")
 
         self.Gait_Net = VoxelBaselineShareTime_2B(model_cfg)
         self.HumanSpace_Conv = nn.ModuleList([
@@ -543,6 +546,73 @@ class BiggerGait__SAM3DBody__Projection_Voxel_Based_Gaitbase_Share(
         colors[valid_mask] = heat[valid_mask]
         return colors
 
+    @staticmethod
+    def _concat_seq_chunks(chunk_tensors, batch_size):
+        if not chunk_tensors:
+            raise ValueError("chunk_tensors must not be empty")
+        seq_tensors = []
+        for tensor in chunk_tensors:
+            if tensor.shape[0] % batch_size != 0:
+                raise ValueError(
+                    f"Chunk leading dim {tensor.shape[0]} is not divisible by batch_size {batch_size}"
+                )
+            seq_len = tensor.shape[0] // batch_size
+            seq_tensors.append(tensor.view(batch_size, seq_len, *tensor.shape[1:]))
+        merged = torch.cat(seq_tensors, dim=1).contiguous()
+        return merged.view(batch_size * merged.shape[1], *merged.shape[2:])
+
+    def _concat_seq_chunk_dicts(self, chunk_dicts, batch_size):
+        if not chunk_dicts:
+            raise ValueError("chunk_dicts must not be empty")
+        merged = {}
+        keys = chunk_dicts[0].keys()
+        for key in keys:
+            value0 = chunk_dicts[0][key]
+            if torch.is_tensor(value0):
+                merged[key] = self._concat_seq_chunks([chunk[key] for chunk in chunk_dicts], batch_size)
+            else:
+                merged[key] = value0
+        return merged
+
+    def _aggregate_temporal_vertices(self, canonical_points, vertex_feat, vertex_valid, batch_size, seq_len):
+        if self.temporal_window <= 1:
+            return canonical_points, vertex_feat, vertex_valid
+
+        num_verts = canonical_points.shape[1]
+        feat_dim = vertex_feat.shape[-1]
+        span = self.temporal_window
+
+        points_seq = canonical_points.view(batch_size, seq_len, num_verts, 3)
+        feats_seq = vertex_feat.view(batch_size, seq_len, num_verts, feat_dim)
+        valid_seq = vertex_valid.view(batch_size, seq_len, num_verts)
+
+        pad_points = points_seq.new_zeros((batch_size, span, num_verts, 3))
+        pad_feats = feats_seq.new_zeros((batch_size, span, num_verts, feat_dim))
+        pad_valid = valid_seq.new_zeros((batch_size, span, num_verts), dtype=torch.bool)
+
+        points_pad = torch.cat([pad_points, points_seq, pad_points], dim=1)
+        feats_pad = torch.cat([pad_feats, feats_seq, pad_feats], dim=1)
+        valid_pad = torch.cat([pad_valid, valid_seq, pad_valid], dim=1)
+
+        point_windows = []
+        feat_windows = []
+        valid_windows = []
+        for offset in range(-span, span + 1):
+            start = span + offset
+            end = start + seq_len
+            point_windows.append(points_pad[:, start:end])
+            feat_windows.append(feats_pad[:, start:end])
+            valid_windows.append(valid_pad[:, start:end])
+
+        point_windows = torch.stack(point_windows, dim=2)
+        feat_windows = torch.stack(feat_windows, dim=2)
+        valid_windows = torch.stack(valid_windows, dim=2)
+
+        agg_points = rearrange(point_windows, "n s t v c -> (n s) (t v) c").contiguous()
+        agg_feats = rearrange(feat_windows, "n s t v c -> (n s) (t v) c").contiguous()
+        agg_valid = rearrange(valid_windows, "n s t v -> (n s) (t v)").contiguous()
+        return agg_points, agg_feats, agg_valid
+
     def _figure_to_tensor(self, fig):
         canvas = FigureCanvas(fig)
         canvas.draw()
@@ -559,7 +629,7 @@ class BiggerGait__SAM3DBody__Projection_Voxel_Based_Gaitbase_Share(
         canvas_hw=(256, 256),
         max_points=12000,
         point_size=4.0,
-        view_mode="front",
+        view_mode="angled",
     ):
         points = points.detach().float().cpu()
         colors = colors.detach().float().cpu().clamp(0.0, 1.0)
@@ -602,20 +672,20 @@ class BiggerGait__SAM3DBody__Projection_Voxel_Based_Gaitbase_Share(
         ax.set_xlim(center[0] - radius, center[0] + radius)
         ax.set_ylim(center[1] - radius, center[1] + radius)
         ax.set_zlim(center[2] - radius, center[2] + radius)
-        if view_mode == "front":
+        if view_mode == "angled":
+            try:
+                ax.set_proj_type("persp")
+            except Exception:
+                pass
+            ax.set_box_aspect((1.0, 1.0, 2.0))
+            ax.view_init(elev=30.0, azim=45.0)
+        elif view_mode == "front":
             try:
                 ax.set_proj_type("ortho")
             except Exception:
                 pass
             ax.set_box_aspect((1.0, 0.35, 2.0))
             ax.view_init(elev=6.0, azim=-90.0)
-        elif view_mode == "iso":
-            try:
-                ax.set_proj_type("persp")
-            except Exception:
-                pass
-            ax.set_box_aspect((1.0, 1.0, 2.0))
-            ax.view_init(elev=20.0, azim=35.0)
         else:
             raise ValueError(f"Unsupported pointcloud view_mode: {view_mode}")
         ax.set_axis_off()
@@ -629,7 +699,7 @@ class BiggerGait__SAM3DBody__Projection_Voxel_Based_Gaitbase_Share(
         valid_mask,
         color_mode="pca",
         canvas_hw=(256, 256),
-        point_size=14.0,
+        point_size=8.0,
         max_points=16000,
     ):
         centers = centers.detach().float().cpu()
@@ -658,7 +728,7 @@ class BiggerGait__SAM3DBody__Projection_Voxel_Based_Gaitbase_Share(
             canvas_hw=canvas_hw,
             max_points=max_points,
             point_size=point_size,
-            view_mode="front",
+            view_mode="angled",
         )
 
     def _build_pointcloud_pca_3d_vis_batch(
@@ -687,8 +757,8 @@ class BiggerGait__SAM3DBody__Projection_Voxel_Based_Gaitbase_Share(
                     points,
                     colors,
                     valid_mask=valid_mask,
-                    point_size=5.0,
-                    view_mode="front",
+                    point_size=3.0,
+                    view_mode="angled",
                 )
             )
         if not vis_frames:
@@ -716,7 +786,7 @@ class BiggerGait__SAM3DBody__Projection_Voxel_Based_Gaitbase_Share(
                     feat_batch[idx],
                     valid_mask_batch[idx],
                     color_mode=color_mode,
-                    point_size=14.0,
+                    point_size=8.0,
                 )
             )
         if not vis_frames:
@@ -782,6 +852,8 @@ class BiggerGait__SAM3DBody__Projection_Voxel_Based_Gaitbase_Share(
         cam_int_src,
         target_h,
         target_w,
+        batch_size=None,
+        seq_len=None,
     ):
         src_idx_map, _ = self.get_source_vertex_index_map(
             pred_verts,
@@ -823,6 +895,17 @@ class BiggerGait__SAM3DBody__Projection_Voxel_Based_Gaitbase_Share(
             target_h,
             target_w,
         )
+
+        if self.temporal_window > 1:
+            if batch_size is None or seq_len is None:
+                raise ValueError("batch_size and seq_len are required when temporal_window > 1")
+            canonical_points, vertex_feat, vertex_valid = self._aggregate_temporal_vertices(
+                canonical_points,
+                vertex_feat,
+                vertex_valid,
+                batch_size,
+                seq_len,
+            )
 
         v_cam = canonical_points + cam_t_tgt.unsqueeze(1)
         x, y, z = v_cam.unbind(-1)
@@ -925,7 +1008,8 @@ class BiggerGait__SAM3DBody__Projection_Voxel_Based_Gaitbase_Share(
 
         rgb_chunks = torch.chunk(rgb, (rgb.size(1) // self.chunk_size) + 1, dim=1)
         should_log_pca_vis = self.debug_pca_vis and self._should_log_visual_summary()
-        all_outs = []
+        batch_size = rgb.size(0)
+        seq_len = rgb.size(1)
         target_h, target_w = self.image_size * 2, self.image_size
         h_feat, w_feat = target_h // 16, target_w // 16
 
@@ -936,9 +1020,16 @@ class BiggerGait__SAM3DBody__Projection_Voxel_Based_Gaitbase_Share(
         voxel_norm_before_summary = None
         voxel_norm_after_summary = None
         export_aux = None
+        human_feat_chunks = []
+        human_mask_chunks = []
+        generated_mask_chunks = []
+        pose_out_chunks = []
+        pred_verts_chunks = []
+        pred_cam_t_chunks = []
+        global_rot_chunks = []
+        cam_int_src_chunks = []
 
-        num_rgb_chunks = len(rgb_chunks)
-        for chunk_idx, rgb_img in enumerate(rgb_chunks):
+        for rgb_img in rgb_chunks:
             n, s, c, h, w = rgb_img.size()
             rgb_img = rearrange(rgb_img, "n s c h w -> (n s) c h w").contiguous()
             curr_bs = rgb_img.shape[0]
@@ -1025,123 +1116,140 @@ class BiggerGait__SAM3DBody__Projection_Voxel_Based_Gaitbase_Share(
                 self.sils_size,
             ).detach().clone()
             human_feat = human_feat * (human_mask > 0.5).to(human_feat)
+            human_feat_chunks.append(human_feat)
+            human_mask_chunks.append(human_mask.float())
+            generated_mask_chunks.append(generated_mask)
+            pose_out_chunks.append({k: v for k, v in pose_out.items() if torch.is_tensor(v)})
+            pred_verts_chunks.append(pred_verts)
+            pred_cam_t_chunks.append(pred_cam_t)
+            global_rot_chunks.append(global_rot)
+            cam_int_src_chunks.append(cam_int_src)
 
-            voxel_feat, _, aux_dict = self.build_voxel_volume(
-                human_feat,
-                human_mask.float(),
-                pose_out,
-                pred_verts,
-                pred_cam_t,
-                global_rot,
-                cam_int_src,
-                target_h,
-                target_w,
+        human_feat = self._concat_seq_chunks(human_feat_chunks, batch_size)
+        human_mask = self._concat_seq_chunks(human_mask_chunks, batch_size)
+        generated_mask = self._concat_seq_chunks(generated_mask_chunks, batch_size)
+        pose_out = self._concat_seq_chunk_dicts(pose_out_chunks, batch_size)
+        pred_verts = self._concat_seq_chunks(pred_verts_chunks, batch_size)
+        pred_cam_t = self._concat_seq_chunks(pred_cam_t_chunks, batch_size)
+        global_rot = self._concat_seq_chunks(global_rot_chunks, batch_size)
+        cam_int_src = self._concat_seq_chunks(cam_int_src_chunks, batch_size)
+
+        self._apose_cache = {}
+        voxel_feat, _, aux_dict = self.build_voxel_volume(
+            human_feat,
+            human_mask.float(),
+            pose_out,
+            pred_verts,
+            pred_cam_t,
+            global_rot,
+            cam_int_src,
+            target_h,
+            target_w,
+            batch_size=batch_size,
+            seq_len=seq_len,
+        )
+
+        voxel_feat_6d = rearrange(
+            voxel_feat.view(batch_size, seq_len, *voxel_feat.shape[1:]),
+            "n s c d h w -> n c s d h w",
+        ).contiguous()
+
+        if should_log_pca_vis:
+            outs, _ = self.Gait_Net.test_1(voxel_feat_6d, return_debug=True)
+        elif self.training:
+            outs = torch.utils.checkpoint.checkpoint(
+                self.Gait_Net.test_1,
+                voxel_feat_6d,
+                use_reentrant=False,
             )
+        else:
+            outs = self.Gait_Net.test_1(voxel_feat_6d)
 
-            voxel_feat_6d = rearrange(
-                voxel_feat.view(n, s, *voxel_feat.shape[1:]),
-                "n s c d h w -> n c s d h w",
-            ).contiguous()
+        target_mask_2d_summary = aux_dict["target_mask_2d"][:5].float()
+        export_aux = aux_dict
+        if should_log_pca_vis:
+            pointcloud_pca_vis = []
+            voxel_pca_before_vis = []
+            voxel_pca_after_vis = []
+            voxel_norm_before_vis = []
+            voxel_norm_after_vis = []
 
-            debug_test_1 = should_log_pca_vis and (chunk_idx == num_rgb_chunks - 1)
-            if debug_test_1:
-                outs, gait_debug = self.Gait_Net.test_1(voxel_feat_6d, return_debug=True)
-            elif self.training:
-                outs = torch.utils.checkpoint.checkpoint(
-                    self.Gait_Net.test_1,
-                    voxel_feat_6d,
-                    use_reentrant=False,
+            pre_voxel_occ = rearrange(aux_dict["voxel_occ"], "(n s) c d h w -> n c s d h w", n=batch_size, s=seq_len)
+            pre_voxel_centers = aux_dict["voxel_centers"]
+            pre_vertex_feat = rearrange(aux_dict["vertex_feat"], "(n s) v c -> n s v c", n=batch_size, s=seq_len)
+            pre_vertex_valid = rearrange(aux_dict["vertex_valid"], "(n s) v -> n s v", n=batch_size, s=seq_len)
+            canonical_points = rearrange(aux_dict["canonical_points"], "(n s) v c -> n s v c", n=batch_size, s=seq_len)
+
+            for i in range(self.num_FPN):
+                point_feat_chunk = torch.chunk(pre_vertex_feat, self.num_FPN, dim=-1)[i]
+                pointcloud_pca_vis.append(
+                    self._build_pointcloud_pca_3d_vis_batch(
+                        rearrange(canonical_points, "n s v c -> (n s) v c").contiguous()[:5],
+                        rearrange(point_feat_chunk, "n s v c -> (n s) v c").contiguous()[:5],
+                        rearrange(pre_vertex_valid, "n s v -> (n s) v").contiguous()[:5],
+                    )
                 )
-            else:
-                outs = self.Gait_Net.test_1(voxel_feat_6d)
-            all_outs.append(outs)
 
-            if chunk_idx == num_rgb_chunks - 1:
-                target_mask_2d_summary = aux_dict["target_mask_2d"][:5].float()
-                export_aux = aux_dict
-                if debug_test_1:
-                    pointcloud_pca_vis = []
-                    voxel_pca_before_vis = []
-                    voxel_pca_after_vis = []
-                    voxel_norm_before_vis = []
-                    voxel_norm_after_vis = []
+                pre_chunk = torch.chunk(voxel_feat_6d, self.num_FPN, dim=1)[i]
+                pre_chunk_flat = rearrange(pre_chunk, "n c s d h w -> (n s) c d h w").contiguous()
+                pre_occ_flat = rearrange(pre_voxel_occ, "n c s d h w -> (n s) c d h w").contiguous()
+                voxel_pca_before_vis.append(
+                    self._build_voxel_3d_vis_batch(
+                        pre_voxel_centers[:5],
+                        pre_chunk_flat[:5],
+                        pre_occ_flat[:5],
+                        color_mode="pca",
+                    )
+                )
+                voxel_norm_before_vis.append(
+                    self._build_voxel_3d_vis_batch(
+                        pre_voxel_centers[:5],
+                        pre_chunk_flat[:5],
+                        pre_occ_flat[:5],
+                        color_mode="norm",
+                    )
+                )
 
-                    pre_voxel_occ = rearrange(aux_dict["voxel_occ"], "(n s) c d h w -> n c s d h w", n=n, s=s)
-                    pre_voxel_centers = aux_dict["voxel_centers"]
-                    pre_vertex_feat = rearrange(aux_dict["vertex_feat"], "(n s) v c -> n s v c", n=n, s=s)
-                    pre_vertex_valid = rearrange(aux_dict["vertex_valid"], "(n s) v -> n s v", n=n, s=s)
-                    canonical_points = rearrange(aux_dict["canonical_points"], "(n s) v c -> n s v c", n=n, s=s)
+                out_chunk = torch.chunk(outs, self.num_FPN, dim=1)[i]
+                out_chunk_flat = rearrange(out_chunk, "n c s d h w -> (n s) c d h w").contiguous()
+                out_d, out_h, out_w = out_chunk_flat.shape[-3:]
+                post_centers = self._build_uniform_voxel_centers(
+                    aux_dict["x_min"],
+                    aux_dict["y_min"],
+                    aux_dict["z_min"],
+                    aux_dict["voxel_size"],
+                    out_d,
+                    out_h,
+                    out_w,
+                )
+                post_occ = self._resize_voxel_valid_mask(
+                    aux_dict["voxel_occ"],
+                    (out_d, out_h, out_w),
+                )
+                voxel_pca_after_vis.append(
+                    self._build_voxel_3d_vis_batch(
+                        post_centers[:5],
+                        out_chunk_flat[:5],
+                        post_occ[:5],
+                        color_mode="pca",
+                    )
+                )
+                voxel_norm_after_vis.append(
+                    self._build_voxel_3d_vis_batch(
+                        post_centers[:5],
+                        out_chunk_flat[:5],
+                        post_occ[:5],
+                        color_mode="norm",
+                    )
+                )
 
-                    for i in range(self.num_FPN):
-                        point_feat_chunk = torch.chunk(pre_vertex_feat, self.num_FPN, dim=-1)[i]
-                        pointcloud_pca_vis.append(
-                            self._build_pointcloud_pca_3d_vis_batch(
-                                rearrange(canonical_points, "n s v c -> (n s) v c").contiguous()[:5],
-                                rearrange(point_feat_chunk, "n s v c -> (n s) v c").contiguous()[:5],
-                                rearrange(pre_vertex_valid, "n s v -> (n s) v").contiguous()[:5],
-                            )
-                        )
+            pointcloud_pca_before_summary = self._tile_fpn_frame_vis(pointcloud_pca_vis)
+            voxel_pca_before_summary = self._tile_fpn_frame_vis(voxel_pca_before_vis)
+            voxel_pca_after_summary = self._tile_fpn_frame_vis(voxel_pca_after_vis)
+            voxel_norm_before_summary = self._tile_fpn_frame_vis(voxel_norm_before_vis)
+            voxel_norm_after_summary = self._tile_fpn_frame_vis(voxel_norm_after_vis)
 
-                        pre_chunk = torch.chunk(voxel_feat_6d, self.num_FPN, dim=1)[i]
-                        pre_chunk_flat = rearrange(pre_chunk, "n c s d h w -> (n s) c d h w").contiguous()
-                        pre_occ_flat = rearrange(pre_voxel_occ, "n c s d h w -> (n s) c d h w").contiguous()
-                        voxel_pca_before_vis.append(
-                            self._build_voxel_3d_vis_batch(
-                                pre_voxel_centers[:5],
-                                pre_chunk_flat[:5],
-                                pre_occ_flat[:5],
-                                color_mode="pca",
-                            )
-                        )
-                        voxel_norm_before_vis.append(
-                            self._build_voxel_3d_vis_batch(
-                                pre_voxel_centers[:5],
-                                pre_chunk_flat[:5],
-                                pre_occ_flat[:5],
-                                color_mode="norm",
-                            )
-                        )
-
-                        out_chunk = torch.chunk(outs, self.num_FPN, dim=1)[i]
-                        out_chunk_flat = rearrange(out_chunk, "n c s d h w -> (n s) c d h w").contiguous()
-                        out_d, out_h, out_w = out_chunk_flat.shape[-3:]
-                        post_centers = self._build_uniform_voxel_centers(
-                            aux_dict["x_min"],
-                            aux_dict["y_min"],
-                            aux_dict["z_min"],
-                            aux_dict["voxel_size"],
-                            out_d,
-                            out_h,
-                            out_w,
-                        )
-                        post_occ = self._resize_voxel_valid_mask(
-                            aux_dict["voxel_occ"],
-                            (out_d, out_h, out_w),
-                        )
-                        voxel_pca_after_vis.append(
-                            self._build_voxel_3d_vis_batch(
-                                post_centers[:5],
-                                out_chunk_flat[:5],
-                                post_occ[:5],
-                                color_mode="pca",
-                            )
-                        )
-                        voxel_norm_after_vis.append(
-                            self._build_voxel_3d_vis_batch(
-                                post_centers[:5],
-                                out_chunk_flat[:5],
-                                post_occ[:5],
-                                color_mode="norm",
-                            )
-                        )
-
-                    pointcloud_pca_before_summary = self._tile_fpn_frame_vis(pointcloud_pca_vis)
-                    voxel_pca_before_summary = self._tile_fpn_frame_vis(voxel_pca_before_vis)
-                    voxel_pca_after_summary = self._tile_fpn_frame_vis(voxel_pca_after_vis)
-                    voxel_norm_before_summary = self._tile_fpn_frame_vis(voxel_norm_before_vis)
-                    voxel_norm_after_summary = self._tile_fpn_frame_vis(voxel_norm_after_vis)
-
-        embed_list, log_list = self.Gait_Net.test_2(torch.cat(all_outs, dim=2), seqL)
+        embed_list, log_list = self.Gait_Net.test_2(outs, seqL)
 
         if self._should_export_debug() and export_aux is not None:
             self._export_alignment_debug(labs[0], export_aux)
@@ -1153,10 +1261,12 @@ class BiggerGait__SAM3DBody__Projection_Voxel_Based_Gaitbase_Share(
                     "softmax": {"logits": torch.cat(log_list, dim=-1), "labels": labs},
                 },
                 "visual_summary": {
-                    "image/rgb_img": rgb_img.view(n * s, c, h, w)[:5].float(),
-                    "image/generated_3d_mask_lowres": generated_mask.view(n * s, 1, h_feat, w_feat)[:5].float(),
+                    "image/rgb_img": rearrange(rgb, "n s c h w -> (n s) c h w")[:5].float(),
+                    "image/generated_3d_mask_lowres": generated_mask.view(
+                        batch_size * seq_len, 1, h_feat, w_feat
+                    )[:5].float(),
                     "image/generated_3d_mask_interpolated": human_mask.view(
-                        n * s, 1, self.sils_size * 2, self.sils_size
+                        batch_size * seq_len, 1, self.sils_size * 2, self.sils_size
                     )[:5].float(),
                 },
                 "inference_feat": {

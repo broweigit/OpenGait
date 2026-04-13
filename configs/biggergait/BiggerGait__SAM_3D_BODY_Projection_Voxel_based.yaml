@@ -92,6 +92,7 @@ model_cfg:
       - 64
       - 32
       - 32
+    temporal_window: 3
     depth_center_mode: bbox_mid
     depth_center_offset: 0.0
 
