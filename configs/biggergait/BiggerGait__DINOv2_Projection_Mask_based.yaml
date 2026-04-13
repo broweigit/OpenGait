@@ -1,21 +1,21 @@
 data_cfg:
   dataset_name: CCPG
-  dataset_root: /data4/SAM_3D_BODY/CCPG/Released/CCPG-ratio-pkl-sam3d-decoder
+  dataset_root: /data4/SAM_3D_BODY/CCPG/Released/CCPG-ratio-pkl-sam3d-decoder-lite
   dataset_partition: ./datasets/CCPG/CCPG.json
   data_in_use: [True, True]
-  num_workers: 10
+  num_workers: 4
   remove_no_gallery: false
   test_dataset_name: CCPG
 
 evaluator_cfg:
   enable_float16: true
   restore_ckpt_strict: false
-  restore_hint: 0
+  restore_hint: 30000
   save_name: BiggerGait__Dinov2_Group__Projection_Mask_Based
   eval_func: evaluate_CCPG_part_based
   sampler:
     batch_shuffle: false
-    batch_size: 8
+    batch_size: 4
     sample_type: all_ordered
     frames_all_limit: 250
   metric: euc
@@ -102,7 +102,7 @@ trainer_cfg:
   with_test: true
   restore_ckpt_strict: false
   restore_hint: 0
-  save_iter: 10000
+  save_iter: 5000
   save_name: BiggerGait__Dinov2_Group__Projection_Mask_Based
   sync_BN: true
   total_iter: 30000
