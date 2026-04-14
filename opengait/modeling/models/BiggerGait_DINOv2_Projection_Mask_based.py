@@ -1,7 +1,9 @@
 import numpy as np
+import pickle
 import time
 import torch
 import torch.nn as nn
+import torch.utils.data as tordata
 import torch.utils.checkpoint
 from einops import rearrange
 from functools import partial
@@ -9,7 +11,61 @@ from torch.nn import functional as F
 
 from ..base_model import BaseModel
 from .BigGait_utils.BigGait_GaitBase import *
-from utils import list2var, np2var
+from data.collate_fn import CollateFn
+from data.dataset import DataSet, batch_remove_black_border
+import data.sampler as Samplers
+from utils import get_attr_from, get_valid_args, list2var, np2var
+
+
+class AlignedVideoSAMDecoderDataSet(DataSet):
+    def __loader__(self, paths):
+        from torchvision.io import read_video
+        import random
+
+        paths = sorted(paths)
+        avi_paths = [pth for pth in paths if pth.endswith('.avi')]
+        pkl_paths = [pth for pth in paths if pth.endswith('.pkl')]
+
+        if len(paths) == 2 and len(avi_paths) == 1 and len(pkl_paths) == 1:
+            rgb_path = avi_paths[0]
+            sam_path = pkl_paths[0]
+
+            video, _, _ = read_video(rgb_path, output_format="TCHW", pts_unit='sec')
+            with open(sam_path, 'rb') as f:
+                sam_seq = pickle.load(f)
+
+            common_len = min(video.size(0), len(sam_seq))
+            if common_len == 0:
+                raise ValueError(f'Input data should have at least one frame: {paths}')
+
+            video = video[:common_len]
+            sam_seq = sam_seq[:common_len]
+
+            if self.training:
+                random_idx = sorted(
+                    random.sample(range(common_len), min(40, common_len)),
+                    key=int,
+                )
+                video = video[random_idx, :, :, :]
+                sam_seq = [sam_seq[i] for i in random_idx]
+
+            rgb_seq = batch_remove_black_border(video).numpy()
+            mapped = {
+                rgb_path: rgb_seq,
+                sam_path: sam_seq,
+            }
+            data_list = [mapped[pth] for pth in paths]
+
+            for idx, data in enumerate(data_list):
+                if len(data) != len(data_list[0]):
+                    raise ValueError(
+                        'Each input data({}) should have the same length.'.format(paths[idx]))
+                if len(data) == 0:
+                    raise ValueError(
+                        'Each input data({}) should have at least one element.'.format(paths[idx]))
+            return data_list
+
+        return super().__loader__(paths)
 
 
 class ResizeToHW(torch.nn.Module):
@@ -22,6 +78,22 @@ class ResizeToHW(torch.nn.Module):
 
 
 class BiggerGait__DINOv2__Projection_Mask_Based(BaseModel):
+    def get_loader(self, data_cfg, train=True):
+        sampler_cfg = self.cfgs['trainer_cfg']['sampler'] if train else self.cfgs['evaluator_cfg']['sampler']
+        dataset = AlignedVideoSAMDecoderDataSet(data_cfg, train)
+
+        Sampler = get_attr_from([Samplers], sampler_cfg['type'])
+        vaild_args = get_valid_args(Sampler, sampler_cfg, free_keys=[
+            'sample_type', 'type'])
+        sampler = Sampler(dataset, **vaild_args)
+
+        loader = tordata.DataLoader(
+            dataset=dataset,
+            batch_sampler=sampler,
+            collate_fn=CollateFn(dataset.label_set, sampler_cfg),
+            num_workers=data_cfg['num_workers'])
+        return loader
+
     def build_network(self, model_cfg):
         self.pretrained_lvm = model_cfg["pretrained_lvm"]
         self.image_size = model_cfg["image_size"]
@@ -307,7 +379,6 @@ class BiggerGait__DINOv2__Projection_Mask_Based(BaseModel):
             for i in range(self.num_FPN):
                 intermediates[i] = self.HumanSpace_Conv[i](intermediates[i])
             intermediates = torch.concat(intermediates, dim=1)
-
             human_mask = self.preprocess(generated_mask, self.sils_size).detach().clone()
             intermediates = intermediates * (human_mask > 0.5).to(intermediates)
             intermediates = rearrange(
