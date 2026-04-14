@@ -1,6 +1,7 @@
 import os
 from time import strftime, localtime
 import numpy as np
+import torch
 from utils import get_msg_mgr, mkdir
 
 from .metric import mean_iou, cuda_dist, compute_ACC_mAP, evaluate_rank, evaluate_many
@@ -415,7 +416,6 @@ def evaluate_CCPG(data, dataset, metric='euc'):
         msg_mgr.log_info('BG: {}'.format(de_diag(acc[3, :, :, i], True)))
     return result_dict
 
-import torch
 def evaluate_CCPG_part(data, dataset, metric='euc'):
     msg_mgr = get_msg_mgr()
     
@@ -1259,3 +1259,166 @@ def evaluate_CCGR_MINI(data, dataset, metric='euc'):
 
     msg_mgr.log_info(results)
     return results
+
+
+def evaluate_CCGR_MINI_part_based(data, dataset, metric='euc'):
+    assert 'CCGR' in dataset
+    msg_mgr = get_msg_mgr()
+
+    msg_mgr.log_info("\n" + "#" * 60)
+    msg_mgr.log_info(">>> Running Standard CCGR_MINI Evaluation First...")
+    msg_mgr.log_info("#" * 60)
+    try:
+        evaluate_CCGR_MINI(data.copy(), dataset, metric)
+    except Exception as e:
+        msg_mgr.log_warning(f"Standard evaluate_CCGR_MINI failed: {e}")
+
+    msg_mgr.log_info("\n" + "#" * 60)
+    msg_mgr.log_info(">>> Running Part-based CCGR_MINI Evaluation...")
+    msg_mgr.log_info("#" * 60)
+
+    feature = data['embeddings']
+    label = data['labels']
+    cams = data['types']
+    time_seqs = data['views']
+
+    if isinstance(feature, torch.Tensor):
+        feature = feature.detach().cpu().numpy()
+    if isinstance(label, torch.Tensor):
+        label = label.detach().cpu().numpy()
+    else:
+        label = np.array(label)
+
+    try:
+        if feature.ndim != 3:
+            msg_mgr.log_warning(f"Feature shape {feature.shape} is not [N, C, P], fallback to standard evaluate_CCGR_MINI.")
+            return evaluate_CCGR_MINI(data, dataset, metric)
+        _, _, total_parts = feature.shape
+    except ValueError:
+        return evaluate_CCGR_MINI(data, dataset, metric)
+
+    import json
+    import sys
+    import yaml
+
+    gallery_sets = set(json.load(open('./datasets/CCGR-MINI/CCGR-MINI.json', 'rb'))['GALLERY_SET'])
+    probe_mask = np.array([
+        '-'.join([pid, cam, seq]) not in gallery_sets
+        for pid, cam, seq in zip(label, cams, time_seqs)
+    ])
+
+    probe_lbls = np.asarray(label)[probe_mask]
+    gallery_lbls = np.asarray(label)[~probe_mask]
+
+    cfg_path = None
+    if '--cfgs' in sys.argv:
+        cfg_idx = sys.argv.index('--cfgs') + 1
+        if cfg_idx < len(sys.argv):
+            cfg_path = sys.argv[cfg_idx]
+
+    try:
+        if cfg_path is None:
+            raise ValueError("Cannot find '--cfgs' in current argv.")
+        with open(cfg_path, 'r', encoding='utf-8') as f:
+            yaml_cfg = yaml.safe_load(f)
+
+        model_cfg = yaml_cfg['model_cfg']
+        num_fpn_heads = model_cfg['num_FPN']
+
+        if 'bin_num' not in model_cfg:
+            raise ValueError("model_cfg.bin_num is required for part-based evaluation.")
+        bin_num = model_cfg['bin_num']
+        if isinstance(bin_num, int):
+            parts_per_branch = int(bin_num)
+        elif isinstance(bin_num, list):
+            parts_per_branch = int(sum(bin_num))
+        else:
+            raise ValueError(f"Unsupported bin_num format: {bin_num}")
+
+        branch_cfgs = model_cfg.get('branch_configs', None)
+        if branch_cfgs is None:
+            num_branches = 1
+        elif isinstance(branch_cfgs, list) and len(branch_cfgs) > 0:
+            num_branches = len(branch_cfgs)
+        else:
+            raise ValueError("branch_configs exists but is empty or invalid.")
+
+        branch_parts = [parts_per_branch] * num_branches
+        msg_mgr.log_info(f"Loaded runtime config for part-based evaluation: {cfg_path}")
+    except Exception as e:
+        msg_mgr.log_warning(f"Failed to parse runtime config from {cfg_path}: {e}")
+        msg_mgr.log_warning("Falling back to standard evaluate_CCGR_MINI only.")
+        return evaluate_CCGR_MINI(data, dataset, metric)
+
+    if total_parts % num_fpn_heads != 0:
+        msg_mgr.log_warning(
+            f"Warning: Total parts {total_parts} cannot be evenly divided by {num_fpn_heads} heads."
+        )
+        msg_mgr.log_warning("Falling back to standard evaluate_CCGR_MINI only.")
+        return evaluate_CCGR_MINI(data, dataset, metric)
+
+    parts_per_head = total_parts // num_fpn_heads
+    expected_parts = sum(branch_parts)
+
+    msg_mgr.log_info(f"Dynamic Config: Total Parts={total_parts}, Heads={num_fpn_heads}, Parts/Head={parts_per_head}")
+    msg_mgr.log_info(f"Branch Layout: {len(branch_parts)} branches, parts per branch = {branch_parts}")
+
+    if parts_per_head != expected_parts:
+        msg_mgr.log_warning(
+            f"Warning: Calculated Parts/Head ({parts_per_head}) != Expected Branch Parts ({expected_parts})!"
+        )
+        msg_mgr.log_warning("Falling back to standard evaluate_CCGR_MINI only.")
+        return evaluate_CCGR_MINI(data, dataset, metric)
+
+    def run_evaluation_core(feat_input, title_suffix=""):
+        if feat_input.ndim == 2:
+            feat_input = feat_input[:, :, np.newaxis]
+
+        probe_features = feat_input[probe_mask]
+        gallery_features = feat_input[~probe_mask]
+        dist = cuda_dist(probe_features, gallery_features, metric).cpu().numpy()
+        cmc, all_AP, all_INP = evaluate_rank(dist, probe_lbls, gallery_lbls)
+
+        msg_mgr.log_info(
+            f"{title_suffix:<25} | "
+            f"R1: {cmc[0] * 100:.2f}, "
+            f"R5: {cmc[4] * 100:.2f}, "
+            f"R10: {cmc[9] * 100:.2f}, "
+            f"mAP: {np.mean(all_AP) * 100:.2f}, "
+            f"mINP: {np.mean(all_INP) * 100:.2f}"
+        )
+
+    msg_mgr.log_info("\n" + "=" * 40)
+    msg_mgr.log_info("1. Full Feature Evaluation")
+    msg_mgr.log_info("=" * 40)
+    run_evaluation_core(feature, title_suffix="[ALL Combined]")
+
+    msg_mgr.log_info("\n" + "=" * 40)
+    msg_mgr.log_info("2. FPN Branch Evaluation")
+    msg_mgr.log_info("=" * 40)
+
+    for head_idx in range(num_fpn_heads):
+        msg_mgr.log_info(f"\n>>> [FPN Head {head_idx}]")
+
+        start = head_idx * parts_per_head
+        end = start + parts_per_head
+
+        head_feat_chunk = feature[:, :, start:end]
+        run_evaluation_core(head_feat_chunk, title_suffix=f"[Head-{head_idx} Full]")
+
+        b_start = start
+        for b_idx, b_parts in enumerate(branch_parts):
+            b_end = b_start + b_parts
+            branch_feat_chunk = feature[:, :, b_start:b_end]
+            run_evaluation_core(branch_feat_chunk, title_suffix=f"  *[Branch-{b_idx} Full]")
+            b_start = b_end
+
+        current_p_idx = start
+        for b_idx, b_parts in enumerate(branch_parts):
+            for inner_p_id in range(b_parts):
+                part_feat = feature[:, :, current_p_idx: current_p_idx + 1]
+                title = f"    - Branch{b_idx} Part {inner_p_id:02d}"
+                run_evaluation_core(part_feat, title_suffix=title)
+                current_p_idx += 1
+
+    return {}
