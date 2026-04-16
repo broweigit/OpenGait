@@ -1323,6 +1323,7 @@ def evaluate_CCGR_MINI_part_based(data, dataset, metric='euc'):
             yaml_cfg = yaml.safe_load(f)
 
         model_cfg = yaml_cfg['model_cfg']
+        evaluator_cfg = yaml_cfg.get('evaluator_cfg', {})
         num_fpn_heads = model_cfg['num_FPN']
 
         if 'bin_num' not in model_cfg:
@@ -1344,6 +1345,16 @@ def evaluate_CCGR_MINI_part_based(data, dataset, metric='euc'):
             raise ValueError("branch_configs exists but is empty or invalid.")
 
         branch_parts = [parts_per_branch] * num_branches
+        part_eval_mode = str(evaluator_cfg.get('part_eval_mode', 'light_topk')).lower()
+        if part_eval_mode not in ['light_topk', 'full']:
+            msg_mgr.log_warning(f"Unsupported part_eval_mode={part_eval_mode}, fallback to light_topk.")
+            part_eval_mode = 'light_topk'
+        part_eval_ranks = evaluator_cfg.get('part_eval_ranks', [1, 5, 10])
+        if isinstance(part_eval_ranks, int):
+            part_eval_ranks = [part_eval_ranks]
+        part_eval_ranks = sorted({int(r) for r in part_eval_ranks if int(r) > 0})
+        if len(part_eval_ranks) == 0:
+            part_eval_ranks = [1, 5, 10]
         msg_mgr.log_info(f"Loaded runtime config for part-based evaluation: {cfg_path}")
     except Exception as e:
         msg_mgr.log_warning(f"Failed to parse runtime config from {cfg_path}: {e}")
@@ -1362,6 +1373,14 @@ def evaluate_CCGR_MINI_part_based(data, dataset, metric='euc'):
 
     msg_mgr.log_info(f"Dynamic Config: Total Parts={total_parts}, Heads={num_fpn_heads}, Parts/Head={parts_per_head}")
     msg_mgr.log_info(f"Branch Layout: {len(branch_parts)} branches, parts per branch = {branch_parts}")
+    if part_eval_mode == 'light_topk':
+        msg_mgr.log_info(
+            "CCGR part breakdown uses lightweight top-k retrieval only; "
+            "full mAP/mINP are reported above by the standard CCGR evaluation."
+        )
+        msg_mgr.log_info(f"Lightweight part ranks: {part_eval_ranks}")
+    else:
+        msg_mgr.log_info("CCGR part breakdown uses full evaluate_rank metrics for every head/branch/part.")
 
     if parts_per_head != expected_parts:
         msg_mgr.log_warning(
@@ -1376,25 +1395,50 @@ def evaluate_CCGR_MINI_part_based(data, dataset, metric='euc'):
 
         probe_features = feat_input[probe_mask]
         gallery_features = feat_input[~probe_mask]
-        dist = cuda_dist(probe_features, gallery_features, metric).cpu().numpy()
-        cmc, all_AP, all_INP = evaluate_rank(dist, probe_lbls, gallery_lbls)
+        dist = cuda_dist(probe_features, gallery_features, metric)
 
-        msg_mgr.log_info(
-            f"{title_suffix:<25} | "
-            f"R1: {cmc[0] * 100:.2f}, "
-            f"R5: {cmc[4] * 100:.2f}, "
-            f"R10: {cmc[9] * 100:.2f}, "
-            f"mAP: {np.mean(all_AP) * 100:.2f}, "
-            f"mINP: {np.mean(all_INP) * 100:.2f}"
-        )
+        if part_eval_mode == 'full':
+            dist_np = dist.cpu().numpy()
+            cmc, all_AP, all_INP = evaluate_rank(dist_np, probe_lbls, gallery_lbls)
+            msg_mgr.log_info(
+                f"{title_suffix:<25} | "
+                f"R1: {cmc[0] * 100:.2f}, "
+                f"R5: {cmc[4] * 100:.2f}, "
+                f"R10: {cmc[9] * 100:.2f}, "
+                f"mAP: {np.mean(all_AP) * 100:.2f}, "
+                f"mINP: {np.mean(all_INP) * 100:.2f}"
+            )
+            return
+
+        max_rank = min(max(part_eval_ranks), dist.shape[1])
+        if max_rank <= 0:
+            msg_mgr.log_warning(f"{title_suffix:<25} | Empty gallery for lightweight part evaluation.")
+            return
+
+        topk_idx = dist.topk(max_rank, dim=1, largest=False)[1].cpu().numpy()
+        topk_gallery_lbls = gallery_lbls[topk_idx]
+        matches = (topk_gallery_lbls == probe_lbls[:, np.newaxis])
+
+        rank_logs = []
+        for rank_k in part_eval_ranks:
+            eff_rank = min(rank_k, max_rank)
+            score = matches[:, :eff_rank].any(axis=1).mean() * 100
+            rank_logs.append(f"R{rank_k}: {score:.2f}")
+        msg_mgr.log_info(f"{title_suffix:<25} | " + ", ".join(rank_logs))
 
     msg_mgr.log_info("\n" + "=" * 40)
-    msg_mgr.log_info("1. Full Feature Evaluation")
+    if part_eval_mode == 'light_topk':
+        msg_mgr.log_info("1. Full Feature Evaluation (Lightweight Top-k)")
+    else:
+        msg_mgr.log_info("1. Full Feature Evaluation")
     msg_mgr.log_info("=" * 40)
     run_evaluation_core(feature, title_suffix="[ALL Combined]")
 
     msg_mgr.log_info("\n" + "=" * 40)
-    msg_mgr.log_info("2. FPN Branch Evaluation")
+    if part_eval_mode == 'light_topk':
+        msg_mgr.log_info("2. FPN Branch Evaluation (Lightweight Top-k)")
+    else:
+        msg_mgr.log_info("2. FPN Branch Evaluation")
     msg_mgr.log_info("=" * 40)
 
     for head_idx in range(num_fpn_heads):
