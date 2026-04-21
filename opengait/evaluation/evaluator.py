@@ -2,6 +2,7 @@ import os
 from time import strftime, localtime
 import numpy as np
 import torch
+import torch.nn.functional as F
 from utils import get_msg_mgr, mkdir
 
 from .metric import mean_iou, cuda_dist, compute_ACC_mAP, evaluate_rank, evaluate_many
