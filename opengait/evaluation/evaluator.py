@@ -416,6 +416,348 @@ def evaluate_CCPG(data, dataset, metric='euc'):
         msg_mgr.log_info('BG: {}'.format(de_diag(acc[3, :, :, i], True)))
     return result_dict
 
+
+def _load_runtime_yaml_cfg():
+    import sys
+    import yaml
+
+    cfg_path = None
+    if '--cfgs' in sys.argv:
+        cfg_idx = sys.argv.index('--cfgs') + 1
+        if cfg_idx < len(sys.argv):
+            cfg_path = sys.argv[cfg_idx]
+
+    if cfg_path is None:
+        return None, None
+
+    with open(cfg_path, 'r', encoding='utf-8') as f:
+        yaml_cfg = yaml.safe_load(f)
+    return cfg_path, yaml_cfg
+
+
+def _pairmask_eval_settings(default_topk=50, default_logit_scale=4.0):
+    msg_mgr = get_msg_mgr()
+    try:
+        cfg_path, yaml_cfg = _load_runtime_yaml_cfg()
+        if yaml_cfg is None:
+            raise ValueError("Cannot find current cfg path from argv.")
+        evaluator_cfg = yaml_cfg.get('evaluator_cfg', {})
+        pairmask_cfg = yaml_cfg.get('model_cfg', {}).get('pairmask_cfg', {})
+        rerank_topk = int(evaluator_cfg.get('pairmask_rerank_topk', default_topk))
+        logit_scale = float(pairmask_cfg.get('logit_scale', default_logit_scale))
+        msg_mgr.log_info(
+            f"Loaded pairmask runtime config from {cfg_path}: topk={rerank_topk}, logit_scale={logit_scale:.3f}"
+        )
+        return rerank_topk, logit_scale
+    except Exception as e:
+        msg_mgr.log_warning(
+            f"Failed to parse pairmask runtime config, fallback to defaults: {e}"
+        )
+        return int(default_topk), float(default_logit_scale)
+
+
+def _pairwise_dist_tensor(x, y, metric='euc'):
+    num_bin = x.size(2)
+    n_x = x.size(0)
+    n_y = y.size(0)
+    dist = torch.zeros(n_x, n_y, device=x.device, dtype=x.dtype)
+    for i in range(num_bin):
+        _x = x[:, :, i]
+        _y = y[:, :, i]
+        if metric == 'cos':
+            _x = F.normalize(_x, p=2, dim=1)
+            _y = F.normalize(_y, p=2, dim=1)
+            dist += torch.matmul(_x, _y.transpose(0, 1))
+        else:
+            _dist = (
+                torch.sum(_x ** 2, dim=1, keepdim=True)
+                + torch.sum(_y ** 2, dim=1).unsqueeze(0)
+                - 2 * torch.matmul(_x, _y.transpose(0, 1))
+            )
+            dist += torch.sqrt(F.relu(_dist))
+    return 1 - dist / num_bin if metric == 'cos' else dist / num_bin
+
+
+def _paired_dist_tensor(x, y, metric='euc'):
+    if metric == 'cos':
+        x = F.normalize(x, p=2, dim=1)
+        y = F.normalize(y, p=2, dim=1)
+        return 1 - (x * y).sum(dim=1).mean(dim=1)
+    return torch.sqrt(F.relu((x - y).pow(2).sum(dim=1))).mean(dim=1)
+
+
+def _pairmask_shared_part_weights(probe_q, probe_k, gallery_q, gallery_k, logit_scale):
+    score_left = (probe_q.unsqueeze(0) * gallery_k).sum(dim=1)
+    score_right = (gallery_q * probe_k.unsqueeze(0)).sum(dim=1)
+    logits = 0.5 * (score_left + score_right) * logit_scale
+    return torch.sigmoid(logits).clamp(0.0, 1.0)
+
+
+def _pairmask_rerank_distance(
+    probe_static,
+    gallery_static,
+    probe_q,
+    probe_k,
+    gallery_q,
+    gallery_k,
+    metric='euc',
+    topk=50,
+    logit_scale=4.0,
+):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    probe_static = torch.from_numpy(np.asarray(probe_static, dtype=np.float32)).to(device)
+    gallery_static = torch.from_numpy(np.asarray(gallery_static, dtype=np.float32)).to(device)
+    probe_q = torch.from_numpy(np.asarray(probe_q, dtype=np.float32)).to(device)
+    probe_k = torch.from_numpy(np.asarray(probe_k, dtype=np.float32)).to(device)
+    gallery_q = torch.from_numpy(np.asarray(gallery_q, dtype=np.float32)).to(device)
+    gallery_k = torch.from_numpy(np.asarray(gallery_k, dtype=np.float32)).to(device)
+
+    static_dist = _pairwise_dist_tensor(probe_static, gallery_static, metric)
+    if gallery_static.size(0) == 0 or probe_static.size(0) == 0:
+        return static_dist.cpu().numpy()
+
+    topk = min(int(topk), gallery_static.size(0))
+    if topk <= 0:
+        return static_dist.cpu().numpy()
+
+    final_dist = static_dist.clone()
+    shortlist = static_dist.topk(topk, largest=False, dim=1).indices
+    for i in range(probe_static.size(0)):
+        idx = shortlist[i]
+        weights = _pairmask_shared_part_weights(
+            probe_q[i], probe_k[i], gallery_q[idx], gallery_k[idx], logit_scale
+        )
+        scale = weights.clamp_min(1.0e-12).sqrt().unsqueeze(1)
+        probe_scaled = probe_static[i].unsqueeze(0) * scale
+        gallery_scaled = gallery_static[idx] * scale
+        dyn_dist = _paired_dist_tensor(probe_scaled, gallery_scaled, metric)
+        final_dist[i, idx] = dyn_dist
+    return final_dist.cpu().numpy()
+
+
+def evaluate_CCPG_pairmask_rerank(data, dataset, metric='euc'):
+    msg_mgr = get_msg_mgr()
+    required_keys = ['pairmask_aux_embeddings', 'pairmask_q', 'pairmask_k']
+    if not all(k in data for k in required_keys):
+        msg_mgr.log_warning(
+            f"Missing pairmask inference keys {required_keys}, fallback to standard evaluate_CCPG."
+        )
+        return evaluate_CCPG(data, dataset, metric)
+
+    msg_mgr.log_info("\n" + "#" * 60)
+    msg_mgr.log_info(">>> Running Standard CCPG Evaluation First...")
+    msg_mgr.log_info("#" * 60)
+    try:
+        evaluate_CCPG(data.copy(), dataset, metric)
+    except Exception as e:
+        msg_mgr.log_warning(f"Standard evaluate_CCPG failed: {e}")
+
+    msg_mgr.log_info("\n" + "#" * 60)
+    msg_mgr.log_info(">>> Running PairMask Static-Aux CCPG Evaluation...")
+    msg_mgr.log_info("#" * 60)
+    try:
+        aux_data = data.copy()
+        aux_data['embeddings'] = data['pairmask_aux_embeddings']
+        evaluate_CCPG(aux_data, dataset, metric)
+    except Exception as e:
+        msg_mgr.log_warning(f"Static aux evaluate_CCPG failed: {e}")
+
+    rerank_topk, logit_scale = _pairmask_eval_settings(default_topk=50, default_logit_scale=4.0)
+
+    feature = np.asarray(data['pairmask_aux_embeddings'])
+    pair_q = np.asarray(data['pairmask_q'])
+    pair_k = np.asarray(data['pairmask_k'])
+    label = np.array(data['labels'])
+    seq_type = np.asarray(data['types'])
+    view = [v.split("_")[0] for v in data['views']]
+    view_np = np.array(view)
+    view_list = sorted(list(set(view)))
+    view_num = len(view_list)
+
+    probe_seq_dict = {'CCPG': [["U0_D0_BG", "U0_D0"], ["U3_D3"], ["U1_D0"], ["U0_D0_BG"]]}
+    gallery_seq_dict = {'CCPG': [["U1_D1", "U2_D2", "U3_D3"], ["U0_D3"], ["U1_D1"], ["U0_D0"]]}
+    num_rank = 5
+    acc = np.zeros([len(probe_seq_dict[dataset]), view_num, view_num, num_rank]) - 1.0
+
+    ap_save = []
+    cmc_save = []
+    minp = []
+    for p, probe_seq in enumerate(probe_seq_dict[dataset]):
+        gallery_seq = gallery_seq_dict[dataset][p]
+        gseq_mask = np.isin(seq_type, gallery_seq)
+        pseq_mask = np.isin(seq_type, probe_seq)
+
+        gallery_x = feature[gseq_mask]
+        gallery_y = label[gseq_mask]
+        gallery_view = view_np[gseq_mask]
+        probe_x = feature[pseq_mask]
+        probe_y = label[pseq_mask]
+        probe_view = view_np[pseq_mask]
+
+        msg_mgr.log_info(
+            f"[PairMask] gallery length={len(gallery_y)} {gallery_seq}, probe length={len(probe_y)} {probe_seq}"
+        )
+        distmat = _pairmask_rerank_distance(
+            probe_x,
+            gallery_x,
+            pair_q[pseq_mask],
+            pair_k[pseq_mask],
+            pair_q[gseq_mask],
+            pair_k[gseq_mask],
+            metric=metric,
+            topk=rerank_topk,
+            logit_scale=logit_scale,
+        )
+        cmc, ap, inp = evaluate_many(distmat, probe_y, gallery_y, probe_view, gallery_view)
+        ap_save.append(ap)
+        cmc_save.append(cmc[0])
+        minp.append(inp)
+
+    msg_mgr.log_info('===PairMask Rank-1 (Exclude identical-view cases for Person Re-Identification)===')
+    msg_mgr.log_info('CL: %.3f,\tUP: %.3f,\tDN: %.3f,\tBG: %.3f' % (
+        cmc_save[0] * 100, cmc_save[1] * 100, cmc_save[2] * 100, cmc_save[3] * 100))
+
+    msg_mgr.log_info('===PairMask mAP (Exclude identical-view cases for Person Re-Identification)===')
+    msg_mgr.log_info('CL: %.3f,\tUP: %.3f,\tDN: %.3f,\tBG: %.3f' % (
+        ap_save[0] * 100, ap_save[1] * 100, ap_save[2] * 100, ap_save[3] * 100))
+
+    msg_mgr.log_info('===PairMask mINP (Exclude identical-view cases for Person Re-Identification)===')
+    msg_mgr.log_info('CL: %.3f,\tUP: %.3f,\tDN: %.3f,\tBG: %.3f' % (
+        minp[0] * 100, minp[1] * 100, minp[2] * 100, minp[3] * 100))
+
+    for p, probe_seq in enumerate(probe_seq_dict[dataset]):
+        gallery_seq = gallery_seq_dict[dataset][p]
+        for v1, probe_view in enumerate(view_list):
+            for v2, gallery_view in enumerate(view_list):
+                gseq_mask = np.isin(seq_type, gallery_seq) & np.isin(view_np, [gallery_view])
+                pseq_mask = np.isin(seq_type, probe_seq) & np.isin(view_np, [probe_view])
+                gallery_x = feature[gseq_mask]
+                gallery_y = label[gseq_mask]
+                probe_x = feature[pseq_mask]
+                probe_y = label[pseq_mask]
+                if len(gallery_x) == 0 or len(probe_x) == 0:
+                    continue
+                dist = _pairmask_rerank_distance(
+                    probe_x,
+                    gallery_x,
+                    pair_q[pseq_mask],
+                    pair_k[pseq_mask],
+                    pair_q[gseq_mask],
+                    pair_k[gseq_mask],
+                    metric=metric,
+                    topk=rerank_topk,
+                    logit_scale=logit_scale,
+                )
+                idx = np.argsort(dist, axis=1)
+                acc[p, v1, v2, :] = np.round(
+                    np.sum(
+                        np.cumsum(
+                            np.reshape(probe_y, [-1, 1]) == gallery_y[idx[:, 0:num_rank]], axis=1
+                        ) > 0,
+                        axis=0,
+                    ) * 100 / dist.shape[0],
+                    2,
+                )
+
+    result_dict = {
+        "scalar/test_accuracy/CL": acc[0, :, :, 0],
+        "scalar/test_accuracy/UP": acc[1, :, :, 0],
+        "scalar/test_accuracy/DN": acc[2, :, :, 0],
+        "scalar/test_accuracy/BG": acc[3, :, :, 0],
+    }
+    msg_mgr.log_info('===PairMask Rank-1 (Include identical-view cases)===')
+    msg_mgr.log_info('CL: %.3f,\tUP: %.3f,\tDN: %.3f,\tBG: %.3f' % (
+        np.mean(acc[0, :, :, 0]),
+        np.mean(acc[1, :, :, 0]),
+        np.mean(acc[2, :, :, 0]),
+        np.mean(acc[3, :, :, 0])))
+    msg_mgr.log_info('===PairMask Rank-1 (Exclude identical-view cases)===')
+    msg_mgr.log_info('CL: %.3f,\tUP: %.3f,\tDN: %.3f,\tBG: %.3f' % (
+        de_diag(acc[0, :, :, 0]),
+        de_diag(acc[1, :, :, 0]),
+        de_diag(acc[2, :, :, 0]),
+        de_diag(acc[3, :, :, 0])))
+    np.set_printoptions(precision=2, floatmode='fixed')
+    msg_mgr.log_info('===PairMask Rank-1 of each angle (Exclude identical-view cases)===')
+    msg_mgr.log_info('CL: {}'.format(de_diag(acc[0, :, :, 0], True)))
+    msg_mgr.log_info('UP: {}'.format(de_diag(acc[1, :, :, 0], True)))
+    msg_mgr.log_info('DN: {}'.format(de_diag(acc[2, :, :, 0], True)))
+    msg_mgr.log_info('BG: {}'.format(de_diag(acc[3, :, :, 0], True)))
+    return result_dict
+
+
+def evaluate_CCGR_MINI_pairmask_rerank(data, dataset, metric='euc'):
+    assert 'CCGR' in dataset
+    msg_mgr = get_msg_mgr()
+    required_keys = ['pairmask_aux_embeddings', 'pairmask_q', 'pairmask_k']
+    if not all(k in data for k in required_keys):
+        msg_mgr.log_warning(
+            f"Missing pairmask inference keys {required_keys}, fallback to standard evaluate_CCGR_MINI."
+        )
+        return evaluate_CCGR_MINI(data, dataset, metric)
+
+    msg_mgr.log_info("\n" + "#" * 60)
+    msg_mgr.log_info(">>> Running Standard CCGR_MINI Evaluation First...")
+    msg_mgr.log_info("#" * 60)
+    try:
+        evaluate_CCGR_MINI(data.copy(), dataset, metric)
+    except Exception as e:
+        msg_mgr.log_warning(f"Standard evaluate_CCGR_MINI failed: {e}")
+
+    msg_mgr.log_info("\n" + "#" * 60)
+    msg_mgr.log_info(">>> Running PairMask Static-Aux CCGR_MINI Evaluation...")
+    msg_mgr.log_info("#" * 60)
+    try:
+        aux_data = data.copy()
+        aux_data['embeddings'] = data['pairmask_aux_embeddings']
+        evaluate_CCGR_MINI(aux_data, dataset, metric)
+    except Exception as e:
+        msg_mgr.log_warning(f"Static aux evaluate_CCGR_MINI failed: {e}")
+
+    rerank_topk, logit_scale = _pairmask_eval_settings(default_topk=100, default_logit_scale=4.0)
+
+    feature = np.asarray(data['pairmask_aux_embeddings'])
+    pair_q = np.asarray(data['pairmask_q'])
+    pair_k = np.asarray(data['pairmask_k'])
+    labels = np.asarray(data['labels'])
+    cams = np.asarray(data['types'])
+    time_seqs = np.asarray(data['views'])
+
+    import json
+
+    gallery_sets = json.load(open('./datasets/CCGR-MINI/CCGR-MINI.json', 'rb'))['GALLERY_SET']
+    probe_mask = np.array([
+        '-'.join([pid, cam, seq]) not in gallery_sets
+        for pid, cam, seq in zip(labels, cams, time_seqs)
+    ])
+
+    probe_features = feature[probe_mask]
+    gallery_features = feature[~probe_mask]
+    probe_lbls = labels[probe_mask]
+    gallery_lbls = labels[~probe_mask]
+    dist = _pairmask_rerank_distance(
+        probe_features,
+        gallery_features,
+        pair_q[probe_mask],
+        pair_k[probe_mask],
+        pair_q[~probe_mask],
+        pair_k[~probe_mask],
+        metric=metric,
+        topk=rerank_topk,
+        logit_scale=logit_scale,
+    )
+
+    cmc, all_AP, all_INP = evaluate_rank(dist, probe_lbls, gallery_lbls)
+    mAP = np.mean(all_AP)
+    mINP = np.mean(all_INP)
+    results = {}
+    for r in [1, 5, 10]:
+        results[f'scalar/test_accuracy/Rank-{r}'] = cmc[r - 1] * 100
+    results['scalar/test_accuracy/mAP'] = mAP * 100
+    results['scalar/test_accuracy/mINP'] = mINP * 100
+    msg_mgr.log_info(results)
+    return results
+
 def evaluate_CCPG_part(data, dataset, metric='euc'):
     msg_mgr = get_msg_mgr()
     
