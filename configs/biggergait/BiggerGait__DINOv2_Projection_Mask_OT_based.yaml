@@ -1,9 +1,9 @@
 data_cfg:
   dataset_name: CCPG
-  dataset_root: /data4/SAM_3D_BODY/CCPG/Released/CCPG-ratio-pkl-sam3d-decoder
+  dataset_root: /data4/SAM_3D_BODY/CCPG/Released/CCPG-ratio-pkl-sam3d-decoder-lite/
   dataset_partition: ./datasets/CCPG/CCPG.json
   data_in_use: [True, True]
-  num_workers: 4
+  num_workers: 8
   remove_no_gallery: false
   test_dataset_name: CCPG
 
@@ -60,6 +60,8 @@ model_cfg:
     #   yaw: 45.0
     # - use_apose: false
     #   yaw: -45.0
+    - use_apose: false
+      yaw: original
     - use_apose: true
       yaw: 0.0
 
@@ -103,8 +105,8 @@ optimizer_cfg:
 scheduler_cfg:
   gamma: 0.1
   milestones:
+    - 10000
     - 15000
-    - 25000
   scheduler: MultiStepLR
 
 trainer_cfg:
@@ -118,7 +120,7 @@ trainer_cfg:
   save_iter: 5000
   save_name: BiggerGait__Dinov2_Group__Projection_Mask_OT_Based
   sync_BN: true
-  total_iter: 30000
+  total_iter: 20000
   sampler:
     batch_shuffle: true
     batch_size:

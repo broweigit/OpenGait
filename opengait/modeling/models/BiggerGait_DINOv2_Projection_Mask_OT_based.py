@@ -96,12 +96,17 @@ class BiggerGait__DINOv2__Projection_Mask_OT_Based(BiggerGait__DINOv2__Projectio
         for branch_cfg in self.branch_configs:
             if "yaw" not in branch_cfg:
                 raise ValueError("Each branch config must contain a yaw field.")
+        branch_desc = [
+            "original_view" if self._is_original_view_branch(cfg) else f"yaw={float(cfg.get('yaw', 0.0))}"
+            for cfg in self.branch_configs
+        ]
 
         first_gait_net = self.Gait_Net
         del self.Gait_Net
         self.Gait_Nets = nn.ModuleList(
             [first_gait_net] + [copy.deepcopy(first_gait_net) for _ in range(self.num_branches - 1)]
         )
+        self.msg_mgr.log_info(f"[OT] Branch configs: {branch_desc}")
         self.ot_topk_support = int(model_cfg.get("ot_topk_support", 0) or 0)
         self.ot_sparse_rebalance_iters = int(
             model_cfg.get("ot_sparse_rebalance_iters", model_cfg.get("ot_iters", 8))
@@ -295,7 +300,36 @@ class BiggerGait__DINOv2__Projection_Mask_OT_Based(BiggerGait__DINOv2__Projectio
         apose_keypoints[..., [1, 2]] *= -1
         return apose_verts, apose_keypoints
 
+    @staticmethod
+    def _is_original_view_branch(branch_cfg):
+        if bool(branch_cfg.get("original_view", False)) or bool(branch_cfg.get("no_ot", False)):
+            return True
+        yaw = branch_cfg.get("yaw", 0.0)
+        if yaw is None:
+            return True
+        if isinstance(yaw, str):
+            return yaw.strip().lower() in {
+                "none",
+                "null",
+                "raw",
+                "original",
+                "original_view",
+                "identity",
+                "no_rotate",
+                "no-rotate",
+            }
+        return False
+
     def build_branch_geometry(self, branch_cfg, pose_out):
+        if self._is_original_view_branch(branch_cfg):
+            return {
+                "use_original_view": True,
+                "verts": None,
+                "keypoints": None,
+                "yaw": None,
+                "apply_global_rot_alignment": False,
+            }
+
         use_apose = branch_cfg.get("use_apose", False)
         yaw = float(branch_cfg.get("yaw", 0.0))
 
@@ -312,6 +346,7 @@ class BiggerGait__DINOv2__Projection_Mask_OT_Based(BiggerGait__DINOv2__Projectio
             apply_global_rot_alignment = True
 
         return {
+            "use_original_view": False,
             "verts": branch_verts,
             "keypoints": branch_keypoints,
             "yaw": yaw,
@@ -549,25 +584,29 @@ class BiggerGait__DINOv2__Projection_Mask_OT_Based(BiggerGait__DINOv2__Projectio
             branch_target_masks = []
             for branch_cfg in self.branch_configs:
                 branch_geo = self.build_branch_geometry(branch_cfg, pose_out)
-                warp_feat, tgt_valid_mask, _ = self.warp_features_with_ot(
-                    human_feat,
-                    human_mask.float(),
-                    pose_out["pred_vertices"],
-                    branch_geo["verts"],
-                    branch_geo["keypoints"],
-                    pose_out["pred_cam_t"],
-                    pose_out["global_rot"],
-                    cam_int_src,
-                    cam_int_tgt,
-                    cam_t_tgt,
-                    self.sils_size * 2,
-                    self.sils_size,
-                    target_h,
-                    target_w,
-                    branch_geo["yaw"],
-                    branch_geo["apply_global_rot_alignment"],
-                    flat_flip_flags=flat_flip_flags,
-                )
+                if branch_geo["use_original_view"]:
+                    warp_feat = human_feat
+                    tgt_valid_mask = human_mask.float()
+                else:
+                    warp_feat, tgt_valid_mask, _ = self.warp_features_with_ot(
+                        human_feat,
+                        human_mask.float(),
+                        pose_out["pred_vertices"],
+                        branch_geo["verts"],
+                        branch_geo["keypoints"],
+                        pose_out["pred_cam_t"],
+                        pose_out["global_rot"],
+                        cam_int_src,
+                        cam_int_tgt,
+                        cam_t_tgt,
+                        self.sils_size * 2,
+                        self.sils_size,
+                        target_h,
+                        target_w,
+                        branch_geo["yaw"],
+                        branch_geo["apply_global_rot_alignment"],
+                        flat_flip_flags=flat_flip_flags,
+                    )
                 branch_warped_feats.append(warp_feat)
                 branch_target_masks.append(tgt_valid_mask)
             timing_info["model_ot"] += self._perf_now(rgb.device) - stage_start
