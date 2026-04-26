@@ -1,0 +1,142 @@
+data_cfg:
+  dataset_name: CCPG
+  dataset_root: /data4/SAM_3D_BODY/CCPG/Released/CCPG-ratio-pkl-sam3d-decoder-lite/
+  dataset_partition: ./datasets/CCPG/CCPG.json
+  data_in_use: [True, True]
+  num_workers: 8
+  remove_no_gallery: false
+  test_dataset_name: CCPG
+
+evaluator_cfg:
+  enable_float16: true
+  restore_ckpt_strict: false
+  restore_hint: 30000
+  save_name: BiggerGait__Dinov2_Group__Projection_Mask_OT_ShapePrior_Based
+  eval_func: evaluate_CCPG_part_based
+  sampler:
+    batch_shuffle: false
+    batch_size: 8
+    sample_type: all_ordered
+    frames_all_limit: 250
+  metric: euc
+  transform:
+    - type: BaseRgbTransform
+    - type: NoOperation
+
+loss_cfg:
+  - loss_term_weight: 1.0
+    margin: 0.2
+    type: TripletLoss
+    log_prefix: triplet
+  - loss_term_weight: 1.0
+    scale: 16
+    type: CrossEntropyLoss
+    log_prefix: softmax
+    log_accuracy: true
+  - loss_term_weight: 0.2
+    type: BinaryCrossEntropyLoss
+    log_prefix: shape_silhouette
+
+model_cfg:
+  model: BiggerGait__DINOv2__Projection_Mask_OT_ShapePrior_Based
+  pretrained_lvm: ./pretrained_LVMs/dinov2-small
+  pretrained_sam3d_root: pretrained_LVMs/sam-3d-body
+  require_full_sam_decoder: true
+  image_size: 224
+  sils_size: 32
+
+  source_dim: 384
+  num_unknown: 16
+  total_layer_num: 12
+  group_layer_num: 2
+  head_num: 2
+  num_FPN: 6
+  chunk_size: 96
+  sync_hflip_prob: 0.5
+  enable_timing: true
+
+  ot_temperature: 0.01
+  ot_dist_thresh: 0.2
+  ot_iters: 8
+  branch_configs:
+    - use_apose: false
+      yaw: original
+    - use_apose: true
+      yaw: 0.0
+
+  shape_prior_cfg:
+    prior_dim: 64
+    detach_bottleneck: true
+    use_layernorm: true
+    use_silhouette_loss: true
+
+  backbone_cfg:
+    type: ResNet9
+    block: BasicBlock
+    in_channel: 16
+    channels:
+      - 64
+      - 128
+      - 256
+      - 512
+    layers:
+      - 1
+      - 1
+      - 1
+      - 1
+    strides:
+      - 1
+      - 2
+      - 1
+      - 1
+    maxpool: false
+  SeparateFCs:
+    in_channels: 512
+    out_channels: 256
+    parts_num: 32
+  SeparateBNNecks:
+    class_num: 100
+    in_channels: 256
+    parts_num: 32
+  bin_num:
+    - 32
+
+optimizer_cfg:
+  lr: 0.1
+  momentum: 0.9
+  solver: SGD
+  weight_decay: 0.0005
+
+scheduler_cfg:
+  gamma: 0.1
+  milestones:
+    - 10000
+    - 15000
+  scheduler: MultiStepLR
+
+trainer_cfg:
+  find_unused_parameters: true
+  enable_float16: true
+  fix_BN: false
+  log_iter: 100
+  with_test: true
+  restore_ckpt_strict: false
+  restore_hint: 0
+  save_iter: 5000
+  save_name: BiggerGait__Dinov2_Group__Projection_Mask_OT_ShapePrior_Based
+  sync_BN: true
+  total_iter: 20000
+  sampler:
+    batch_shuffle: true
+    batch_size:
+      - 8
+      - 4
+    frames_num_fixed: 30
+    frames_skip_num: 4
+    frames_num_max: 40
+    frames_num_min: 20
+    sample_type: fixed_unordered
+    type: TripletSampler
+  transform:
+    - type: BaseRgbTransform
+    - type: NoOperation
