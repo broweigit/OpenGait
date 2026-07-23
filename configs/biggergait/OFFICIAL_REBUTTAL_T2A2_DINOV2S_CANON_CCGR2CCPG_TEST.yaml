@@ -101,7 +101,7 @@ trainer_cfg:
   with_test: true
   restore_ckpt_strict: true
   restore_hint: 0
-  save_iter: 5000
+  save_iter: 30000
   save_name: OFFICIAL_REBUTTAL_T2A2_DINOV2S_CANON_CCGR
   sync_BN: true
   total_iter: 30000

@@ -1,20 +1,20 @@
-# PDF full method: SAM3D appearance/geometry, original + A-pose yaw-0, SparseTopK4.
+# Table 2(d): walking pose, yaw 90, SparseTopK4.
 # dataset_name deliberately remains CCGR-MINI for checkpoint lookup.
 data_cfg:
   dataset_name: CCGR-MINI
-  dataset_root: /data1/CCGR/CCGR_MINI_RGB_CUT/CCGR-MINI-RGB-V1/
-  dataset_partition: ./datasets/CCGR-MINI/CCGR-MINI.json
-  data_in_use: [true]
+  dataset_root: /data/CCPG/Released/CCPG-ratio-pkl
+  dataset_partition: ./datasets/CCPG/CCPG.json
+  data_in_use: [true, false]
   num_workers: 8
   remove_no_gallery: false
-  test_dataset_name: CCGR-MINI
+  test_dataset_name: CCPG
 
 evaluator_cfg:
   enable_float16: true
   restore_ckpt_strict: true
   restore_hint: 30000
-  save_name: OFFICIAL_REBUTTAL_T2A4_T2B2_T2C3_T2D4_MAIN_CCGR
-  eval_func: evaluate_CCGR_MINI_part_based
+  save_name: OFFICIAL_REBUTTAL_T2D3_NO_APOSE_YAW90_CCGR
+  eval_func: evaluate_CCPG_part_based
   sampler:
     batch_shuffle: false
     batch_size: 4
@@ -90,8 +90,8 @@ model_cfg:
   branch_configs:
     - use_apose: false
       yaw: original
-    - use_apose: true
-      yaw: 0.0
+    - use_apose: false
+      yaw: 90.0
   Mask_Branch:
     source_dim: 1280
     target_dim: 2
@@ -137,7 +137,7 @@ trainer_cfg:
   restore_ckpt_strict: true
   restore_hint: 0
   save_iter: 30000
-  save_name: OFFICIAL_REBUTTAL_T2A4_T2B2_T2C3_T2D4_MAIN_CCGR
+  save_name: OFFICIAL_REBUTTAL_T2D3_NO_APOSE_YAW90_CCGR
   sync_BN: true
   total_iter: 30000
   sampler:

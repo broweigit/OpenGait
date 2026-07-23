@@ -1,20 +1,20 @@
-# PDF full method: SAM3D appearance/geometry, original + A-pose yaw-0, SparseTopK4.
+# Table 2(a): BiggerGait, DINOv2-S, no canonical branch.
 # dataset_name deliberately remains CCGR-MINI for checkpoint lookup.
 data_cfg:
   dataset_name: CCGR-MINI
-  dataset_root: /data1/CCGR/CCGR_MINI_RGB_CUT/CCGR-MINI-RGB-V1/
-  dataset_partition: ./datasets/CCGR-MINI/CCGR-MINI.json
-  data_in_use: [true]
+  dataset_root: /data/CCPG/Released/CCPG-ratio-pkl
+  dataset_partition: ./datasets/CCPG/CCPG.json
+  data_in_use: [true, false]
   num_workers: 8
   remove_no_gallery: false
-  test_dataset_name: CCGR-MINI
+  test_dataset_name: CCPG
 
 evaluator_cfg:
   enable_float16: true
   restore_ckpt_strict: true
   restore_hint: 30000
-  save_name: OFFICIAL_REBUTTAL_T2A4_T2B2_T2C3_T2D4_MAIN_CCGR
-  eval_func: evaluate_CCGR_MINI_part_based
+  save_name: OFFICIAL_REBUTTAL_T2A1_DINOV2S_NO_CANON_CCGR
+  eval_func: evaluate_CCPG
   sampler:
     batch_shuffle: false
     batch_size: 4
@@ -37,71 +37,24 @@ loss_cfg:
     log_accuracy: true
 
 model_cfg:
-  model: BiggerGait__SAM3DBody__Projection_Mask_OT_Based_SparseTopK4_Gaitbase_Share
-  chunk_size: 8
-  pretrained_lvm: pretrained_LVMs/sam-3d-body
-  pretrained_mask_branch: BYPASS
-  image_size: 256
+  model: BiggerGait__DINOv2
+  pretrained_lvm: ./pretrained_LVMs/dinov2-small
+  pretrained_mask_branch: ./pretrained_LVMs/MaskBranch_vits14.pt
+  image_size: 224
   sils_size: 32
-  source_dim: 1280
-  num_FPN: 4
-  debug_pca_vis: false
-  layer_config:
-    hook_mask:
-      - false
-      - false
-      - false
-      - false
-      - false
-      - false
-      - false
-      - false
-      - false
-      - false
-      - false
-      - false
-      - false
-      - false
-      - false
-      - false
-      - true
-      - true
-      - true
-      - true
-      - true
-      - true
-      - true
-      - true
-      - true
-      - true
-      - true
-      - true
-      - true
-      - true
-      - true
-      - true
-    hook_sample_type: chunk
+  source_dim: 384
   num_unknown: 16
-  ot_temperature: 0.01
-  ot_dist_thresh: 0.2
-  ot_iters: 8
-  ot_topk_support: 4
-  ot_sparse_rebalance_iters: 4
-  branch_configs:
-    - use_apose: false
-      yaw: original
-    - use_apose: true
-      yaw: 0.0
+  total_layer_num: 12
+  group_layer_num: 2
+  head_num: 2
   Mask_Branch:
-    source_dim: 1280
+    source_dim: 384
     target_dim: 2
     p: 0.0
     softmax: true
-    Relu: false
-    Up: true
   backbone_cfg:
     type: ResNet9
-    block: BasicBlock_Time
+    block: BasicBlock
     in_channel: 16
     channels: [64, 128, 256, 512]
     layers: [1, 1, 1, 1]
@@ -137,7 +90,7 @@ trainer_cfg:
   restore_ckpt_strict: true
   restore_hint: 0
   save_iter: 30000
-  save_name: OFFICIAL_REBUTTAL_T2A4_T2B2_T2C3_T2D4_MAIN_CCGR
+  save_name: OFFICIAL_REBUTTAL_T2A1_DINOV2S_NO_CANON_CCGR
   sync_BN: true
   total_iter: 30000
   sampler:

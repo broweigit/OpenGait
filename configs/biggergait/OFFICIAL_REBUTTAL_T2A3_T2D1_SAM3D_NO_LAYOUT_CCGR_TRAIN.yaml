@@ -125,7 +125,7 @@ trainer_cfg:
   with_test: true
   restore_ckpt_strict: true
   restore_hint: 0
-  save_iter: 5000
+  save_iter: 30000
   save_name: OFFICIAL_REBUTTAL_T2A3_T2D1_SAM3D_NO_LAYOUT_CCGR
   sync_BN: true
   total_iter: 30000
@@ -143,4 +143,3 @@ trainer_cfg:
       trf_cfg:
         - type: RandomHorizontalFlip
         - type: BaseRgbTransform
-
