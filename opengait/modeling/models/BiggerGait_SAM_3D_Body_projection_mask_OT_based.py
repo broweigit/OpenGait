@@ -252,6 +252,32 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
         n_parameters = sum(p.numel() for p in self.parameters())
         self.msg_mgr.log_info('All Model Count: {:.5f}M'.format(n_parameters / 1e6))
 
+    @staticmethod
+    def _module_float_dtype(module, fallback=torch.float32):
+        for param in module.parameters():
+            if param.is_floating_point():
+                return param.dtype
+        for buffer in module.buffers():
+            if buffer.is_floating_point():
+                return buffer.dtype
+        return fallback
+
+    def _cast_floating_dtype(self, obj, dtype):
+        if torch.is_tensor(obj):
+            if obj.is_floating_point():
+                return obj.to(dtype=dtype)
+            return obj
+        if isinstance(obj, dict):
+            return {key: self._cast_floating_dtype(value, dtype) for key, value in obj.items()}
+        if isinstance(obj, list):
+            return [self._cast_floating_dtype(value, dtype) for value in obj]
+        if isinstance(obj, tuple):
+            return tuple(self._cast_floating_dtype(value, dtype) for value in obj)
+        return obj
+
+    def _cast_floating_to_module_dtype(self, obj, module):
+        return self._cast_floating_dtype(obj, self._module_float_dtype(module))
+
     def _prepare_dummy_batch(self, image_embeddings, target_h, target_w):
         bsz = image_embeddings.shape[0]
         device = image_embeddings.device
@@ -712,6 +738,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
 
             with torch.no_grad():
                 outs = self.preprocess(rgb_img, target_h, target_w)
+                outs = self._cast_floating_to_module_dtype(outs, self.Backbone)
                 self.intermediate_features = {}
                 _ = self.Backbone(outs)
 
@@ -720,7 +747,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
                 target_tokens = h_feat * w_feat
                 if sam_emb.shape[1] > target_tokens:
                     sam_emb = sam_emb[:, -target_tokens:, :]
-                sam_emb = sam_emb.transpose(1, 2).reshape(curr_bs, -1, h_feat, w_feat)
+                sam_emb = sam_emb.transpose(1, 2).reshape(curr_bs, -1, h_feat, w_feat).float()
 
                 dummy_batch = self._prepare_dummy_batch(sam_emb, target_h, target_w)
                 self.SAM_Engine._batch_size = curr_bs
@@ -740,12 +767,12 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
                         batch=dummy_batch
                     )
 
-                pose_out = pose_outs[-1]
+                pose_out = self._cast_floating_dtype(pose_outs[-1], torch.float32)
                 self._apose_cache = {}
                 pred_verts = pose_out['pred_vertices']
                 pred_cam_t = pose_out['pred_cam_t']
                 global_rot = pose_out['global_rot']
-                cam_int_src = dummy_batch['cam_int']
+                cam_int_src = dummy_batch['cam_int'].float()
                 _, src_depth_map = self.get_source_vertex_index_map(
                     pred_verts, pred_cam_t, cam_int_src, h_feat, w_feat, target_h, target_w
                 )
@@ -756,7 +783,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
                     feat = self.intermediate_features[i]
                     if feat.shape[1] > target_tokens:
                         feat = feat[:, -target_tokens:, :]
-                    features_to_use.append(feat)
+                    features_to_use.append(feat.float())
 
             processed_feat_list = []
             step = len(features_to_use) // self.num_FPN

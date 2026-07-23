@@ -97,6 +97,7 @@ class DataSet(tordata.Dataset):
         """
         self.training = training
         self.video_sample_ratio = data_cfg['video_sample_ratio'] if 'video_sample_ratio' in data_cfg.keys() else None
+        self.sync_video_modalities = data_cfg.get('sync_video_modalities', False)
         self.__dataset_parser(data_cfg, training)
         self.cache = data_cfg['cache']
         self.label_list = [seq_info[0] for seq_info in self.seqs_info]
@@ -121,16 +122,27 @@ class DataSet(tordata.Dataset):
         import random
         paths = sorted(paths)
         data_list = []
+        video_frame_indices = None
+        video_source_length = None
         for pth in paths:
             if pth.endswith('.pkl'):
                 with open(pth, 'rb') as f:
                     _ = pickle.load(f)
                 f.close()
+                if self.training and self.sync_video_modalities and video_frame_indices is not None:
+                    if len(_) != video_source_length:
+                        raise ValueError(
+                            'Cannot synchronize video modalities: {} has {} frames, but the source video has {}.'.format(
+                                pth, len(_), video_source_length))
+                    _ = [_[frame_idx] for frame_idx in video_frame_indices]
             elif pth.endswith('.avi'):
                 video, _, _ = read_video(pth, output_format="TCHW", pts_unit='sec')
 
                 if self.training:
                     random_idx = sorted(random.sample(range(video.size(0)), min(40, video.size(0))), key=int)
+                    if self.sync_video_modalities:
+                        video_frame_indices = random_idx
+                        video_source_length = video.size(0)
                     video = video[random_idx, :, :, :]
 
                 # ratios = torch.full((video.size(0),), video.size(-1) / video.size(-2), device=video.device)
