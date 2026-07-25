@@ -5,6 +5,7 @@ data_cfg:
   dataset_root: /data3/ROMP_SMPL/CCPG/Released/CCPG-ratio-pkl-romp-smpl-geometry
   dataset_partition: ./datasets/CCPG/CCPG.json
   data_in_use: [true, true]
+  sync_video_modalities: true
   num_workers: 8
   remove_no_gallery: false
   test_dataset_name: CCPG
@@ -153,8 +154,6 @@ trainer_cfg:
     sample_type: fixed_unordered
     type: TripletSampler
   transform:
-    - type: Compose
-      trf_cfg:
-        - type: RandomHorizontalFlip
-        - type: BaseRgbTransform
+    # Keep RGB aligned with the offline ROMP image-plane geometry.
+    - type: BaseRgbTransform
     - type: NoOperation

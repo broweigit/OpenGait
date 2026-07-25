@@ -5,6 +5,7 @@ data_cfg:
   dataset_root: /data3/ROMP_SMPL/CCGR/CCGR-MINI-RGB-V1-romp-smpl-geometry
   dataset_partition: ./datasets/CCGR-MINI/CCGR-MINI.json
   data_in_use: [true, true]
+  sync_video_modalities: true
   num_workers: 8
   remove_no_gallery: false
   test_dataset_name: CCGR-MINI
@@ -153,8 +154,6 @@ trainer_cfg:
     sample_type: fixed_unordered
     type: TripletSampler
   transform:
-    - type: Compose
-      trf_cfg:
-        - type: RandomHorizontalFlip
-        - type: BaseRgbTransform
+    # ROMP geometry is precomputed in the unflipped image coordinates.
+    - type: BaseRgbTransform
     - type: NoOperation
