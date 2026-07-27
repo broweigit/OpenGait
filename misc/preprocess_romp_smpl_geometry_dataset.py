@@ -559,7 +559,7 @@ def make_blank_invalid_geometry(
     cam_t_dtype: np.dtype,
     reason: str,
     num_vertices: int = 6890,
-    num_joints: int = 54,
+    num_joints: int = 71,
 ) -> Dict[str, Any]:
     verts = np.zeros((num_vertices, 3), dtype=np.float32)
     joints = np.zeros((num_joints, 3), dtype=np.float32)
@@ -732,6 +732,7 @@ class ROMPGeometryPreprocessor:
         joints_dtype: np.dtype,
         cam_t_dtype: np.dtype,
         missing_policy: str,
+        romp_home: Optional[Path] = None,
     ):
         self.target_h = target_h
         self.target_w = target_w
@@ -740,6 +741,7 @@ class ROMPGeometryPreprocessor:
         self.joints_dtype = np.dtype(joints_dtype)
         self.cam_t_dtype = np.dtype(cam_t_dtype)
         self.missing_policy = missing_policy
+        self.romp_home = Path(romp_home).expanduser().resolve() if romp_home else None
         self.model = self._build_romp(gpu)
 
     def _build_romp(self, gpu: int):
@@ -749,6 +751,16 @@ class ROMPGeometryPreprocessor:
         if settings_ctor is None:
             raise RuntimeError("Cannot find romp.main.default_settings in simple_romp.")
         settings = settings_ctor() if callable(settings_ctor) else copy.deepcopy(settings_ctor)
+
+        if self.romp_home is not None:
+            model_path = self.romp_home / "ROMP.pkl"
+            smpl_path = self.romp_home / "SMPL_NEUTRAL.pth"
+            if not model_path.is_file() or not smpl_path.is_file():
+                raise FileNotFoundError(
+                    f"romp_home must contain ROMP.pkl and SMPL_NEUTRAL.pth: {self.romp_home}"
+                )
+            settings.model_path = str(model_path)
+            settings.smpl_path = str(smpl_path)
 
         for key, value in {
             "mode": "image",
@@ -767,7 +779,12 @@ class ROMPGeometryPreprocessor:
 
         if not hasattr(romp, "ROMP"):
             raise RuntimeError("Cannot find romp.ROMP. Please check simple_romp installation.")
-        return romp.ROMP(settings)
+        engine = romp.ROMP(settings)
+        # simple-romp always wraps the network in DataParallel, including CPU
+        # mode. This helper is already launched once per assigned device.
+        if isinstance(engine.model, torch.nn.DataParallel):
+            engine.model = engine.model.module
+        return engine
 
     def _run_frame(self, frame_rgb: np.ndarray) -> Dict[str, Any]:
         # Official simple_romp examples use cv2.imread output, so pass BGR.
@@ -827,6 +844,16 @@ class ROMPGeometryPreprocessor:
             except Exception as exc:
                 if self.missing_policy == "fail":
                     raise RuntimeError(f"ROMP failed at frame {frame_idx}: {exc}") from exc
+                if self.missing_policy == "blank":
+                    frame_dict = make_blank_invalid_geometry(
+                        self.cam_int,
+                        self.vertices_dtype,
+                        self.joints_dtype,
+                        self.cam_t_dtype,
+                        str(exc),
+                    )
+                    frames.append(frame_dict)
+                    continue
                 if self.missing_policy != "previous":
                     raise ValueError(f"Unsupported missing policy: {self.missing_policy}")
                 if not frames:
@@ -937,7 +964,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--output-name", default="01-romp-smpl_geometry.pkl")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--limit", type=int, default=None, help="Only process the first N sequences.")
-    parser.add_argument("--missing-policy", default="previous", choices=["previous", "fail"])
+    parser.add_argument("--missing-policy", default="previous", choices=["previous", "blank", "fail"])
     parser.add_argument("--vertices-dtype", default="float16")
     parser.add_argument("--joints-dtype", default="float32")
     parser.add_argument("--cam-t-dtype", default="float32")
@@ -997,6 +1024,7 @@ def main() -> None:
         joints_dtype=np.dtype(args.joints_dtype),
         cam_t_dtype=np.dtype(args.cam_t_dtype),
         missing_policy=args.missing_policy,
+        romp_home=Path(args.romp_home) if args.romp_home else None,
     )
 
     for record in tqdm(records, desc="Preprocessing ROMP geometry"):
