@@ -146,6 +146,242 @@ def evaluate_indoor_dataset(data, dataset, metric='euc', cross_view_gallery=Fals
             feature, label, seq_type, view, dataset, metric)
 
 
+def _normalize_fixed_probe_view(raw_view, dataset):
+    """Normalize dataset-specific view names for pairwise view evaluation."""
+    view = str(raw_view).strip()
+    if view.lower().endswith('.avi'):
+        view = view[:-4]
+
+    if 'CCGR' in dataset:
+        if view.lower() == 'over':
+            return 'over'
+
+        # CCGR names are angle_trial (e.g. 90_3) or
+        # half-angle_trial (e.g. 22_5_2 means 22.5 degrees).
+        fields = view.split('_')
+        if len(fields) >= 2 and fields[1] == '5':
+            return f'{int(fields[0])}.5'
+        try:
+            angle = float(fields[0])
+            return str(int(angle)) if angle.is_integer() else str(angle)
+        except (TypeError, ValueError):
+            return view
+
+    if dataset == 'CASIA-B':
+        try:
+            return f'{int(float(view)):03d}'
+        except (TypeError, ValueError):
+            return view
+
+    return view
+
+
+def _fixed_probe_view_sort_key(view):
+    if view == 'over':
+        return (1, float('inf'))
+    try:
+        return (0, float(view))
+    except (TypeError, ValueError):
+        return (2, str(view))
+
+
+def evaluate_fixed_probe_view(data, dataset, metric='euc', probe_view=None):
+    """Evaluate fixed probe view(s) against every *other* gallery view.
+
+    CASIA-B follows its standard sequence split: nm-05/06, bg-01/02 and
+    cl-01/02 are probes, while nm-01..04 are galleries. CCGR-MINI does not
+    use its official sparse GALLERY_SET here: that set contains only about
+    two randomly selected sequences per identity and therefore does not
+    provide full identity coverage at each gallery angle. Instead, all test
+    sequences from two disjoint angles are used to isolate the cross-view
+    recognition gap. Setting ``probe_view: all`` evaluates the full off-
+    diagonal view matrix in a single inference run.
+    """
+    if dataset != 'CASIA-B' and 'CCGR' not in dataset:
+        raise KeyError(
+            f'Fixed-probe view evaluation currently supports CASIA-B and CCGR, got {dataset}.'
+        )
+    if probe_view is None:
+        raise ValueError(
+            'evaluator_cfg.probe_view is required; use one view, a list of views, or "all".'
+        )
+
+    msg_mgr = get_msg_mgr()
+    features = data['embeddings']
+    if isinstance(features, torch.Tensor):
+        features = features.detach().cpu().numpy()
+    labels = np.asarray(data['labels'])
+    seq_types = np.asarray(data['types'])
+    views = np.asarray([
+        _normalize_fixed_probe_view(view, dataset) for view in data['views']
+    ])
+    view_list = sorted(np.unique(views).tolist(), key=_fixed_probe_view_sort_key)
+
+    if isinstance(probe_view, (list, tuple)):
+        requested_probe_views = [
+            _normalize_fixed_probe_view(view, dataset) for view in probe_view
+        ]
+    elif str(probe_view).strip().lower() == 'all':
+        requested_probe_views = view_list
+    else:
+        requested_probe_views = [_normalize_fixed_probe_view(probe_view, dataset)]
+
+    missing_views = [view for view in requested_probe_views if view not in view_list]
+    if missing_views:
+        raise ValueError(
+            f'Requested probe view(s) {missing_views} not found. Available views: {view_list}'
+        )
+
+    if dataset == 'CASIA-B':
+        probe_seq_dict = {
+            'NM': ['nm-05', 'nm-06'],
+            'BG': ['bg-01', 'bg-02'],
+            'CL': ['cl-01', 'cl-02'],
+        }
+        gallery_seqs = ['nm-01', 'nm-02', 'nm-03', 'nm-04']
+        protocol = (
+            'CASIA-B standard sequence split; fixed probe view versus each '
+            'different-view NM gallery.'
+        )
+    else:
+        probe_seq_dict = {'Overall': None}
+        gallery_seqs = None
+        protocol = (
+            'CCGR all-test-sequence cross-view protocol; probe and gallery '
+            'angles are disjoint and the sparse official GALLERY_SET is not used.'
+        )
+
+    msg_mgr.log_info('=' * 72)
+    msg_mgr.log_info('Fixed-Probe-to-Each-Gallery-View Evaluation')
+    msg_mgr.log_info(f'Dataset: {dataset}; metric: {metric}')
+    msg_mgr.log_info(f'Protocol: {protocol}')
+    msg_mgr.log_info(f'Available normalized views: {view_list}')
+    msg_mgr.log_info(f'Selected probe view(s): {requested_probe_views}')
+
+    result_dict = {}
+    for condition, probe_seqs in probe_seq_dict.items():
+        condition_probe_mask = np.ones(len(labels), dtype=bool)
+        if probe_seqs is not None:
+            condition_probe_mask = np.isin(seq_types, probe_seqs)
+
+        condition_gallery_mask = np.ones(len(labels), dtype=bool)
+        if gallery_seqs is not None:
+            condition_gallery_mask = np.isin(seq_types, gallery_seqs)
+
+        for selected_probe_view in requested_probe_views:
+            probe_mask = condition_probe_mask & (views == selected_probe_view)
+            probe_x = features[probe_mask]
+            probe_y = labels[probe_mask]
+            if len(probe_y) == 0:
+                msg_mgr.log_warning(
+                    f'No {condition} probe samples found at view {selected_probe_view}; skipped.'
+                )
+                continue
+
+            gallery_view_list = [
+                gallery_view for gallery_view in view_list
+                if gallery_view != selected_probe_view
+            ]
+            rank1_row = []
+            map_row = []
+            minp_row = []
+
+            for gallery_view in gallery_view_list:
+                gallery_mask = condition_gallery_mask & (views == gallery_view)
+                gallery_x = features[gallery_mask]
+                gallery_y = labels[gallery_mask]
+                if len(gallery_y) == 0:
+                    msg_mgr.log_warning(
+                        f'No gallery samples found at view {gallery_view}; skipped.'
+                    )
+                    rank1_row.append(np.nan)
+                    map_row.append(np.nan)
+                    minp_row.append(np.nan)
+                    continue
+
+                valid_probe_count = int(np.isin(probe_y, np.unique(gallery_y)).sum())
+                if valid_probe_count == 0:
+                    msg_mgr.log_warning(
+                        f'No probe identities at {selected_probe_view} occur in gallery '
+                        f'view {gallery_view}; skipped.'
+                    )
+                    rank1_row.append(np.nan)
+                    map_row.append(np.nan)
+                    minp_row.append(np.nan)
+                    continue
+
+                dist = cuda_dist(probe_x, gallery_x, metric).cpu().numpy()
+                cmc, all_ap, all_inp = evaluate_rank(dist, probe_y, gallery_y)
+                rank1 = float(cmc[0] * 100.0)
+                mean_ap = float(np.mean(all_ap) * 100.0)
+                mean_inp = float(np.mean(all_inp) * 100.0)
+                rank1_row.append(rank1)
+                map_row.append(mean_ap)
+                minp_row.append(mean_inp)
+
+                probe_key = selected_probe_view.replace('.', 'p')
+                gallery_key = gallery_view.replace('.', 'p')
+                result_prefix = (
+                    f'scalar/test_accuracy/fixed_probe/{condition}/'
+                    f'P{probe_key}_G{gallery_key}'
+                )
+                result_dict[f'{result_prefix}_Rank-1'] = rank1
+                result_dict[f'{result_prefix}_mAP'] = mean_ap
+                result_dict[f'{result_prefix}_mINP'] = mean_inp
+                msg_mgr.log_info(
+                    f'{condition}: probe={selected_probe_view}, gallery={gallery_view}, '
+                    f'Rank-1={rank1:.2f}%, mAP={mean_ap:.2f}%, mINP={mean_inp:.2f}%, '
+                    f'probe samples={len(probe_y)} ({valid_probe_count} valid), '
+                    f'gallery samples={len(gallery_y)}'
+                )
+
+            rank1_array = np.asarray(rank1_row, dtype=np.float64)
+            map_array = np.asarray(map_row, dtype=np.float64)
+            minp_array = np.asarray(minp_row, dtype=np.float64)
+            valid_rank1 = rank1_array[~np.isnan(rank1_array)]
+            if valid_rank1.size:
+                cross_view_mean = float(np.mean(valid_rank1))
+                cross_view_map = float(np.nanmean(map_array))
+                cross_view_minp = float(np.nanmean(minp_array))
+                probe_key = selected_probe_view.replace('.', 'p')
+                result_prefix = (
+                    f'scalar/test_accuracy/fixed_probe/{condition}/'
+                    f'P{probe_key}_cross_view_mean'
+                )
+                result_dict[f'{result_prefix}_Rank-1'] = cross_view_mean
+                result_dict[f'{result_prefix}_mAP'] = cross_view_map
+                result_dict[f'{result_prefix}_mINP'] = cross_view_minp
+            else:
+                cross_view_mean = float('nan')
+                cross_view_map = float('nan')
+                cross_view_minp = float('nan')
+
+            header = ','.join(['condition', 'probe_view', 'metric'] + gallery_view_list + ['mean'])
+            rank1_values = ','.join(
+                'nan' if np.isnan(value) else f'{value:.2f}' for value in rank1_row
+            )
+            map_values = ','.join(
+                'nan' if np.isnan(value) else f'{value:.2f}' for value in map_row
+            )
+            minp_values = ','.join(
+                'nan' if np.isnan(value) else f'{value:.2f}' for value in minp_row
+            )
+            msg_mgr.log_info('CSV-ready fixed-probe rows:')
+            msg_mgr.log_info(header)
+            msg_mgr.log_info(
+                f'{condition},{selected_probe_view},Rank-1,{rank1_values},{cross_view_mean:.2f}'
+            )
+            msg_mgr.log_info(
+                f'{condition},{selected_probe_view},mAP,{map_values},{cross_view_map:.2f}'
+            )
+            msg_mgr.log_info(
+                f'{condition},{selected_probe_view},mINP,{minp_values},{cross_view_minp:.2f}'
+            )
+
+    msg_mgr.log_info('=' * 72)
+    return result_dict
+
+
 def evaluate_real_scene(data, dataset, metric='euc'):
     msg_mgr = get_msg_mgr()
     feature, label, seq_type = data['embeddings'], data['labels'], data['types']
