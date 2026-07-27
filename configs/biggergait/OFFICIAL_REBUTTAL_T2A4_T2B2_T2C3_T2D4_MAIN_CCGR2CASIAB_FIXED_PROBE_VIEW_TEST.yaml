@@ -1,12 +1,12 @@
-# A4 CCGR-trained full method: fixed CASIA-B probe view against every other gallery view.
-# probe_view accepts one CASIA-B angle (e.g. "000"), a list, or "all" for the
-# complete off-diagonal matrix. The default measures frontal probes.
+# A4 CCGR-trained full method: complete CASIA-B 11x11 view evaluation.
+# It reports NM/BG/CL Rank-1, mAP and mINP matrices, overall cross-view
+# retrieval metrics, and Small/Medium/Large view-gap Rank-1 summaries.
 # dataset_name deliberately remains CCGR-MINI so the CCGR A4 checkpoint is found.
 data_cfg:
   dataset_name: CCGR-MINI
   dataset_root: /data1/jdy/casiab/casiab-ratio-frompkl
   dataset_partition: ./datasets/CASIA-B/CASIA-B.json
-  data_in_use: [true]
+  data_in_use: [true, false]
   num_workers: 8
   remove_no_gallery: false
   test_dataset_name: CASIA-B
@@ -17,7 +17,8 @@ evaluator_cfg:
   restore_hint: 30000
   save_name: OFFICIAL_REBUTTAL_T2A4_T2B2_T2C3_T2D4_MAIN_CCGR
   eval_func: evaluate_fixed_probe_view
-  probe_view: "000"
+  probe_view: "all"
+  view_gap_thresholds: [36.0, 72.0]
   sampler:
     batch_shuffle: false
     batch_size: 4

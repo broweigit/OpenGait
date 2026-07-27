@@ -185,8 +185,10 @@ def _fixed_probe_view_sort_key(view):
         return (2, str(view))
 
 
-def evaluate_fixed_probe_view(data, dataset, metric='euc', probe_view=None):
-    """Evaluate fixed probe view(s) against every *other* gallery view.
+def evaluate_fixed_probe_view(data, dataset, metric='euc', probe_view=None,
+                              probe_gallery_pairs=None,
+                              view_gap_thresholds=(36.0, 72.0)):
+    """Evaluate selected probe/gallery view pairs from one inference pass.
 
     CASIA-B follows its standard sequence split: nm-05/06, bg-01/02 and
     cl-01/02 are probes, while nm-01..04 are galleries. CCGR-MINI does not
@@ -194,16 +196,17 @@ def evaluate_fixed_probe_view(data, dataset, metric='euc', probe_view=None):
     two randomly selected sequences per identity and therefore does not
     provide full identity coverage at each gallery angle. Instead, all test
     sequences from two disjoint angles are used to isolate the cross-view
-    recognition gap. Setting ``probe_view: all`` evaluates the full off-
-    diagonal view matrix in a single inference run.
+    recognition gap. Setting ``probe_view: all`` evaluates and reports the
+    full off-diagonal view matrix. ``probe_gallery_pairs`` can instead select
+    explicit directed pairs, e.g. [["over", "0"], ["0", "over"]].
     """
     if dataset != 'CASIA-B' and 'CCGR' not in dataset:
         raise KeyError(
             f'Fixed-probe view evaluation currently supports CASIA-B and CCGR, got {dataset}.'
         )
-    if probe_view is None:
+    if probe_view is None and probe_gallery_pairs is None:
         raise ValueError(
-            'evaluator_cfg.probe_view is required; use one view, a list of views, or "all".'
+            'Set evaluator_cfg.probe_view or evaluator_cfg.probe_gallery_pairs.'
         )
 
     msg_mgr = get_msg_mgr()
@@ -217,7 +220,22 @@ def evaluate_fixed_probe_view(data, dataset, metric='euc', probe_view=None):
     ])
     view_list = sorted(np.unique(views).tolist(), key=_fixed_probe_view_sort_key)
 
-    if isinstance(probe_view, (list, tuple)):
+    normalized_pairs = None
+    if probe_gallery_pairs is not None:
+        normalized_pairs = []
+        for pair in probe_gallery_pairs:
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                raise ValueError(
+                    'Each probe_gallery_pairs entry must be [probe_view, gallery_view], '
+                    f'got {pair!r}.'
+                )
+            probe = _normalize_fixed_probe_view(pair[0], dataset)
+            gallery = _normalize_fixed_probe_view(pair[1], dataset)
+            if probe == gallery:
+                raise ValueError(f'Probe and gallery views must differ, got {pair!r}.')
+            normalized_pairs.append((probe, gallery))
+        requested_probe_views = list(dict.fromkeys(pair[0] for pair in normalized_pairs))
+    elif isinstance(probe_view, (list, tuple)):
         requested_probe_views = [
             _normalize_fixed_probe_view(view, dataset) for view in probe_view
         ]
@@ -226,7 +244,12 @@ def evaluate_fixed_probe_view(data, dataset, metric='euc', probe_view=None):
     else:
         requested_probe_views = [_normalize_fixed_probe_view(probe_view, dataset)]
 
-    missing_views = [view for view in requested_probe_views if view not in view_list]
+    views_to_validate = list(requested_probe_views)
+    if normalized_pairs is not None:
+        views_to_validate.extend(pair[1] for pair in normalized_pairs)
+    missing_views = sorted(
+        set(view for view in views_to_validate if view not in view_list),
+        key=_fixed_probe_view_sort_key)
     if missing_views:
         raise ValueError(
             f'Requested probe view(s) {missing_views} not found. Available views: {view_list}'
@@ -257,8 +280,11 @@ def evaluate_fixed_probe_view(data, dataset, metric='euc', probe_view=None):
     msg_mgr.log_info(f'Protocol: {protocol}')
     msg_mgr.log_info(f'Available normalized views: {view_list}')
     msg_mgr.log_info(f'Selected probe view(s): {requested_probe_views}')
+    if normalized_pairs is not None:
+        msg_mgr.log_info(f'Selected directed probe/gallery pairs: {normalized_pairs}')
 
     result_dict = {}
+    condition_matrices = {}
     for condition, probe_seqs in probe_seq_dict.items():
         condition_probe_mask = np.ones(len(labels), dtype=bool)
         if probe_seqs is not None:
@@ -267,6 +293,12 @@ def evaluate_fixed_probe_view(data, dataset, metric='euc', probe_view=None):
         condition_gallery_mask = np.ones(len(labels), dtype=bool)
         if gallery_seqs is not None:
             condition_gallery_mask = np.isin(seq_types, gallery_seqs)
+
+        metric_matrices = {
+            'Rank-1': np.full((len(view_list), len(view_list)), np.nan, dtype=np.float64),
+            'mAP': np.full((len(view_list), len(view_list)), np.nan, dtype=np.float64),
+            'mINP': np.full((len(view_list), len(view_list)), np.nan, dtype=np.float64),
+        }
 
         for selected_probe_view in requested_probe_views:
             probe_mask = condition_probe_mask & (views == selected_probe_view)
@@ -278,13 +310,16 @@ def evaluate_fixed_probe_view(data, dataset, metric='euc', probe_view=None):
                 )
                 continue
 
-            gallery_view_list = [
-                gallery_view for gallery_view in view_list
-                if gallery_view != selected_probe_view
-            ]
-            rank1_row = []
-            map_row = []
-            minp_row = []
+            if normalized_pairs is None:
+                gallery_view_list = [
+                    gallery_view for gallery_view in view_list
+                    if gallery_view != selected_probe_view
+                ]
+            else:
+                gallery_view_list = [
+                    gallery for probe, gallery in normalized_pairs
+                    if probe == selected_probe_view
+                ]
 
             for gallery_view in gallery_view_list:
                 gallery_mask = condition_gallery_mask & (views == gallery_view)
@@ -294,9 +329,6 @@ def evaluate_fixed_probe_view(data, dataset, metric='euc', probe_view=None):
                     msg_mgr.log_warning(
                         f'No gallery samples found at view {gallery_view}; skipped.'
                     )
-                    rank1_row.append(np.nan)
-                    map_row.append(np.nan)
-                    minp_row.append(np.nan)
                     continue
 
                 valid_probe_count = int(np.isin(probe_y, np.unique(gallery_y)).sum())
@@ -305,9 +337,6 @@ def evaluate_fixed_probe_view(data, dataset, metric='euc', probe_view=None):
                         f'No probe identities at {selected_probe_view} occur in gallery '
                         f'view {gallery_view}; skipped.'
                     )
-                    rank1_row.append(np.nan)
-                    map_row.append(np.nan)
-                    minp_row.append(np.nan)
                     continue
 
                 dist = cuda_dist(probe_x, gallery_x, metric).cpu().numpy()
@@ -315,9 +344,11 @@ def evaluate_fixed_probe_view(data, dataset, metric='euc', probe_view=None):
                 rank1 = float(cmc[0] * 100.0)
                 mean_ap = float(np.mean(all_ap) * 100.0)
                 mean_inp = float(np.mean(all_inp) * 100.0)
-                rank1_row.append(rank1)
-                map_row.append(mean_ap)
-                minp_row.append(mean_inp)
+                probe_idx = view_list.index(selected_probe_view)
+                gallery_idx = view_list.index(gallery_view)
+                metric_matrices['Rank-1'][probe_idx, gallery_idx] = rank1
+                metric_matrices['mAP'][probe_idx, gallery_idx] = mean_ap
+                metric_matrices['mINP'][probe_idx, gallery_idx] = mean_inp
 
                 probe_key = selected_probe_view.replace('.', 'p')
                 gallery_key = gallery_view.replace('.', 'p')
@@ -335,48 +366,152 @@ def evaluate_fixed_probe_view(data, dataset, metric='euc', probe_view=None):
                     f'gallery samples={len(gallery_y)}'
                 )
 
-            rank1_array = np.asarray(rank1_row, dtype=np.float64)
-            map_array = np.asarray(map_row, dtype=np.float64)
-            minp_array = np.asarray(minp_row, dtype=np.float64)
-            valid_rank1 = rank1_array[~np.isnan(rank1_array)]
-            if valid_rank1.size:
-                cross_view_mean = float(np.mean(valid_rank1))
-                cross_view_map = float(np.nanmean(map_array))
-                cross_view_minp = float(np.nanmean(minp_array))
-                probe_key = selected_probe_view.replace('.', 'p')
-                result_prefix = (
-                    f'scalar/test_accuracy/fixed_probe/{condition}/'
-                    f'P{probe_key}_cross_view_mean'
-                )
-                result_dict[f'{result_prefix}_Rank-1'] = cross_view_mean
-                result_dict[f'{result_prefix}_mAP'] = cross_view_map
-                result_dict[f'{result_prefix}_mINP'] = cross_view_minp
-            else:
-                cross_view_mean = float('nan')
-                cross_view_map = float('nan')
-                cross_view_minp = float('nan')
+            probe_idx = view_list.index(selected_probe_view)
+            probe_key = selected_probe_view.replace('.', 'p')
+            for metric_name, matrix in metric_matrices.items():
+                valid_values = matrix[probe_idx][np.isfinite(matrix[probe_idx])]
+                if valid_values.size:
+                    result_dict[
+                        f'scalar/test_accuracy/fixed_probe/{condition}/'
+                        f'P{probe_key}_cross_view_mean_{metric_name}'
+                    ] = float(np.mean(valid_values))
 
-            header = ','.join(['condition', 'probe_view', 'metric'] + gallery_view_list + ['mean'])
-            rank1_values = ','.join(
-                'nan' if np.isnan(value) else f'{value:.2f}' for value in rank1_row
-            )
-            map_values = ','.join(
-                'nan' if np.isnan(value) else f'{value:.2f}' for value in map_row
-            )
-            minp_values = ','.join(
-                'nan' if np.isnan(value) else f'{value:.2f}' for value in minp_row
-            )
-            msg_mgr.log_info('CSV-ready fixed-probe rows:')
-            msg_mgr.log_info(header)
-            msg_mgr.log_info(
-                f'{condition},{selected_probe_view},Rank-1,{rank1_values},{cross_view_mean:.2f}'
-            )
-            msg_mgr.log_info(
-                f'{condition},{selected_probe_view},mAP,{map_values},{cross_view_map:.2f}'
-            )
-            msg_mgr.log_info(
-                f'{condition},{selected_probe_view},mINP,{minp_values},{cross_view_minp:.2f}'
-            )
+        condition_matrices[condition] = metric_matrices
+        msg_mgr.log_info(f'CSV-ready {condition} view matrices (rows=probe, columns=gallery):')
+        header = ','.join(['condition', 'metric', 'probe_view'] + view_list + ['cross_view_mean'])
+        msg_mgr.log_info(header)
+        for metric_name, matrix in metric_matrices.items():
+            for probe_idx, selected_probe_view in enumerate(view_list):
+                row = matrix[probe_idx]
+                row_values = ','.join(
+                    'nan' if np.isnan(value) else f'{value:.2f}' for value in row
+                )
+                valid_values = row[np.isfinite(row)]
+                row_mean = float(np.mean(valid_values)) if valid_values.size else float('nan')
+                msg_mgr.log_info(
+                    f'{condition},{metric_name},{selected_probe_view},'
+                    f'{row_values},{row_mean:.2f}'
+                )
+
+            valid_values = matrix[np.isfinite(matrix)]
+            if valid_values.size:
+                overall = float(np.mean(valid_values))
+                result_dict[
+                    f'scalar/test_accuracy/fixed_probe/{condition}/'
+                    f'overall_cross_view_{metric_name}'
+                ] = overall
+                msg_mgr.log_info(
+                    f'{condition} overall cross-view {metric_name}: {overall:.2f}% '
+                    f'over {valid_values.size} directed view pairs.'
+                )
+
+        if dataset == 'CASIA-B':
+            if not isinstance(view_gap_thresholds, (list, tuple)) or len(view_gap_thresholds) != 2:
+                raise ValueError('view_gap_thresholds must contain [small_max, medium_max].')
+            small_max, medium_max = map(float, view_gap_thresholds)
+            if not 0.0 < small_max < medium_max:
+                raise ValueError('Require 0 < small_max < medium_max for view-gap bins.')
+            gap_values = {'Small': [], 'Medium': [], 'Large': []}
+            rank1_matrix = metric_matrices['Rank-1']
+            for probe_idx, probe in enumerate(view_list):
+                for gallery_idx, gallery in enumerate(view_list):
+                    value = rank1_matrix[probe_idx, gallery_idx]
+                    if not np.isfinite(value) or probe == gallery:
+                        continue
+                    gap = abs(float(probe) - float(gallery))
+                    gap = min(gap, 360.0 - gap)
+                    gap_name = (
+                        'Small' if gap <= small_max else
+                        'Medium' if gap <= medium_max else 'Large'
+                    )
+                    gap_values[gap_name].append(float(value))
+            for gap_name, values in gap_values.items():
+                if values:
+                    gap_mean = float(np.mean(values))
+                    result_dict[
+                        f'scalar/test_accuracy/fixed_probe/{condition}/'
+                        f'{gap_name.lower()}_view_gap_Rank-1'
+                    ] = gap_mean
+                    msg_mgr.log_info(
+                        f'{condition} {gap_name} view-gap Rank-1: {gap_mean:.2f}% '
+                        f'over {len(values)} directed pairs.'
+                    )
+
+    # A condition-agnostic summary is convenient for the rebuttal table. For
+    # CASIA-B this averages NM/BG/CL and all evaluated directed view pairs.
+    for metric_name in ('Rank-1', 'mAP', 'mINP'):
+        all_values = [
+            matrix_dict[metric_name][np.isfinite(matrix_dict[metric_name])]
+            for matrix_dict in condition_matrices.values()
+        ]
+        all_values = [values for values in all_values if values.size]
+        if all_values:
+            overall = float(np.mean(np.concatenate(all_values)))
+            result_dict[
+                f'scalar/test_accuracy/fixed_probe/Overall/'
+                f'overall_cross_view_{metric_name}'
+            ] = overall
+            msg_mgr.log_info(f'Overall cross-view {metric_name}: {overall:.2f}%')
+
+    if dataset == 'CASIA-B':
+        rank1_matrices = [
+            matrix_dict['Rank-1'] for matrix_dict in condition_matrices.values()
+        ]
+        small_max, medium_max = map(float, view_gap_thresholds)
+        for gap_name in ('Small', 'Medium', 'Large'):
+            values = []
+            for matrix in rank1_matrices:
+                for probe_idx, probe in enumerate(view_list):
+                    for gallery_idx, gallery in enumerate(view_list):
+                        value = matrix[probe_idx, gallery_idx]
+                        if not np.isfinite(value) or probe == gallery:
+                            continue
+                        gap = abs(float(probe) - float(gallery))
+                        gap = min(gap, 360.0 - gap)
+                        current_gap_name = (
+                            'Small' if gap <= small_max else
+                            'Medium' if gap <= medium_max else 'Large'
+                        )
+                        if current_gap_name == gap_name:
+                            values.append(float(value))
+            if values:
+                gap_mean = float(np.mean(values))
+                result_dict[
+                    f'scalar/test_accuracy/fixed_probe/Overall/'
+                    f'{gap_name.lower()}_view_gap_Rank-1'
+                ] = gap_mean
+                msg_mgr.log_info(
+                    f'Overall {gap_name} view-gap Rank-1: {gap_mean:.2f}%'
+                )
+
+    if normalized_pairs is not None:
+        is_bidirectional = (
+            len(normalized_pairs) == 2
+            and normalized_pairs[0] == normalized_pairs[1][::-1]
+        )
+        if is_bidirectional:
+            matrix_dict = next(iter(condition_matrices.values()))
+            for metric_name, matrix in matrix_dict.items():
+                pair_values = [
+                    matrix[view_list.index(probe), view_list.index(gallery)]
+                    for probe, gallery in normalized_pairs
+                ]
+                if all(np.isfinite(value) for value in pair_values):
+                    bidirectional_mean = float(np.mean(pair_values))
+                    result_dict[
+                        f'scalar/test_accuracy/fixed_probe/Overall/'
+                        f'bidirectional_mean_{metric_name}'
+                    ] = bidirectional_mean
+                    msg_mgr.log_info(
+                        f'Bidirectional mean {metric_name} over '
+                        f'{normalized_pairs[0][0]}->{normalized_pairs[0][1]} and '
+                        f'{normalized_pairs[1][0]}->{normalized_pairs[1][1]}: '
+                        f'{bidirectional_mean:.2f}%'
+                    )
+        msg_mgr.log_info(
+            'The overall values above are the mean over the explicitly configured '
+            'directed pairs; reverse directions are kept as separate pair results.'
+        )
 
     msg_mgr.log_info('=' * 72)
     return result_dict
