@@ -10,6 +10,15 @@ data_cfg:
   num_workers: 8
   remove_no_gallery: false
   test_dataset_name: CCGR-MINI
+  # Identical balanced subset to the robustness test for paired comparison.
+  eval_subset:
+    enabled: true
+    seed: 7890
+    num_pids: 150
+    min_sequences_per_pid: 48
+    gallery_per_pid: 2
+    probes_per_pid: 5
+    probe_views: ["0", "22_5", "45", "67_5", "90", "112_5", "135", "157_5", "180", "over"]
 
 evaluator_cfg:
   enable_float16: true

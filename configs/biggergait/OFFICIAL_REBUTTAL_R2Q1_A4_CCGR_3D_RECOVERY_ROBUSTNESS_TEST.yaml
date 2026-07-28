@@ -11,6 +11,16 @@ data_cfg:
   num_workers: 8
   remove_no_gallery: false
   test_dataset_name: CCGR-MINI
+  # Reproducible 1,050-sequence subset: 150 complete identities, retaining
+  # two official gallery sequences and five view-balanced probes per identity.
+  eval_subset:
+    enabled: true
+    seed: 7890
+    num_pids: 150
+    min_sequences_per_pid: 48
+    gallery_per_pid: 2
+    probes_per_pid: 5
+    probe_views: ["0", "22_5", "45", "67_5", "90", "112_5", "135", "157_5", "180", "over"]
 
 evaluator_cfg:
   enable_float16: true

@@ -1,6 +1,7 @@
 import os
 import pickle
 import os.path as osp
+import random
 import torch.utils.data as tordata
 import json
 from utils import get_msg_mgr
@@ -231,5 +232,145 @@ class DataSet(tordata.Dataset):
                                 'Find no .pkl file in %s-%s-%s.' % (lab, typ, vie))
             return seqs_info_list
 
-        self.seqs_info = get_seqs_info_list(
-            train_set) if training else get_seqs_info_list(test_set)
+        def build_balanced_eval_subset(seqs_info_list):
+            subset_cfg = data_config.get('eval_subset', {}) or {}
+            if not subset_cfg.get('enabled', False):
+                return seqs_info_list
+
+            gallery_set = set(partition.get('GALLERY_SET', []))
+            if not gallery_set:
+                raise ValueError(
+                    'eval_subset requires GALLERY_SET in dataset_partition.')
+
+            seed = int(subset_cfg.get('seed', 7890))
+            num_pids = int(subset_cfg.get('num_pids', 150))
+            probes_per_pid = int(subset_cfg.get('probes_per_pid', 5))
+            gallery_per_pid = int(subset_cfg.get('gallery_per_pid', 2))
+            min_sequences_per_pid = int(
+                subset_cfg.get('min_sequences_per_pid', 48))
+            probe_views = [str(view) for view in subset_cfg.get(
+                'probe_views',
+                ['0', '22_5', '45', '67_5', '90',
+                 '112_5', '135', '157_5', '180', 'over'])]
+            if num_pids <= 0 or probes_per_pid <= 0 or gallery_per_pid <= 0:
+                raise ValueError(
+                    'eval_subset counts must all be positive integers.')
+            if len(probe_views) < probes_per_pid:
+                raise ValueError(
+                    'eval_subset.probe_views must contain at least as many '
+                    'views as probes_per_pid.')
+
+            def sequence_key(seq_info):
+                return '-'.join(seq_info[:3])
+
+            def normalized_probe_view(raw_view):
+                for view in sorted(probe_views, key=len, reverse=True):
+                    if raw_view == view or raw_view == view + '.avi':
+                        return view
+                    if raw_view.startswith(view + '_'):
+                        return view
+                return None
+
+            per_pid = {}
+            for seq_info in seqs_info_list:
+                per_pid.setdefault(seq_info[0], []).append(seq_info)
+
+            eligible_pids = []
+            for pid, pid_seqs in per_pid.items():
+                pid_gallery = [
+                    seq for seq in pid_seqs
+                    if sequence_key(seq) in gallery_set]
+                pid_gallery_keys = {
+                    sequence_key(seq) for seq in pid_gallery}
+                available_probe_views = {
+                    normalized_probe_view(seq[2])
+                    for seq in pid_seqs
+                    if sequence_key(seq) not in pid_gallery_keys}
+                has_all_probe_views = all(
+                    view in available_probe_views for view in probe_views)
+                if (len(pid_seqs) >= min_sequences_per_pid
+                        and len(pid_gallery) >= gallery_per_pid
+                        and has_all_probe_views):
+                    eligible_pids.append(pid)
+            eligible_pids = sorted(eligible_pids)
+            if len(eligible_pids) < num_pids:
+                raise ValueError(
+                    'eval_subset requested {} identities, but only {} satisfy '
+                    'the completeness/gallery requirements.'.format(
+                        num_pids, len(eligible_pids)))
+
+            pid_rng = random.Random(seed)
+            pid_rng.shuffle(eligible_pids)
+            selected_pids = sorted(eligible_pids[:num_pids])
+            selected_keys = set()
+            selected_probe_view_counts = {view: 0 for view in probe_views}
+
+            # Rotate the five requested views across identities. With 150
+            # identities and ten CCGR views, every view contributes exactly
+            # 75 probes when all complete identities contain all ten views.
+            view_stride = max(1, len(probe_views) // probes_per_pid)
+            for pid_index, pid in enumerate(selected_pids):
+                pid_seqs = per_pid[pid]
+                pid_gallery = sorted(
+                    [seq for seq in pid_seqs
+                     if sequence_key(seq) in gallery_set],
+                    key=sequence_key)
+                chosen_gallery = pid_gallery[:gallery_per_pid]
+                selected_keys.update(sequence_key(seq) for seq in chosen_gallery)
+
+                gallery_keys = {sequence_key(seq) for seq in pid_gallery}
+                probe_by_view = {view: [] for view in probe_views}
+                for seq in pid_seqs:
+                    if sequence_key(seq) in gallery_keys:
+                        continue
+                    view = normalized_probe_view(seq[2])
+                    if view is not None:
+                        probe_by_view[view].append(seq)
+
+                target_views = [
+                    probe_views[(pid_index + offset * view_stride)
+                                % len(probe_views)]
+                    for offset in range(probes_per_pid)]
+                if len(set(target_views)) != probes_per_pid:
+                    raise ValueError(
+                        'eval_subset view rotation produced duplicate views; '
+                        'adjust probe_views or probes_per_pid.')
+                for view in target_views:
+                    candidates = sorted(
+                        probe_by_view.get(view, []), key=sequence_key)
+                    if not candidates:
+                        raise ValueError(
+                            'Identity {} has no non-gallery probe for requested '
+                            'view {}.'.format(pid, view))
+                    choice_rng = random.Random('{}:{}:{}'.format(
+                        seed, pid, view))
+                    chosen_probe = candidates[
+                        choice_rng.randrange(len(candidates))]
+                    selected_keys.add(sequence_key(chosen_probe))
+                    selected_probe_view_counts[view] += 1
+
+            subset = [
+                seq for seq in seqs_info_list
+                if sequence_key(seq) in selected_keys]
+            expected_size = num_pids * (gallery_per_pid + probes_per_pid)
+            if len(subset) != expected_size:
+                raise RuntimeError(
+                    'Balanced eval subset produced {} sequences; expected {}.'
+                    .format(len(subset), expected_size))
+
+            msg_mgr.log_info('-------- Balanced Eval Subset --------')
+            msg_mgr.log_info(
+                'Selected {} identities x ({} gallery + {} probe) = {} '
+                'sequences with seed {}.'.format(
+                    num_pids, gallery_per_pid, probes_per_pid,
+                    len(subset), seed))
+            msg_mgr.log_info(
+                'Probe view counts: {}'.format(selected_probe_view_counts))
+            log_pid_list(selected_pids)
+            return subset
+
+        if training:
+            self.seqs_info = get_seqs_info_list(train_set)
+        else:
+            self.seqs_info = build_balanced_eval_subset(
+                get_seqs_info_list(test_set))
