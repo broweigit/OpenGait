@@ -1975,6 +1975,98 @@ def evaluate_CCGR_MINI(data, dataset, metric='euc'):
     return results
 
 
+def evaluate_embedding_variants(
+    data,
+    dataset,
+    metric='euc',
+    base_eval_func='evaluate_CCGR_MINI',
+    variants=None,
+    result_group='variants',
+    include_mesh_diagnostics=False,
+):
+    """Evaluate named embeddings produced during one dataloader pass.
+
+    Each condition is stored under ``embeddings_<variant>``. Optional mesh
+    diagnostics are per-sequence frame averages accumulated by the model.
+    """
+    msg_mgr = get_msg_mgr()
+    if variants is None:
+        variants = [
+            'clean',
+            'lowres_x2',
+            'lowres_x4',
+            'pose_jitter_5deg',
+            'pose_jitter_10deg',
+        ]
+    if base_eval_func in ('evaluate_embedding_variants', 'evaluate_robustness_variants'):
+        raise ValueError('base_eval_func cannot recursively call a variant evaluator.')
+    base_evaluator = globals().get(base_eval_func)
+    if base_evaluator is None or not callable(base_evaluator):
+        raise ValueError(f'Unknown variant base evaluator: {base_eval_func}')
+
+    combined_results = {}
+    for variant in variants:
+        embedding_key = f'embeddings_{variant}'
+        if embedding_key not in data:
+            raise KeyError(
+                f'Missing {embedding_key!r}; available inference keys: {sorted(data.keys())}'
+            )
+        variant_data = data.copy()
+        variant_data['embeddings'] = data[embedding_key]
+        msg_mgr.log_info('\n' + '=' * 72)
+        msg_mgr.log_info(f'>>> {result_group} variant: {variant} ({embedding_key})')
+        msg_mgr.log_info('=' * 72)
+        variant_results = base_evaluator(variant_data, dataset, metric=metric)
+        if variant_results:
+            for key, value in variant_results.items():
+                scalar_name = key.rsplit('/', 1)[-1]
+                combined_results[
+                    f'scalar/{result_group}/{variant}/{scalar_name}'
+                ] = value
+
+        if include_mesh_diagnostics:
+            diagnostic_specs = (
+                ('mesh_failure_rate', 'CatastrophicMeshFailureRate'),
+                ('mesh_in_frame_vertex_ratio', 'InFrameVertexRatio'),
+            )
+            for prefix, display_name in diagnostic_specs:
+                diagnostic_key = f'{prefix}_{variant}'
+                if diagnostic_key not in data:
+                    raise KeyError(
+                        f'Missing {diagnostic_key!r}; available inference keys: '
+                        f'{sorted(data.keys())}'
+                    )
+                percentage = float(np.asarray(data[diagnostic_key]).mean() * 100.0)
+                combined_results[
+                    f'scalar/{result_group}/{variant}/{display_name}'
+                ] = percentage
+                msg_mgr.log_info(f'{display_name}: {percentage:.4f}%')
+
+    msg_mgr.log_info('\n' + '=' * 72)
+    msg_mgr.log_info(f'{result_group} summary (one dataloader traversal)')
+    msg_mgr.log_info(combined_results)
+    return combined_results
+
+
+def evaluate_robustness_variants(
+    data,
+    dataset,
+    metric='euc',
+    base_eval_func='evaluate_CCGR_MINI',
+    variants=None,
+):
+    """Backward-compatible entry point for A4 robustness evaluation."""
+    return evaluate_embedding_variants(
+        data=data,
+        dataset=dataset,
+        metric=metric,
+        base_eval_func=base_eval_func,
+        variants=variants,
+        result_group='robustness',
+        include_mesh_diagnostics=True,
+    )
+
+
 def evaluate_CCGR_MINI_part_based(data, dataset, metric='euc'):
     assert 'CCGR' in dataset
     msg_mgr = get_msg_mgr()

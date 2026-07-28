@@ -564,6 +564,34 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
     def preprocess(self, sils, h, w, mode='bilinear'):
         return F.interpolate(sils, (h, w), mode=mode, align_corners=False)
 
+    def prepare_backbone_input(
+        self,
+        rgb_img,
+        target_h,
+        target_w,
+        sequence_batch=None,
+        sequence_length=None,
+        sequence_lengths=None,
+    ):
+        """Prepare RGB for the frozen SAM3D backbone.
+
+        Kept as a separate hook so evaluation-only robustness subclasses can
+        perturb the image seen by both the LVM and body estimator without
+        changing the normal A4 data path.
+        """
+        return self.preprocess(rgb_img, target_h, target_w)
+
+    def perturb_pose_out_for_eval(
+        self,
+        pose_out,
+        sequence_batch,
+        sequence_length,
+        chunk_index=0,
+        sequence_lengths=None,
+    ):
+        """Evaluation-only hook for controlled parametric-body perturbations."""
+        return pose_out
+
     def min_max_norm(self, x):
         return (x - x.min()) / (x.max() - x.min())
 
@@ -737,7 +765,14 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
             curr_bs = rgb_img.shape[0]
 
             with torch.no_grad():
-                outs = self.preprocess(rgb_img, target_h, target_w)
+                outs = self.prepare_backbone_input(
+                    rgb_img,
+                    target_h,
+                    target_w,
+                    sequence_batch=n,
+                    sequence_length=s,
+                    sequence_lengths=seqL,
+                )
                 outs = self._cast_floating_to_module_dtype(outs, self.Backbone)
                 self.intermediate_features = {}
                 _ = self.Backbone(outs)
@@ -768,6 +803,13 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_Gaitbase_Share(BaseModel):
                     )
 
                 pose_out = self._cast_floating_dtype(pose_outs[-1], torch.float32)
+                pose_out = self.perturb_pose_out_for_eval(
+                    pose_out,
+                    sequence_batch=n,
+                    sequence_length=s,
+                    chunk_index=chunk_idx,
+                    sequence_lengths=seqL,
+                )
                 self._apose_cache = {}
                 pred_verts = pose_out['pred_vertices']
                 pred_cam_t = pose_out['pred_cam_t']
