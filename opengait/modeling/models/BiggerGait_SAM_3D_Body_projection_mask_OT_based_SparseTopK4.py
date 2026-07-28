@@ -493,6 +493,12 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_SparseTopK4_Gaitbase_Share
         chunk_index=0,
         sequence_lengths=None,
     ):
+        # The parent A4 forward always invokes this hook. Ordinary train/test
+        # and Sparse-OT sensitivity runs must preserve the submitted model's
+        # exact behavior and must not touch robustness-only diagnostic caches.
+        if not self.robustness_eval_enabled:
+            return pose_out
+
         variant = self._active_robustness_variant
         variant_type = variant.get("type")
         if variant_type == "collect_temporal_mean":
