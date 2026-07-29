@@ -237,6 +237,231 @@ class DataSet(tordata.Dataset):
             if not subset_cfg.get('enabled', False):
                 return seqs_info_list
 
+            strategy = str(subset_cfg.get(
+                'strategy', 'ccgr_gallery_view')).lower()
+
+            if strategy == 'ccpg_protocol_balanced':
+                seed = int(subset_cfg.get('seed', 7890))
+                num_pids = int(subset_cfg.get('num_pids', 99))
+                sequences_per_pid = int(
+                    subset_cfg.get('sequences_per_pid', 30))
+                base_views_per_type = int(
+                    subset_cfg.get('base_views_per_type', 4))
+                protocol_types = [str(value) for value in subset_cfg.get(
+                    'protocol_types',
+                    ['U0_D0_BG', 'U0_D0', 'U1_D1', 'U2_D2',
+                     'U3_D3', 'U0_D3', 'U1_D0'])]
+                camera_views = [str(value) for value in subset_cfg.get(
+                    'camera_views',
+                    ['01', '02', '03', '04', '05',
+                     '06', '07', '08', '09', '10'])]
+
+                if (num_pids <= 0 or sequences_per_pid <= 0
+                        or base_views_per_type <= 1):
+                    raise ValueError(
+                        'CCPG eval_subset counts must be positive and '
+                        'base_views_per_type must exceed one.')
+                if len(protocol_types) != len(set(protocol_types)):
+                    raise ValueError(
+                        'CCPG eval_subset.protocol_types contains duplicates.')
+                if len(camera_views) != len(set(camera_views)):
+                    raise ValueError(
+                        'CCPG eval_subset.camera_views contains duplicates.')
+                minimum_per_pid = len(protocol_types) * base_views_per_type
+                if sequences_per_pid < minimum_per_pid:
+                    raise ValueError(
+                        'CCPG sequences_per_pid={} is smaller than the {} '
+                        'sequences required by {} types x {} base views.'
+                        .format(
+                            sequences_per_pid, minimum_per_pid,
+                            len(protocol_types), base_views_per_type))
+
+                def sequence_key(seq_info):
+                    return '-'.join(seq_info[:3])
+
+                def normalized_camera(raw_view):
+                    for camera in sorted(
+                            camera_views, key=len, reverse=True):
+                        if (raw_view == camera
+                                or raw_view.startswith(camera + '_')):
+                            return camera
+                    return None
+
+                per_pid = {}
+                for seq_info in seqs_info_list:
+                    pid, seq_type, raw_view = seq_info[:3]
+                    camera = normalized_camera(str(raw_view))
+                    if seq_type not in protocol_types or camera is None:
+                        continue
+                    per_pid.setdefault(pid, {}).setdefault(
+                        seq_type, {}).setdefault(camera, []).append(seq_info)
+
+                eligible_pids = []
+                common_cameras_by_pid = {}
+                for pid, type_map in per_pid.items():
+                    if any(seq_type not in type_map
+                           for seq_type in protocol_types):
+                        continue
+                    common_cameras = set(camera_views)
+                    for seq_type in protocol_types:
+                        common_cameras &= set(type_map[seq_type].keys())
+                    if len(common_cameras) < base_views_per_type:
+                        continue
+                    eligible_pids.append(pid)
+                    common_cameras_by_pid[pid] = sorted(common_cameras)
+
+                eligible_pids = sorted(eligible_pids)
+                if len(eligible_pids) < num_pids:
+                    raise ValueError(
+                        'CCPG eval_subset requested {} identities, but only '
+                        '{} contain every protocol type and at least {} common '
+                        'camera views.'.format(
+                            num_pids, len(eligible_pids),
+                            base_views_per_type))
+
+                pid_rng = random.Random(seed)
+                pid_rng.shuffle(eligible_pids)
+                selected_pids = sorted(eligible_pids[:num_pids])
+                processing_pids = list(selected_pids)
+                random.Random(seed + 1).shuffle(processing_pids)
+
+                selected_keys = set()
+                selected_counts_by_pid = {pid: 0 for pid in selected_pids}
+                type_counts = {seq_type: 0 for seq_type in protocol_types}
+                camera_counts = {camera: 0 for camera in camera_views}
+                type_camera_counts = {
+                    (seq_type, camera): 0
+                    for seq_type in protocol_types
+                    for camera in camera_views
+                }
+
+                def choose_sequence(candidates):
+                    # Prefer the canonical *_0 recording; otherwise use the
+                    # lexicographically first available repeat.
+                    return sorted(candidates, key=sequence_key)[0]
+
+                for pid in processing_pids:
+                    type_map = per_pid[pid]
+                    tie_cameras = list(common_cameras_by_pid[pid])
+                    random.Random('{}:{}:base'.format(
+                        seed, pid)).shuffle(tie_cameras)
+                    tie_rank = {
+                        camera: index
+                        for index, camera in enumerate(tie_cameras)}
+                    chosen_cameras = sorted(
+                        common_cameras_by_pid[pid],
+                        key=lambda camera: (
+                            camera_counts[camera], tie_rank[camera]))[
+                                :base_views_per_type]
+
+                    for seq_type in protocol_types:
+                        for camera in chosen_cameras:
+                            chosen = choose_sequence(
+                                type_map[seq_type][camera])
+                            key = sequence_key(chosen)
+                            selected_keys.add(key)
+                            selected_counts_by_pid[pid] += 1
+                            type_counts[seq_type] += 1
+                            camera_counts[camera] += 1
+                            type_camera_counts[(seq_type, camera)] += 1
+
+                    extras_needed = sequences_per_pid - minimum_per_pid
+                    extra_candidates = []
+                    for seq_type in protocol_types:
+                        for camera, candidates in type_map[seq_type].items():
+                            chosen = choose_sequence(candidates)
+                            if sequence_key(chosen) not in selected_keys:
+                                extra_candidates.append(
+                                    (seq_type, camera, chosen))
+                    extra_ties = list(extra_candidates)
+                    random.Random('{}:{}:extra'.format(
+                        seed, pid)).shuffle(extra_ties)
+                    extra_tie_rank = {
+                        sequence_key(item[2]): index
+                        for index, item in enumerate(extra_ties)}
+
+                    for _ in range(extras_needed):
+                        if not extra_candidates:
+                            raise ValueError(
+                                'Identity {} has insufficient distinct CCPG '
+                                'protocol sequences for {} samples.'.format(
+                                    pid, sequences_per_pid))
+                        extra_candidates.sort(key=lambda item: (
+                            type_counts[item[0]],
+                            camera_counts[item[1]],
+                            type_camera_counts[(item[0], item[1])],
+                            extra_tie_rank[sequence_key(item[2])]))
+                        seq_type, camera, chosen = extra_candidates.pop(0)
+                        selected_keys.add(sequence_key(chosen))
+                        selected_counts_by_pid[pid] += 1
+                        type_counts[seq_type] += 1
+                        camera_counts[camera] += 1
+                        type_camera_counts[(seq_type, camera)] += 1
+
+                subset = [
+                    seq for seq in seqs_info_list
+                    if sequence_key(seq) in selected_keys]
+                expected_size = num_pids * sequences_per_pid
+                if len(subset) != expected_size:
+                    raise RuntimeError(
+                        'CCPG balanced subset produced {} sequences; expected '
+                        '{}.'.format(len(subset), expected_size))
+                if any(count != sequences_per_pid
+                       for count in selected_counts_by_pid.values()):
+                    raise RuntimeError(
+                        'CCPG balanced subset did not retain exactly {} '
+                        'sequences per identity.'.format(sequences_per_pid))
+
+                # Every selected probe must retain a same-identity gallery at
+                # a different camera under each of the four CCPG conditions.
+                protocol_pairs = [
+                    (['U0_D0_BG', 'U0_D0'],
+                     ['U1_D1', 'U2_D2', 'U3_D3']),
+                    (['U3_D3'], ['U0_D3']),
+                    (['U1_D0'], ['U1_D1']),
+                    (['U0_D0_BG'], ['U0_D0']),
+                ]
+                selected_per_pid = {}
+                for seq in subset:
+                    selected_per_pid.setdefault(seq[0], []).append(seq)
+                for pid, pid_seqs in selected_per_pid.items():
+                    for probe_types, gallery_types in protocol_pairs:
+                        gallery_cameras = {
+                            normalized_camera(str(seq[2]))
+                            for seq in pid_seqs if seq[1] in gallery_types}
+                        probes = [
+                            seq for seq in pid_seqs
+                            if seq[1] in probe_types]
+                        if not probes or not gallery_cameras:
+                            raise RuntimeError(
+                                'CCPG subset protocol coverage is incomplete '
+                                'for identity {}.'.format(pid))
+                        for probe in probes:
+                            probe_camera = normalized_camera(str(probe[2]))
+                            if not any(camera != probe_camera
+                                       for camera in gallery_cameras):
+                                raise RuntimeError(
+                                    'CCPG subset has no cross-camera gallery '
+                                    'for identity {} probe {}.'.format(
+                                        pid, sequence_key(probe)))
+
+                msg_mgr.log_info(
+                    '-------- CCPG Protocol-Balanced Eval Subset --------')
+                msg_mgr.log_info(
+                    'Selected {} identities x {} sequences = {} sequences '
+                    'with seed {}.'.format(
+                        num_pids, sequences_per_pid, len(subset), seed))
+                msg_mgr.log_info(
+                    'Protocol type counts: {}'.format(type_counts))
+                msg_mgr.log_info(
+                    'Camera counts: {}'.format(camera_counts))
+                log_pid_list(selected_pids)
+                return subset
+
+            if strategy != 'ccgr_gallery_view':
+                raise ValueError(
+                    'Unknown eval_subset strategy: {}'.format(strategy))
+
             gallery_set = set(partition.get('GALLERY_SET', []))
             if not gallery_set:
                 raise ValueError(

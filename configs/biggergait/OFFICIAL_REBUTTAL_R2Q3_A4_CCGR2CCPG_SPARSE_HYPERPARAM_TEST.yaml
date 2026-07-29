@@ -1,0 +1,188 @@
+# Reviewer 2 / Q3: cross-domain Sparse OT sensitivity of the CCGR-trained A4.
+# The 2,970-sequence CCPG subset retains 99 protocol-complete test identities
+# and balances all seven official protocol types and ten camera views.
+# Each unique hyperparameter setting is evaluated in one dataloader traversal.
+data_cfg:
+  dataset_name: CCGR-MINI
+  dataset_root: /data/CCPG/Released/CCPG-ratio-pkl
+  dataset_partition: ./datasets/CCPG/CCPG.json
+  data_in_use: [true, false]
+  num_workers: 8
+  remove_no_gallery: false
+  test_dataset_name: CCPG
+  eval_subset:
+    enabled: true
+    strategy: ccpg_protocol_balanced
+    seed: 7890
+    num_pids: 99
+    sequences_per_pid: 30
+    base_views_per_type: 4
+    protocol_types: ["U0_D0_BG", "U0_D0", "U1_D1", "U2_D2", "U3_D3", "U0_D3", "U1_D0"]
+    camera_views: ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10"]
+
+evaluator_cfg:
+  enable_float16: true
+  restore_ckpt_strict: true
+  restore_hint: output/CCGR-MINI/BiggerGait__SAM3DBody__Projection_Mask_OT_Based_SparseTopK4_Gaitbase_Share/OFFICIAL_REBUTTAL_T2A4_T2B2_T2C3_T2D4_MAIN_CCGR/checkpoints/OFFICIAL_REBUTTAL_T2A4_T2B2_T2C3_T2D4_MAIN_CCGR-30000.pt
+  save_name: OFFICIAL_REBUTTAL_R2Q3_A4_CCGR2CCPG_SPARSE_HYPERPARAM
+  eval_func: evaluate_embedding_variants
+  base_eval_func: evaluate_CCPG_protocol_scalar
+  result_group: sparse_sensitivity
+  include_mesh_diagnostics: false
+  variants:
+    - current
+    - topk_1
+    - topk_2
+    - topk_8
+    - distance_0p1
+    - distance_0p3
+    - iterations_1
+    - iterations_2
+    - iterations_8
+    - temperature_0p005
+    - temperature_0p02
+  sampler:
+    batch_shuffle: false
+    batch_size: 4
+    sample_type: all_ordered
+    frames_all_limit: 250
+    type: InferenceSampler
+  metric: euc
+  transform:
+    - type: BaseRgbTransform
+
+loss_cfg:
+  - loss_term_weight: 1.0
+    margin: 0.2
+    type: TripletLoss
+    log_prefix: triplet
+  - loss_term_weight: 1.0
+    scale: 16
+    type: CrossEntropyLoss
+    log_prefix: softmax
+    log_accuracy: true
+
+model_cfg:
+  model: BiggerGait__SAM3DBody__Projection_Mask_OT_Based_SparseTopK4_Gaitbase_Share
+  chunk_size: 8
+  pretrained_lvm: pretrained_LVMs/sam-3d-body
+  pretrained_mask_branch: BYPASS
+  image_size: 256
+  sils_size: 32
+  source_dim: 1280
+  num_FPN: 4
+  debug_pca_vis: false
+  sparse_sensitivity_eval:
+    enabled: true
+    topk_values: [1, 2, 4, 8]
+    distance_values: [0.1, 0.2, 0.3]
+    iteration_values: [1, 2, 4, 8]
+    temperature_values: [0.005, 0.01, 0.02]
+  layer_config:
+    hook_mask:
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+    hook_sample_type: chunk
+  num_unknown: 16
+  ot_temperature: 0.01
+  ot_dist_thresh: 0.2
+  ot_iters: 8
+  ot_topk_support: 4
+  ot_sparse_rebalance_iters: 4
+  branch_configs:
+    - use_apose: false
+      yaw: original
+    - use_apose: true
+      yaw: 0.0
+  Mask_Branch:
+    source_dim: 1280
+    target_dim: 2
+    p: 0.0
+    softmax: true
+    Relu: false
+    Up: true
+  backbone_cfg:
+    type: ResNet9
+    block: BasicBlock_Time
+    in_channel: 16
+    channels: [64, 128, 256, 512]
+    layers: [1, 1, 1, 1]
+    strides: [1, 2, 1, 1]
+    maxpool: false
+  SeparateFCs:
+    in_channels: 512
+    out_channels: 256
+    parts_num: 32
+  SeparateBNNecks:
+    class_num: 571
+    in_channels: 256
+    parts_num: 32
+  bin_num: [32]
+
+optimizer_cfg:
+  lr: 0.1
+  momentum: 0.9
+  solver: SGD
+  weight_decay: 0.0005
+
+scheduler_cfg:
+  gamma: 0.1
+  milestones: [15000, 25000]
+  scheduler: MultiStepLR
+
+trainer_cfg:
+  find_unused_parameters: true
+  enable_float16: true
+  fix_BN: false
+  log_iter: 100
+  with_test: true
+  restore_ckpt_strict: true
+  restore_hint: 0
+  save_iter: 30000
+  save_name: OFFICIAL_REBUTTAL_R2Q3_A4_CCGR2CCPG_SPARSE_HYPERPARAM
+  sync_BN: true
+  total_iter: 30000
+  sampler:
+    batch_shuffle: true
+    batch_size: [8, 4]
+    frames_num_fixed: 30
+    frames_skip_num: 4
+    frames_num_max: 40
+    frames_num_min: 20
+    sample_type: fixed_unordered
+    type: TripletSampler
+  transform:
+    - type: Compose
+      trf_cfg:
+        - type: RandomHorizontalFlip
+        - type: BaseRgbTransform

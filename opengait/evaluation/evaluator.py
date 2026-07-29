@@ -789,6 +789,95 @@ def evaluate_CCPG(data, dataset, metric='euc'):
     return result_dict
 
 
+def evaluate_CCPG_protocol_scalar(data, dataset, metric='euc'):
+    """Evaluate CCPG protocol conditions without a dense view-pair matrix.
+
+    This evaluator is intended for a protocol-balanced subset. It retains the
+    official CL/UP/DN/BG probe and gallery sequence types and the standard
+    person-retrieval rule that removes same-identity, same-camera galleries.
+    Returning scalars makes it compatible with named embedding-variant tests.
+    """
+    if dataset != 'CCPG':
+        raise ValueError(
+            'evaluate_CCPG_protocol_scalar only supports CCPG, got {}.'
+            .format(dataset))
+
+    msg_mgr = get_msg_mgr()
+    feature = data['embeddings']
+    labels = np.asarray(data['labels'])
+    seq_types = np.asarray(data['types'])
+    cameras = np.asarray([
+        str(view).split('_')[0] for view in data['views']])
+    if isinstance(feature, torch.Tensor):
+        feature = feature.detach().cpu().numpy()
+
+    protocols = {
+        'CL': (
+            ['U0_D0_BG', 'U0_D0'],
+            ['U1_D1', 'U2_D2', 'U3_D3']),
+        'UP': (['U3_D3'], ['U0_D3']),
+        'DN': (['U1_D0'], ['U1_D1']),
+        'BG': (['U0_D0_BG'], ['U0_D0']),
+    }
+    ranks = (1, 5, 10)
+    condition_values = {
+        'Rank-1': [], 'Rank-5': [], 'Rank-10': [],
+        'mAP': [], 'mINP': [],
+    }
+    results = {}
+
+    for condition, (probe_types, gallery_types) in protocols.items():
+        probe_mask = np.isin(seq_types, probe_types)
+        gallery_mask = np.isin(seq_types, gallery_types)
+        if not np.any(probe_mask) or not np.any(gallery_mask):
+            raise ValueError(
+                '{} has an empty probe or gallery subset.'.format(condition))
+
+        probe_features = feature[probe_mask]
+        gallery_features = feature[gallery_mask]
+        probe_labels = labels[probe_mask]
+        gallery_labels = labels[gallery_mask]
+        probe_cameras = cameras[probe_mask]
+        gallery_cameras = cameras[gallery_mask]
+        msg_mgr.log_info(
+            '{}: {} probes, {} galleries, {} probe identities, {} gallery '
+            'identities.'.format(
+                condition, len(probe_labels), len(gallery_labels),
+                len(set(probe_labels.tolist())),
+                len(set(gallery_labels.tolist()))))
+
+        distance = cuda_dist(
+            probe_features, gallery_features, metric).cpu().numpy()
+        cmc, mean_ap, mean_inp = evaluate_many(
+            distance,
+            probe_labels,
+            gallery_labels,
+            probe_cameras,
+            gallery_cameras,
+        )
+        for rank in ranks:
+            value = float(cmc[rank - 1] * 100.0)
+            results[
+                'scalar/test_accuracy/{}_Rank-{}'.format(
+                    condition, rank)] = value
+            condition_values['Rank-{}'.format(rank)].append(value)
+        mean_ap = float(mean_ap * 100.0)
+        mean_inp = float(mean_inp * 100.0)
+        results['scalar/test_accuracy/{}_mAP'.format(condition)] = mean_ap
+        results['scalar/test_accuracy/{}_mINP'.format(condition)] = mean_inp
+        condition_values['mAP'].append(mean_ap)
+        condition_values['mINP'].append(mean_inp)
+
+    for metric_name, values in condition_values.items():
+        results[
+            'scalar/test_accuracy/Mean_{}'.format(metric_name)
+        ] = float(np.mean(values))
+
+    msg_mgr.log_info('CCPG protocol-balanced scalar results:')
+    msg_mgr.log_info(results)
+    return results
+
+
 def _load_runtime_yaml_cfg():
     import sys
     import yaml
