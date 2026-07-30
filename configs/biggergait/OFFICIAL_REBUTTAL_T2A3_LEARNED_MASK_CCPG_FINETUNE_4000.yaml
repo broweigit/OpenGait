@@ -1,4 +1,4 @@
-# Table 2(a) A3 / Table 2(d) D1: SAM3D projected-mask original-view branch only.
+# A3 CCPG learned-mask adaptation from the submitted 20000-step projected-mask checkpoint.
 data_cfg:
   dataset_name: CCPG
   dataset_root: /data/CCPG/Released/CCPG-ratio-pkl
@@ -12,7 +12,7 @@ evaluator_cfg:
   enable_float16: true
   restore_ckpt_strict: false
   restore_hint: output/CCPG/BiggerGait__SAM3DBody__Learned_Mask_Gaitbase_Share/OFFICIAL_REBUTTAL_T2A3_LEARNED_MASK_CCPG_FINETUNE_4000/checkpoints/OFFICIAL_REBUTTAL_T2A3_LEARNED_MASK_CCPG_FINETUNE_4000-04000.pt
-  save_name: OFFICIAL_REBUTTAL_T2A3_LEARNED_MASK_CCPG_INDOMAIN_TEST
+  save_name: OFFICIAL_REBUTTAL_T2A3_LEARNED_MASK_CCPG_FINETUNE_4000
   eval_func: evaluate_CCPG_part
   sampler:
     batch_shuffle: false
@@ -107,14 +107,14 @@ model_cfg:
   bin_num: [32]
 
 optimizer_cfg:
-  lr: 0.1
+  lr: 0.01
   momentum: 0.9
   solver: SGD
   weight_decay: 0.0005
 
 scheduler_cfg:
   gamma: 0.1
-  milestones: [10000, 15000]
+  milestones: [2000, 3200]
   scheduler: MultiStepLR
 
 trainer_cfg:
@@ -122,13 +122,15 @@ trainer_cfg:
   enable_float16: true
   fix_BN: false
   log_iter: 100
-  with_test: true
+  with_test: false
   restore_ckpt_strict: false
-  restore_hint: 0
-  save_iter: 20000
-  save_name: OFFICIAL_REBUTTAL_T2A3_T2D1_SAM3D_NO_LAYOUT_CCPG
+  optimizer_reset: true
+  scheduler_reset: true
+  restore_hint: output/CCPG/BiggerGait__SAM3DBody__Projection_Mask_Gaitbase_Share/OFFICIAL_REBUTTAL_T2A3_T2D1_SAM3D_NO_LAYOUT_CCPG/checkpoints/OFFICIAL_REBUTTAL_T2A3_T2D1_SAM3D_NO_LAYOUT_CCPG-20000.pt
+  save_iter: 1000
+  save_name: OFFICIAL_REBUTTAL_T2A3_LEARNED_MASK_CCPG_FINETUNE_4000
   sync_BN: true
-  total_iter: 20000
+  total_iter: 4000
   sampler:
     batch_shuffle: true
     batch_size: [8, 4]

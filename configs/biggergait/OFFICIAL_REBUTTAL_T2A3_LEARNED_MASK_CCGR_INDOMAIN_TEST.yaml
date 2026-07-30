@@ -12,7 +12,7 @@ data_cfg:
 evaluator_cfg:
   enable_float16: true
   restore_ckpt_strict: false
-  restore_hint: output/CCGR-MINI/BiggerGait__SAM3DBody__Projection_Mask_Gaitbase_Share/OFFICIAL_REBUTTAL_T2A3_T2D1_SAM3D_NO_LAYOUT_CCGR/checkpoints/OFFICIAL_REBUTTAL_T2A3_T2D1_SAM3D_NO_LAYOUT_CCGR-30000.pt
+  restore_hint: output/CCGR-MINI/BiggerGait__SAM3DBody__Learned_Mask_Gaitbase_Share/OFFICIAL_REBUTTAL_T2A3_LEARNED_MASK_CCGR_FINETUNE_6000/checkpoints/OFFICIAL_REBUTTAL_T2A3_LEARNED_MASK_CCGR_FINETUNE_6000-06000.pt
   save_name: OFFICIAL_REBUTTAL_T2A3_LEARNED_MASK_CCGR_INDOMAIN_TEST
   eval_func: evaluate_CCGR_MINI
   sampler:

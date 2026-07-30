@@ -1,19 +1,20 @@
-# Table 2(a) A3 / Table 2(d) D1: SAM3D projected-mask original-view branch only.
+# A3 CCGR learned-mask adaptation from the submitted 30000-step projected-mask checkpoint.
+# dataset_name deliberately remains CCGR-MINI for checkpoint lookup.
 data_cfg:
-  dataset_name: CCPG
-  dataset_root: /data/CCPG/Released/CCPG-ratio-pkl
-  dataset_partition: ./datasets/CCPG/CCPG.json
-  data_in_use: [true, false]
+  dataset_name: CCGR-MINI
+  dataset_root: /data1/CCGR/CCGR_MINI_RGB_CUT/CCGR-MINI-RGB-V1/
+  dataset_partition: ./datasets/CCGR-MINI/CCGR-MINI.json
+  data_in_use: [true]
   num_workers: 8
   remove_no_gallery: false
-  test_dataset_name: CCPG
+  test_dataset_name: CCGR-MINI
 
 evaluator_cfg:
   enable_float16: true
   restore_ckpt_strict: false
-  restore_hint: output/CCPG/BiggerGait__SAM3DBody__Learned_Mask_Gaitbase_Share/OFFICIAL_REBUTTAL_T2A3_LEARNED_MASK_CCPG_FINETUNE_4000/checkpoints/OFFICIAL_REBUTTAL_T2A3_LEARNED_MASK_CCPG_FINETUNE_4000-04000.pt
-  save_name: OFFICIAL_REBUTTAL_T2A3_LEARNED_MASK_CCPG_INDOMAIN_TEST
-  eval_func: evaluate_CCPG_part
+  restore_hint: output/CCGR-MINI/BiggerGait__SAM3DBody__Learned_Mask_Gaitbase_Share/OFFICIAL_REBUTTAL_T2A3_LEARNED_MASK_CCGR_FINETUNE_6000/checkpoints/OFFICIAL_REBUTTAL_T2A3_LEARNED_MASK_CCGR_FINETUNE_6000-06000.pt
+  save_name: OFFICIAL_REBUTTAL_T2A3_LEARNED_MASK_CCGR_FINETUNE_6000
+  eval_func: evaluate_CCGR_MINI
   sampler:
     batch_shuffle: false
     batch_size: 4
@@ -101,20 +102,20 @@ model_cfg:
     out_channels: 256
     parts_num: 32
   SeparateBNNecks:
-    class_num: 100
+    class_num: 571
     in_channels: 256
     parts_num: 32
   bin_num: [32]
 
 optimizer_cfg:
-  lr: 0.1
+  lr: 0.01
   momentum: 0.9
   solver: SGD
   weight_decay: 0.0005
 
 scheduler_cfg:
   gamma: 0.1
-  milestones: [10000, 15000]
+  milestones: [3000, 4800]
   scheduler: MultiStepLR
 
 trainer_cfg:
@@ -122,13 +123,15 @@ trainer_cfg:
   enable_float16: true
   fix_BN: false
   log_iter: 100
-  with_test: true
+  with_test: false
   restore_ckpt_strict: false
-  restore_hint: 0
-  save_iter: 20000
-  save_name: OFFICIAL_REBUTTAL_T2A3_T2D1_SAM3D_NO_LAYOUT_CCPG
+  optimizer_reset: true
+  scheduler_reset: true
+  restore_hint: output/CCGR-MINI/BiggerGait__SAM3DBody__Projection_Mask_Gaitbase_Share/OFFICIAL_REBUTTAL_T2A3_T2D1_SAM3D_NO_LAYOUT_CCGR/checkpoints/OFFICIAL_REBUTTAL_T2A3_T2D1_SAM3D_NO_LAYOUT_CCGR-30000.pt
+  save_iter: 1500
+  save_name: OFFICIAL_REBUTTAL_T2A3_LEARNED_MASK_CCGR_FINETUNE_6000
   sync_BN: true
-  total_iter: 20000
+  total_iter: 6000
   sampler:
     batch_shuffle: true
     batch_size: [8, 4]
