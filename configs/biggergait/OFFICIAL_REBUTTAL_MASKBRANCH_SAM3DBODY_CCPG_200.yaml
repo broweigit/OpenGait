@@ -1,0 +1,84 @@
+# BigGait mask-branch warm-up with the SAM 3D Body DINOv3 encoder.
+# Only shape_connect and shape_mse are returned by the model.
+data_cfg:
+  dataset_name: CCPG
+  dataset_root: /data/CCPG/Released/CCPG-ratio-pkl
+  dataset_partition: ./datasets/CCPG/CCPG.json
+  data_in_use: [true, false]
+  num_workers: 8
+  remove_no_gallery: false
+  test_dataset_name: CCPG
+
+evaluator_cfg:
+  enable_float16: true
+  restore_ckpt_strict: false
+  restore_hint: 0
+  save_name: OFFICIAL_REBUTTAL_MASKBRANCH_SAM3DBODY_CCPG_200
+  eval_func: evaluate_CCPG
+  sampler:
+    batch_shuffle: false
+    batch_size: 4
+    sample_type: all_ordered
+    frames_all_limit: 30
+    type: InferenceSampler
+  metric: euc
+  transform:
+    - type: BaseRgbTransform
+
+# Scalar shape losses are already computed in forward and are automatically
+# summed by LossAggregator when they are not listed here.
+loss_cfg: []
+
+model_cfg:
+  model: BigGait__SAM3DBody_MaskBranch_Pretrain
+  pretrained_lvm: pretrained_LVMs/sam-3d-body
+  image_size: 256
+  sils_size: 32
+  chunk_size: 8
+  hook_layer: 31
+  mask_branch_export_path: pretrained_LVMs/MaskBranch_sam3dbody_ccpg_iter200.pt
+  Mask_Branch:
+    source_dim: 1280
+    target_dim: 2
+    p: 0.5
+    softmax: true
+    Relu: false
+    Up: true
+
+optimizer_cfg:
+  lr: 0.1
+  momentum: 0.9
+  solver: SGD
+  weight_decay: 0.0005
+
+scheduler_cfg:
+  gamma: 0.1
+  milestones: [150]
+  scheduler: MultiStepLR
+
+trainer_cfg:
+  find_unused_parameters: false
+  enable_float16: true
+  fix_BN: false
+  log_iter: 10
+  with_test: false
+  restore_ckpt_strict: false
+  restore_hint: 0
+  save_iter: 200
+  save_name: OFFICIAL_REBUTTAL_MASKBRANCH_SAM3DBODY_CCPG_200
+  sync_BN: true
+  total_iter: 200
+  sampler:
+    batch_shuffle: true
+    batch_size: [8, 4]
+    frames_num_fixed: 30
+    frames_skip_num: 4
+    frames_num_max: 40
+    frames_num_min: 20
+    sample_type: fixed_unordered
+    type: TripletSampler
+  transform:
+    - type: Compose
+      trf_cfg:
+        - type: RandomHorizontalFlip
+        - type: BaseRgbTransform

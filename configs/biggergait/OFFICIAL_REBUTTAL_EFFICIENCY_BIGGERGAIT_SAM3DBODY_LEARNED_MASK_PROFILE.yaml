@@ -1,0 +1,146 @@
+# A3 efficiency profile: SAM 3D Body LVM + projected-mask original branch,
+# without the canonical branch. This mirrors the official A3 CCGR model.
+data_cfg:
+  dataset_name: CCPG
+  dataset_root: /data/CCPG/Released/CCPG-ratio-pkl
+  dataset_partition: ./datasets/CCPG/CCPG.json
+  data_in_use: [true, false]
+  num_workers: 0
+  remove_no_gallery: false
+  test_dataset_name: CCPG
+
+evaluator_cfg:
+  enable_float16: true
+  restore_ckpt_strict: false
+  restore_hint: 0
+  save_name: OFFICIAL_REBUTTAL_EFFICIENCY_BIGGERGAIT_SAM3DBODY_LEARNED_MASK_PROFILE
+  eval_func: evaluate_CCPG
+  sampler:
+    batch_shuffle: false
+    batch_size: 1
+    sample_type: all_ordered
+    frames_all_limit: 1
+    type: InferenceSampler
+  metric: euc
+  transform:
+    - type: BaseRgbTransform
+
+loss_cfg: []
+
+model_cfg:
+  model: BiggerGait__SAM3DBody_LearnedMask_ProfileStats_Gaitbase_Share
+  profile_case_name: BiggerGait_A3_SAM3DBody_LearnedMask
+  profile_method_name: BiggerGait_A3
+  profile_upstream_name: SAM_3D_Body
+  profile_downstream_name: LearnedMask_Original_GaitBase
+  profile_enabled: true
+  profile_only: true
+  profile_dump_json: true
+  profile_dummy_batch: 1
+  profile_dummy_seq: 1
+  profile_runtime_seq: 30
+  profile_runtime_warmup: 5
+  profile_runtime_repeats: 30
+  profile_runtime_amp: true
+
+  # Match OFFICIAL_REBUTTAL_T2A3_T2D1_SAM3D_NO_LAYOUT_CCGR_TRAIN.yaml.
+  chunk_size: 8
+  pretrained_lvm: pretrained_LVMs/sam-3d-body
+  pretrained_mask_branch: pretrained_LVMs/MaskBranch_sam3dbody_ccpg_iter200.pt
+  mask_foreground_channel: 1
+  image_size: 256
+  sils_size: 32
+  source_dim: 1280
+  num_FPN: 4
+  layer_config:
+    hook_mask:
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+    hook_sample_type: chunk
+  num_unknown: 16
+  Mask_Branch:
+    source_dim: 1280
+    target_dim: 2
+    p: 0.0
+    softmax: true
+    Relu: false
+    Up: true
+  backbone_cfg:
+    type: ResNet9
+    block: BasicBlock_Time
+    in_channel: 16
+    channels: [64, 128, 256, 512]
+    layers: [1, 1, 1, 1]
+    strides: [1, 2, 1, 1]
+    maxpool: false
+  SeparateFCs:
+    in_channels: 512
+    out_channels: 256
+    parts_num: 32
+  SeparateBNNecks:
+    class_num: 100
+    in_channels: 256
+    parts_num: 32
+  bin_num: [32]
+
+optimizer_cfg:
+  lr: 0.1
+  momentum: 0.9
+  solver: SGD
+  weight_decay: 0.0005
+
+scheduler_cfg:
+  gamma: 0.1
+  milestones: [15000, 25000]
+  scheduler: MultiStepLR
+
+trainer_cfg:
+  find_unused_parameters: true
+  enable_float16: false
+  fix_BN: false
+  log_iter: 1
+  with_test: false
+  restore_ckpt_strict: false
+  restore_hint: 0
+  save_iter: 999999
+  save_name: OFFICIAL_REBUTTAL_EFFICIENCY_BIGGERGAIT_SAM3DBODY_LEARNED_MASK_PROFILE
+  sync_BN: false
+  total_iter: 1
+  sampler:
+    batch_shuffle: false
+    batch_size: 1
+    sample_type: all_ordered
+    frames_all_limit: 1
+    type: CommonSampler
+  transform:
+    - type: BaseRgbTransform
