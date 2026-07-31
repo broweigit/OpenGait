@@ -1,37 +1,20 @@
-# Fast paired test for Reviewer 2's temporal-consistency question.
-# Only sequence-static MHR shape and scale are averaged. Frame-specific
-# body_pose, global_rot, camera translation, hand, and face parameters remain
-# unchanged, preserving articulated gait motion.
+# PDF full method trained on CCPG: SAM3D appearance/geometry, original-view +
+# A-pose/yaw-0 canonical branches, and SparseTopK4 transport.
 data_cfg:
-  dataset_name: CCGR-MINI
-  dataset_root: /data1/CCGR/CCGR_MINI_RGB_CUT/CCGR-MINI-RGB-V1/
-  dataset_partition: ./datasets/CCGR-MINI/CCGR-MINI.json
-  data_in_use: [true]
+  dataset_name: CCPG
+  dataset_root: /data/CCPG/Released/CCPG-ratio-pkl
+  dataset_partition: ./datasets/CCPG/CCPG.json
+  data_in_use: [true, false]
   num_workers: 8
   remove_no_gallery: false
-  test_dataset_name: CCGR-MINI
-  # Small reproducible subset for a rapid paired clean-vs-mean comparison:
-  # 30 identities x (2 gallery + 5 view-balanced probes) = 210 sequences.
-  eval_subset:
-    enabled: true
-    strategy: ccgr_gallery_view
-    seed: 7890
-    num_pids: 30
-    min_sequences_per_pid: 48
-    gallery_per_pid: 2
-    probes_per_pid: 5
-    probe_views: ["0", "22_5", "45", "67_5", "90", "112_5", "135", "157_5", "180", "over"]
+  test_dataset_name: CCPG
 
 evaluator_cfg:
   enable_float16: true
   restore_ckpt_strict: true
-  restore_hint: output/CCGR-MINI/BiggerGait__SAM3DBody__Projection_Mask_OT_Based_SparseTopK4_Gaitbase_Share/OFFICIAL_REBUTTAL_T2A4_T2B2_T2C3_T2D4_MAIN_CCGR/checkpoints/OFFICIAL_REBUTTAL_T2A4_T2B2_T2C3_T2D4_MAIN_CCGR-30000.pt
-  save_name: OFFICIAL_REBUTTAL_R2Q2_A4_CCGR_TEMPORAL_SHAPE_SCALE_MEAN_FAST
-  eval_func: evaluate_robustness_variants
-  base_eval_func: evaluate_CCGR_MINI
-  variants:
-    - clean
-    - temporal_shape_scale_mean
+  restore_hint: 20000
+  save_name: OFFICIAL_REBUTTAL_T2A4_T2B2_T2C3_T2D4_MAIN_CCPG
+  eval_func: evaluate_CCPG_part_based
   sampler:
     batch_shuffle: false
     batch_size: 4
@@ -63,16 +46,6 @@ model_cfg:
   source_dim: 1280
   num_FPN: 4
   debug_pca_vis: false
-  robustness_eval:
-    enabled: true
-    variants: [clean, temporal_shape_scale_mean]
-    lowres_scales: [0.5, 0.25]
-    occlusion_fractions: []
-    pose_jitter_degrees: [5.0, 10.0]
-    temporal_parameter_mean: false
-    temporal_shape_scale_mean: true
-    mesh_failure_min_in_frame_ratio: 0.1
-    seed: 7890
   layer_config:
     hook_mask:
       - false
@@ -139,7 +112,7 @@ model_cfg:
     out_channels: 256
     parts_num: 32
   SeparateBNNecks:
-    class_num: 571
+    class_num: 100
     in_channels: 256
     parts_num: 32
   bin_num: [32]
@@ -152,7 +125,7 @@ optimizer_cfg:
 
 scheduler_cfg:
   gamma: 0.1
-  milestones: [15000, 25000]
+  milestones: [10000, 15000]
   scheduler: MultiStepLR
 
 trainer_cfg:
@@ -163,10 +136,10 @@ trainer_cfg:
   with_test: true
   restore_ckpt_strict: true
   restore_hint: 0
-  save_iter: 30000
-  save_name: OFFICIAL_REBUTTAL_R2Q2_A4_CCGR_TEMPORAL_SHAPE_SCALE_MEAN_FAST
+  save_iter: 20000
+  save_name: OFFICIAL_REBUTTAL_T2A4_T2B2_T2C3_T2D4_MAIN_CCPG
   sync_BN: true
-  total_iter: 30000
+  total_iter: 20000
   sampler:
     batch_shuffle: true
     batch_size: [8, 4]
