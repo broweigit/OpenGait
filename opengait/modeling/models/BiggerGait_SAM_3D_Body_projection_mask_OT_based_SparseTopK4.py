@@ -45,6 +45,10 @@ class GeometryOptimalTransportSparseTopK(nn.Module):
             if target_valid_mask is not None:
                 valid_connection = valid_connection & target_valid_mask.unsqueeze(2)
 
+            # Source tokens with at least one local target before Top-k.
+            # This separates geometric eligibility from sparse pruning.
+            candidate_source_mask = valid_connection.any(dim=1)
+
             if self.topk_support > 0:
                 src_count = source_feats.shape[1]
                 topk = min(self.topk_support, src_count)
@@ -72,6 +76,20 @@ class GeometryOptimalTransportSparseTopK(nn.Module):
 
             attn = torch.exp(log_k + u + v)
             has_source = valid_connection.any(dim=-1, keepdim=True)
+            retained_source_mask = valid_connection.any(dim=1)
+            if source_valid_mask is None:
+                valid_source_mask = torch.ones_like(retained_source_mask)
+            else:
+                valid_source_mask = source_valid_mask.bool()
+
+
+            # Use the actual transport graph for coverage diagnostics. A
+            # valid transported feature can itself be the zero vector.
+            self.last_supported_target_mask = has_source.squeeze(-1).detach()
+            self.last_valid_source_mask = valid_source_mask.detach()
+            self.last_candidate_source_mask = candidate_source_mask.detach()
+            self.last_retained_source_mask = retained_source_mask.detach()
+            self.last_transport_edge_count = valid_connection.sum(dim=(1, 2)).detach()
 
         target_feats = torch.bmm(attn, source_feats)
         if target_valid_mask is not None:
@@ -96,9 +114,19 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_SparseTopK4_Gaitbase_Share
         self.sparse_sensitivity_enabled = bool(
             self.sparse_sensitivity_cfg.get("enabled", False)
         )
-        if self.robustness_eval_enabled and self.sparse_sensitivity_enabled:
+        self.coverage_eval_cfg = model_cfg.get("canonical_coverage_eval", {}) or {}
+        self.coverage_eval_enabled = bool(
+            self.coverage_eval_cfg.get("enabled", False)
+        )
+        enabled_eval_modes = sum([
+            self.robustness_eval_enabled,
+            self.sparse_sensitivity_enabled,
+            self.coverage_eval_enabled,
+        ])
+        if enabled_eval_modes > 1:
             raise ValueError(
-                "robustness_eval and sparse_sensitivity_eval are mutually exclusive."
+                "robustness_eval, sparse_sensitivity_eval, and "
+                "canonical_coverage_eval are mutually exclusive."
             )
         self._active_robustness_variant = {"type": "clean", "name": "clean"}
         self._robustness_batch_index = 0
@@ -111,6 +139,20 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_SparseTopK4_Gaitbase_Share
             for cfg in self.branch_configs
         ]
         self.msg_mgr.log_info(f"[OT] Branch configs: {branch_desc}")
+        if self.coverage_eval_enabled:
+            canonical_branch_count = sum(
+                not self._is_original_view_branch(cfg)
+                for cfg in self.branch_configs
+            )
+            if canonical_branch_count != 1:
+                raise ValueError(
+                    "canonical_coverage_eval currently requires exactly one "
+                    f"canonical branch, got {canonical_branch_count}."
+                )
+            self.msg_mgr.log_info(
+                "[Coverage] Enabled exact canonical transport-support "
+                "measurement for the canonical branch."
+            )
 
         self.ot_topk_support = int(model_cfg.get("ot_topk_support", 0) or 0)
         self.ot_sparse_rebalance_iters = int(
@@ -198,6 +240,23 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_SparseTopK4_Gaitbase_Share
                 "type": "temporal_mean",
                 "name": "temporal_parameter_mean",
             })
+        if self.robustness_eval_cfg.get("temporal_shape_scale_mean", False):
+            variants.append({
+                "type": "temporal_shape_scale_mean",
+                "name": "temporal_shape_scale_mean",
+            })
+
+        requested_names = self.robustness_eval_cfg.get("variants")
+        if requested_names is not None:
+            requested_names = list(requested_names)
+            by_name = {variant["name"]: variant for variant in variants}
+            unknown = [name for name in requested_names if name not in by_name]
+            if unknown:
+                raise ValueError(
+                    f"Unknown robustness_eval variants: {unknown}; "
+                    f"available variants: {sorted(by_name)}"
+                )
+            variants = [by_name[name] for name in requested_names]
         return variants
 
     def _sparse_sensitivity_variants(self):
@@ -426,6 +485,56 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_SparseTopK4_Gaitbase_Share
         self._temporal_pose_cursor = end
         return self._rebuild_pose_geometry(rebuilt)
 
+    def _finalize_temporal_shape_scale_mean(self):
+        """Average sequence-static MHR body shape/scale only."""
+        if not self._temporal_pose_chunks:
+            raise RuntimeError("No pose chunks were collected for temporal mean.")
+        keys = ("shape", "scale")
+        full = {
+            key: torch.cat(
+                [chunk[key] for chunk in self._temporal_pose_chunks], dim=0
+            )
+            for key in keys
+        }
+        total_frames = next(iter(full.values())).shape[0]
+        if sum(self._current_sequence_lengths) != total_frames:
+            raise RuntimeError(
+                "Collected temporal-parameter frames do not match current seqL."
+            )
+
+        per_frame = {key: [] for key in keys}
+        start = 0
+        for length in self._current_sequence_lengths:
+            end = start + length
+            for key in keys:
+                mean_value = full[key][start:end].mean(dim=0, keepdim=True)
+                per_frame[key].append(
+                    mean_value.expand(length, *mean_value.shape[1:])
+                )
+            start = end
+
+        self._temporal_static_per_frame = {
+            key: torch.cat(values, dim=0) for key, values in per_frame.items()
+        }
+        self._temporal_static_cursor = 0
+
+    def _apply_temporal_shape_scale_mean(
+        self, pose_out, sequence_batch, sequence_length
+    ):
+        if not hasattr(self, "_temporal_static_per_frame"):
+            raise RuntimeError("Temporal shape/scale mean cache has not been built.")
+        rebuilt = dict(pose_out)
+        chunk_frames = int(sequence_batch) * int(sequence_length)
+        start = self._temporal_static_cursor
+        end = start + chunk_frames
+        total_frames = next(iter(self._temporal_static_per_frame.values())).shape[0]
+        if end > total_frames:
+            raise RuntimeError("Temporal shape/scale cache was exhausted early.")
+        for key, values in self._temporal_static_per_frame.items():
+            rebuilt[key] = values[start:end]
+        self._temporal_static_cursor = end
+        return self._rebuild_pose_geometry(rebuilt)
+
     def _reset_mesh_quality_stats(self):
         self._mesh_quality_chunks = []
 
@@ -508,6 +617,10 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_SparseTopK4_Gaitbase_Share
             pose_out = self._apply_temporal_parameter_mean(
                 pose_out, sequence_batch, sequence_length
             )
+        elif variant_type == "temporal_shape_scale_mean":
+            pose_out = self._apply_temporal_shape_scale_mean(
+                pose_out, sequence_batch, sequence_length
+            )
         elif variant_type == "pose_jitter":
             body_pose = pose_out["body_pose"].float().clone()
             global_rot = pose_out["global_rot"].float().clone()
@@ -582,7 +695,9 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_SparseTopK4_Gaitbase_Share
         )
         try:
             for variant in self._robustness_variants():
-                if variant["type"] == "temporal_mean":
+                if variant["type"] in (
+                    "temporal_mean", "temporal_shape_scale_mean"
+                ):
                     self._temporal_pose_chunks = []
                     self._active_robustness_variant = {
                         "type": "collect_temporal_mean",
@@ -590,7 +705,10 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_SparseTopK4_Gaitbase_Share
                     }
                     collect_retval = super().forward(inputs)
                     del collect_retval
-                    self._finalize_temporal_parameter_mean()
+                    if variant["type"] == "temporal_mean":
+                        self._finalize_temporal_parameter_mean()
+                    else:
+                        self._finalize_temporal_shape_scale_mean()
 
                 self._reset_mesh_quality_stats()
                 self._active_robustness_variant = variant
@@ -610,6 +728,10 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_SparseTopK4_Gaitbase_Share
                 del self._temporal_pose_per_frame
             if hasattr(self, "_temporal_pose_cursor"):
                 del self._temporal_pose_cursor
+            if hasattr(self, "_temporal_static_per_frame"):
+                del self._temporal_static_per_frame
+            if hasattr(self, "_temporal_static_cursor"):
+                del self._temporal_static_cursor
         return {
             "training_feat": {},
             "visual_summary": {},
@@ -617,6 +739,10 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_SparseTopK4_Gaitbase_Share
         }
 
     def forward(self, inputs):
+        if self.coverage_eval_enabled:
+            if self.training:
+                raise RuntimeError("canonical_coverage_eval is evaluation-only.")
+            return self._forward_canonical_coverage(inputs)
         if not self.robustness_eval_enabled and not self.sparse_sensitivity_enabled:
             return super().forward(inputs)
         if self.training:
@@ -625,8 +751,173 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_SparseTopK4_Gaitbase_Share
             return self._forward_robustness(inputs)
         return self._forward_sparse_sensitivity(inputs)
 
+    def _record_canonical_coverage(
+        self,
+        supported_mask,
+        valid_target_mask,
+        valid_source_mask,
+        candidate_source_mask,
+        retained_source_mask,
+        transport_edge_count,
+    ):
+        """Collect exact per-frame numerator/denominator cell counts."""
+        if not self.coverage_eval_enabled:
+            return
+        supported_mask = supported_mask.bool()
+        valid_target_mask = valid_target_mask.bool()
+        supported_count = (supported_mask & valid_target_mask).reshape(
+            supported_mask.shape[0], -1
+        ).sum(dim=1)
+        valid_count = valid_target_mask.reshape(
+            valid_target_mask.shape[0], -1
+        ).sum(dim=1)
+        valid_source_count = valid_source_mask.bool().reshape(
+            valid_source_mask.shape[0], -1
+        ).sum(dim=1)
+        candidate_source_count = candidate_source_mask.bool().reshape(
+            candidate_source_mask.shape[0], -1
+        ).sum(dim=1)
+        retained_source_count = retained_source_mask.bool().reshape(
+            retained_source_mask.shape[0], -1
+        ).sum(dim=1)
+        transport_edge_count = transport_edge_count.reshape(-1)
+
+        self._coverage_supported_frame_chunks.append(supported_count)
+        self._coverage_valid_frame_chunks.append(valid_count)
+        self._coverage_source_valid_frame_chunks.append(valid_source_count)
+        self._coverage_source_candidate_frame_chunks.append(candidate_source_count)
+        self._coverage_source_retained_frame_chunks.append(retained_source_count)
+        self._coverage_transport_edge_frame_chunks.append(transport_edge_count)
+
+    @staticmethod
+    def _coverage_sequence_lengths(seq_l, total_frames, device):
+        if seq_l is None:
+            return torch.tensor([total_frames], device=device, dtype=torch.long)
+        lengths = torch.as_tensor(seq_l, device=device, dtype=torch.long).reshape(-1)
+        if int(lengths.sum().item()) != int(total_frames):
+            raise RuntimeError(
+                "canonical coverage frame accounting mismatch: "
+                f"seqL sums to {int(lengths.sum().item())}, but collected "
+                f"{int(total_frames)} frames."
+            )
+        return lengths
+
+    def _forward_canonical_coverage(self, inputs):
+        self._coverage_supported_frame_chunks = []
+        self._coverage_valid_frame_chunks = []
+        self._coverage_source_valid_frame_chunks = []
+        self._coverage_source_candidate_frame_chunks = []
+        self._coverage_source_retained_frame_chunks = []
+        self._coverage_transport_edge_frame_chunks = []
+        try:
+            retval = super().forward(inputs)
+            if not self._coverage_supported_frame_chunks:
+                raise RuntimeError(
+                    "canonical_coverage_eval collected no canonical branch masks."
+                )
+
+            supported_per_frame = torch.cat(
+                self._coverage_supported_frame_chunks, dim=0
+            )
+            valid_per_frame = torch.cat(
+                self._coverage_valid_frame_chunks, dim=0
+            )
+            source_valid_per_frame = torch.cat(
+                self._coverage_source_valid_frame_chunks, dim=0
+            )
+            source_candidate_per_frame = torch.cat(
+                self._coverage_source_candidate_frame_chunks, dim=0
+            )
+            source_retained_per_frame = torch.cat(
+                self._coverage_source_retained_frame_chunks, dim=0
+            )
+            transport_edges_per_frame = torch.cat(
+                self._coverage_transport_edge_frame_chunks, dim=0
+            )
+            seq_l = inputs[4] if isinstance(inputs, (list, tuple)) else None
+            lengths = self._coverage_sequence_lengths(
+                seq_l, supported_per_frame.numel(), supported_per_frame.device
+            )
+
+            supported_per_sequence = []
+            valid_per_sequence = []
+            source_valid_per_sequence = []
+            source_candidate_per_sequence = []
+            source_retained_per_sequence = []
+            transport_edges_per_sequence = []
+            cursor = 0
+            for length in lengths.tolist():
+                next_cursor = cursor + int(length)
+                supported_per_sequence.append(
+                    supported_per_frame[cursor:next_cursor].sum()
+                )
+                valid_per_sequence.append(
+                    valid_per_frame[cursor:next_cursor].sum()
+                )
+                source_valid_per_sequence.append(
+                    source_valid_per_frame[cursor:next_cursor].sum()
+                )
+                source_candidate_per_sequence.append(
+                    source_candidate_per_frame[cursor:next_cursor].sum()
+                )
+                source_retained_per_sequence.append(
+                    source_retained_per_frame[cursor:next_cursor].sum()
+                )
+                transport_edges_per_sequence.append(
+                    transport_edges_per_frame[cursor:next_cursor].sum()
+                )
+                cursor = next_cursor
+
+            inference_feat = retval["inference_feat"]
+            inference_feat["canonical_supported_cells"] = torch.stack(
+                supported_per_sequence
+            ).reshape(-1, 1)
+            inference_feat["canonical_valid_cells"] = torch.stack(
+                valid_per_sequence
+            ).reshape(-1, 1)
+            inference_feat["canonical_coverage"] = (
+                inference_feat["canonical_supported_cells"].float()
+                / inference_feat["canonical_valid_cells"].float().clamp_min(1.0)
+            )
+            inference_feat["source_valid_tokens"] = torch.stack(
+                source_valid_per_sequence
+            ).reshape(-1, 1)
+            inference_feat["source_candidate_tokens"] = torch.stack(
+                source_candidate_per_sequence
+            ).reshape(-1, 1)
+            inference_feat["source_retained_tokens"] = torch.stack(
+                source_retained_per_sequence
+            ).reshape(-1, 1)
+            inference_feat["transport_edges"] = torch.stack(
+                transport_edges_per_sequence
+            ).reshape(-1, 1)
+            inference_feat["source_token_utilization"] = (
+                inference_feat["source_retained_tokens"].float()
+                / inference_feat["source_valid_tokens"].float().clamp_min(1.0)
+            )
+            inference_feat["source_conditional_retention"] = (
+                inference_feat["source_retained_tokens"].float()
+                / inference_feat["source_candidate_tokens"].float().clamp_min(1.0)
+            )
+            inference_feat["sources_per_supported_target"] = (
+                inference_feat["transport_edges"].float()
+                / inference_feat["canonical_supported_cells"].float().clamp_min(1.0)
+            )
+            inference_feat["targets_per_retained_source"] = (
+                inference_feat["transport_edges"].float()
+                / inference_feat["source_retained_tokens"].float().clamp_min(1.0)
+            )
+            return retval
+        finally:
+            self._coverage_supported_frame_chunks = []
+            self._coverage_valid_frame_chunks = []
+            self._coverage_source_valid_frame_chunks = []
+            self._coverage_source_candidate_frame_chunks = []
+            self._coverage_source_retained_frame_chunks = []
+            self._coverage_transport_edge_frame_chunks = []
+
     def _log_gflops_if_training(self):
-        if not self.training:
+        if not self.training or getattr(self, "profile_enabled", False):
             return
 
         was_training = self.training
@@ -733,7 +1024,7 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_SparseTopK4_Gaitbase_Share
             )
             return human_feat, mask_src, src_depth_map
 
-        return super().warp_features_with_ot(
+        result = super().warp_features_with_ot(
             human_feat,
             mask_src,
             pred_verts,
@@ -751,3 +1042,42 @@ class BiggerGait__SAM3DBody__Projection_Mask_OT_Based_SparseTopK4_Gaitbase_Share
             yaw,
             apply_global_rot_alignment,
         )
+        if self.coverage_eval_enabled:
+            supported_mask = getattr(
+                self.ot_solver, "last_supported_target_mask", None
+            )
+            if supported_mask is None:
+                raise RuntimeError(
+                    "Sparse OT solver did not expose its supported-target mask."
+                )
+            valid_target_mask = result[1].reshape(supported_mask.shape)
+            valid_source_mask = getattr(
+                self.ot_solver, "last_valid_source_mask", None
+            )
+            candidate_source_mask = getattr(
+                self.ot_solver, "last_candidate_source_mask", None
+            )
+            retained_source_mask = getattr(
+                self.ot_solver, "last_retained_source_mask", None
+            )
+            transport_edge_count = getattr(
+                self.ot_solver, "last_transport_edge_count", None
+            )
+            if any(value is None for value in (
+                valid_source_mask,
+                candidate_source_mask,
+                retained_source_mask,
+                transport_edge_count,
+            )):
+                raise RuntimeError(
+                    "Sparse OT solver did not expose source-retention diagnostics."
+                )
+            self._record_canonical_coverage(
+                supported_mask,
+                valid_target_mask,
+                valid_source_mask,
+                candidate_source_mask,
+                retained_source_mask,
+                transport_edge_count,
+            )
+        return result
