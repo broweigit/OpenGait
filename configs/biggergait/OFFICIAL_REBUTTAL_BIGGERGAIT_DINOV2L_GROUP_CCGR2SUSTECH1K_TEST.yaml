@@ -1,0 +1,112 @@
+# Evaluate the CCGR-trained BiggerGait DINOv2-L Group model on SUSTech1K.
+# dataset_name remains the training domain so OpenGait restores the correct checkpoint.
+data_cfg:
+  dataset_name: CCGR-MINI
+  dataset_root: /data1/jdy/sustech1k/sustech1k-ratio-pkl
+  dataset_partition: ./datasets/SUSTech1K/SUSTech1K.json
+  data_in_use: [true, false]
+  num_workers: 8
+  remove_no_gallery: false
+  test_dataset_name: SUSTech1K
+
+evaluator_cfg:
+  enable_float16: true
+  restore_ckpt_strict: true
+  restore_hint: 20000
+  save_name: OFFICIAL_REBUTTAL_BIGGERGAIT_DINOV2L_GROUP_CCGR
+  eval_func: evaluate_indoor_dataset
+  sampler:
+    batch_shuffle: false
+    batch_size: 4
+    sample_type: all_ordered
+    frames_all_limit: 250
+    type: InferenceSampler
+  metric: euc
+  transform:
+    - type: BaseRgbTransform
+      cutting: 0
+
+loss_cfg:
+  - loss_term_weight: 1.0
+    margin: 0.2
+    type: TripletLoss
+    log_prefix: triplet
+  - loss_term_weight: 1.0
+    scale: 16
+    type: CrossEntropyLoss
+    log_prefix: softmax
+    log_accuracy: true
+
+model_cfg:
+  model: BiggerGait__DINOv2
+  chunk_size: 4
+  gradient_checkpointing: false
+  pretrained_lvm: pretrained_LVMs/dinov2-large
+  pretrained_mask_branch: pretrained_LVMs/MaskBranch_vitl14.pt
+  image_size: 224
+  sils_size: 32
+  source_dim: 1024
+  num_unknown: 16
+  total_layer_num: 24
+  group_layer_num: 2
+  head_num: 2
+  Mask_Branch:
+    source_dim: 1024
+    target_dim: 2
+    p: 0.0
+    softmax: true
+  backbone_cfg:
+    type: ResNet9
+    block: BasicBlock
+    in_channel: 16
+    channels: [64, 128, 256, 512]
+    layers: [1, 1, 1, 1]
+    strides: [1, 2, 1, 1]
+    maxpool: false
+  SeparateFCs:
+    in_channels: 512
+    out_channels: 256
+    parts_num: 32
+  SeparateBNNecks:
+    class_num: 571
+    in_channels: 256
+    parts_num: 32
+  bin_num: [32]
+
+optimizer_cfg:
+  lr: 0.1
+  momentum: 0.9
+  solver: SGD
+  weight_decay: 0.0005
+
+scheduler_cfg:
+  gamma: 0.1
+  milestones: [10000, 15000]
+  scheduler: MultiStepLR
+
+trainer_cfg:
+  find_unused_parameters: true
+  enable_float16: true
+  fix_BN: false
+  log_iter: 100
+  with_test: true
+  restore_ckpt_strict: true
+  restore_hint: 0
+  save_iter: 10000
+  save_name: OFFICIAL_REBUTTAL_BIGGERGAIT_DINOV2L_GROUP_CCGR
+  sync_BN: true
+  total_iter: 20000
+  sampler:
+    batch_shuffle: true
+    batch_size: [8, 4]
+    frames_num_fixed: 30
+    frames_skip_num: 4
+    frames_num_max: 40
+    frames_num_min: 20
+    sample_type: fixed_unordered
+    type: TripletSampler
+  transform:
+    - type: Compose
+      trf_cfg:
+        - type: RandomHorizontalFlip
+        - type: BaseRgbTransform
