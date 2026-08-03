@@ -134,6 +134,7 @@ class BaseModel(MetaModel, nn.Module):
         self.msg_mgr = get_msg_mgr()
         self.cfgs = cfgs
         self.iteration = 0
+        self.profile_only = bool(cfgs.get('model_cfg', {}).get('profile_only', False))
         self.engine_cfg = cfgs['trainer_cfg'] if training else cfgs['evaluator_cfg']
         if self.engine_cfg is None:
             raise Exception("Initialize a model without -Engine-Cfgs-")
@@ -148,6 +149,16 @@ class BaseModel(MetaModel, nn.Module):
         self.init_parameters()
         self.trainer_trfs = get_transform(cfgs['trainer_cfg']['transform'])
 
+        if self.profile_only:
+            # Profile mixins emit their log/JSON during init_parameters().
+            # Avoid any dataset, optimizer, checkpoint, or training-loop work.
+            self.device = torch.distributed.get_rank()
+            torch.cuda.set_device(self.device)
+            self.to(device=torch.device("cuda", self.device))
+            self.msg_mgr.log_info(
+                "[ProfileStats] profile_only complete; skipped data loaders."
+            )
+            return
         self.msg_mgr.log_info(cfgs['data_cfg'])
         if training:
             self.train_loader = self.get_loader(
@@ -378,6 +389,18 @@ class BaseModel(MetaModel, nn.Module):
         batch_size = self.test_loader.batch_sampler.batch_size
         rest_size = total_size
         info_dict = Odict()
+        rank0_only_accumulation = bool(
+            self.cfgs.get('evaluator_cfg', {}).get(
+                'rank0_only_accumulation', False
+            )
+        )
+        should_accumulate = not rank0_only_accumulation or rank == 0
+        if rank == 0 and rank0_only_accumulation:
+            self.msg_mgr.log_info(
+                'Rank-0-only inference accumulation enabled: all ranks still '
+                'participate in per-batch all_gather, but only rank 0 retains '
+                'the gathered embeddings.'
+            )
         for inputs in self.test_loader:
             ipts = self.inputs_pretreament(inputs)
             with autocast(enabled=self.engine_cfg['enable_float16']):
@@ -386,9 +409,12 @@ class BaseModel(MetaModel, nn.Module):
                 for k, v in inference_feat.items():
                     inference_feat[k] = ddp_all_gather(v, requires_grad=False)
                 del retval
-            for k, v in inference_feat.items():
-                inference_feat[k] = ts2np(v)
-            info_dict.append(inference_feat)
+            if should_accumulate:
+                for k, v in inference_feat.items():
+                    inference_feat[k] = ts2np(v)
+                info_dict.append(inference_feat)
+            else:
+                del inference_feat
             rest_size -= batch_size
             if rest_size >= 0:
                 update_size = batch_size

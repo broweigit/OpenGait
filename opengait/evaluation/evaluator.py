@@ -185,6 +185,164 @@ def _fixed_probe_view_sort_key(view):
         return (2, str(view))
 
 
+def _canonical_source_angle(raw_view, dataset):
+    normalized = _normalize_fixed_probe_view(raw_view, dataset)
+    if normalized == 'over':
+        return None
+    try:
+        return float(normalized)
+    except (TypeError, ValueError):
+        return None
+
+
+def evaluate_canonical_coverage(data, dataset, metric='euc',
+                                canonical_view=0.0,
+                                view_gap_thresholds=(36.0, 72.0)):
+    """Aggregate exact transported support by source-to-canonical view gap.
+
+    This is intentionally independent of probe/gallery retrieval. The model
+    exports integer supported/valid canonical-cell counts for every sequence;
+    this evaluator pools those counts within Small/Medium/Large source-view
+    bins and also reports each source angle separately.
+    """
+    del metric
+    msg_mgr = get_msg_mgr()
+    if 'canonical_supported_cells' not in data or 'canonical_valid_cells' not in data:
+        raise KeyError(
+            'Coverage evaluation requires canonical_supported_cells and '
+            'canonical_valid_cells in inference_feat.'
+        )
+    retention_keys = (
+        'source_valid_tokens',
+        'source_candidate_tokens',
+        'source_retained_tokens',
+        'transport_edges',
+    )
+    missing_keys = [key for key in retention_keys if key not in data]
+    if missing_keys:
+        raise KeyError(f'Information-retention evaluation is missing: {missing_keys}')
+
+    supported = np.asarray(data['canonical_supported_cells']).reshape(-1).astype(np.float64)
+    valid = np.asarray(data['canonical_valid_cells']).reshape(-1).astype(np.float64)
+    source_valid = np.asarray(data['source_valid_tokens']).reshape(-1).astype(np.float64)
+    source_candidate = np.asarray(
+        data['source_candidate_tokens']
+    ).reshape(-1).astype(np.float64)
+    source_retained = np.asarray(
+        data['source_retained_tokens']
+    ).reshape(-1).astype(np.float64)
+    transport_edges = np.asarray(data['transport_edges']).reshape(-1).astype(np.float64)
+    views = np.asarray(data['views'])
+    if not (
+        len(supported) == len(valid) == len(source_valid)
+        == len(source_candidate) == len(source_retained)
+        == len(transport_edges) == len(views)
+    ):
+        raise ValueError(
+            "Coverage, retention, and view arrays must contain the same number of sequences."
+        )
+
+    threshold_small, threshold_medium = [float(value) for value in view_gap_thresholds]
+    canonical_view = float(canonical_view)
+    source_angles = np.asarray([
+        _canonical_source_angle(view, dataset) for view in views
+    ], dtype=object)
+    usable = np.asarray([angle is not None for angle in source_angles], dtype=bool)
+    numeric_angles = np.zeros(len(source_angles), dtype=np.float64)
+    numeric_angles[usable] = np.asarray(source_angles[usable], dtype=np.float64)
+    raw_gap = np.abs(numeric_angles - canonical_view)
+    gaps = np.minimum(raw_gap, 360.0 - raw_gap)
+    usable &= valid > 0
+
+    bins = [
+        ('small', f'<= {threshold_small:g}', usable & (gaps <= threshold_small)),
+        ('medium', f'({threshold_small:g}, {threshold_medium:g}]',
+         usable & (gaps > threshold_small) & (gaps <= threshold_medium)),
+        ('large', f'> {threshold_medium:g}', usable & (gaps > threshold_medium)),
+    ]
+
+    result_dict = {}
+    msg_mgr.log_info('=' * 72)
+    msg_mgr.log_info('Canonical Support and Source-Token Retention')
+    msg_mgr.log_info(
+        'Definition: sum(supported canonical body cells) / '
+        'sum(valid canonical body cells).'
+    )
+    msg_mgr.log_info(
+        f'Dataset={dataset}; canonical view={canonical_view:g} deg; '
+        f'gap thresholds={list(map(float, view_gap_thresholds))}'
+    )
+    for bin_name, bin_desc, mask in bins:
+        sequence_count = int(mask.sum())
+        supported_total = float(supported[mask].sum())
+        valid_total = float(valid[mask].sum())
+        source_valid_total = float(source_valid[mask].sum())
+        source_candidate_total = float(source_candidate[mask].sum())
+        source_retained_total = float(source_retained[mask].sum())
+        edge_total = float(transport_edges[mask].sum())
+        coverage = 100.0 * supported_total / valid_total if valid_total > 0 else float('nan')
+        candidate_rate = (
+            100.0 * source_candidate_total / source_valid_total
+            if source_valid_total > 0 else float('nan')
+        )
+        utilization = (
+            100.0 * source_retained_total / source_valid_total
+            if source_valid_total > 0 else float('nan')
+        )
+        conditional_retention = (
+            100.0 * source_retained_total / source_candidate_total
+            if source_candidate_total > 0 else float('nan')
+        )
+        sources_per_target = edge_total / supported_total if supported_total > 0 else float('nan')
+        targets_per_source = (
+            edge_total / source_retained_total if source_retained_total > 0 else float('nan')
+        )
+        result_dict[f'scalar/canonical_coverage/{bin_name}'] = coverage
+        result_dict[f'scalar/canonical_coverage/{bin_name}_sequences'] = sequence_count
+        result_dict[f'scalar/source_candidate_rate/{bin_name}'] = candidate_rate
+        result_dict[f'scalar/source_token_utilization/{bin_name}'] = utilization
+        result_dict[f'scalar/source_conditional_retention/{bin_name}'] = conditional_retention
+        result_dict[f'scalar/sources_per_supported_target/{bin_name}'] = sources_per_target
+        result_dict[f'scalar/targets_per_retained_source/{bin_name}'] = targets_per_source
+        msg_mgr.log_info(
+            f'{bin_name.capitalize()} gap {bin_desc} deg: target_support={coverage:.4f}%, '
+            f'source_candidate={candidate_rate:.4f}%, source_utilization={utilization:.4f}%, '
+            f'conditional_retention={conditional_retention:.4f}%, '
+            f'sources/target={sources_per_target:.4f}, targets/source={targets_per_source:.4f}, '
+            f'sequences={sequence_count}'
+        )
+
+    msg_mgr.log_info('CSV-ready per-source-view coverage:')
+    msg_mgr.log_info('source_view,view_gap,target_support,source_candidate,source_utilization,conditional_retention,sources_per_target,targets_per_source,sequences')
+    for source_angle in sorted(np.unique(numeric_angles[usable])):
+        mask = usable & np.isclose(numeric_angles, source_angle)
+        supported_total = float(supported[mask].sum())
+        valid_total = float(valid[mask].sum())
+        source_valid_total = float(source_valid[mask].sum())
+        source_candidate_total = float(source_candidate[mask].sum())
+        source_retained_total = float(source_retained[mask].sum())
+        edge_total = float(transport_edges[mask].sum())
+        coverage = 100.0 * supported_total / valid_total
+        candidate_rate = 100.0 * source_candidate_total / max(source_valid_total, 1.0)
+        utilization = 100.0 * source_retained_total / max(source_valid_total, 1.0)
+        conditional_retention = 100.0 * source_retained_total / max(source_candidate_total, 1.0)
+        sources_per_target = edge_total / max(supported_total, 1.0)
+        targets_per_source = edge_total / max(source_retained_total, 1.0)
+        source_key = f'{source_angle:g}'.replace('.', 'p')
+        result_dict[f'scalar/canonical_coverage/view_{source_key}'] = coverage
+        result_dict[f'scalar/source_candidate_rate/view_{source_key}'] = candidate_rate
+        result_dict[f'scalar/source_token_utilization/view_{source_key}'] = utilization
+        result_dict[f'scalar/source_conditional_retention/view_{source_key}'] = conditional_retention
+        result_dict[f'scalar/sources_per_supported_target/view_{source_key}'] = sources_per_target
+        result_dict[f'scalar/targets_per_retained_source/view_{source_key}'] = targets_per_source
+        msg_mgr.log_info(
+            f'{source_angle:g},{np.abs(source_angle - canonical_view):g},'
+            f'{coverage:.4f},{candidate_rate:.4f},{utilization:.4f},'
+            f'{conditional_retention:.4f},{sources_per_target:.4f},{targets_per_source:.4f},{int(mask.sum())}'
+        )
+    return result_dict
+
+
 def evaluate_fixed_probe_view(data, dataset, metric='euc', probe_view=None,
                               probe_gallery_pairs=None,
                               view_gap_thresholds=(36.0, 72.0)):
@@ -2145,7 +2303,7 @@ def evaluate_robustness_variants(
     variants=None,
 ):
     """Backward-compatible entry point for A4 robustness evaluation."""
-    return evaluate_embedding_variants(
+    results = evaluate_embedding_variants(
         data=data,
         dataset=dataset,
         metric=metric,
@@ -2154,6 +2312,94 @@ def evaluate_robustness_variants(
         result_group='robustness',
         include_mesh_diagnostics=True,
     )
+    msg_mgr = get_msg_mgr()
+    parameter_units = {'shape': 'MHR-coefficient'}
+    parameter_summary = {}
+    for name, unit in parameter_units.items():
+        key = f'body_param_rms_{name}'
+        if key not in data:
+            continue
+        value = float(np.asarray(data[key]).mean())
+        parameter_summary[f'scalar/body_parameter_scale/{name}_RMS'] = value
+        msg_mgr.log_info(f'Clean recovered {name} RMS: {value:.6f} {unit}')
+    if parameter_summary:
+        msg_mgr.log_info(
+            'body_parameter_scale summary: ' + str(parameter_summary)
+        )
+        results.update(parameter_summary)
+    return results
+
+
+def evaluate_strong_hmr_robustness(
+    data,
+    dataset,
+    metric='euc',
+    base_eval_func='evaluate_CCGR_MINI',
+    variants=None,
+):
+    """Evaluate cached strong-HMR variants and reference deviations."""
+    msg_mgr = get_msg_mgr()
+    if variants is None:
+        variants = [
+            'clean',
+            'joint_max_15deg',
+            'joint_max_30deg',
+            'joint_max_45deg',
+            'shape_std_0p5',
+            'shape_std_1',
+            'projection_scale_0p75',
+            'projection_scale_1p25',
+            'global_orientation_max_15deg',
+            'global_orientation_max_30deg',
+            'global_orientation_max_45deg',
+        ]
+    base_evaluator = globals().get(base_eval_func)
+    if base_evaluator is None or not callable(base_evaluator):
+        raise ValueError(f'Unknown strong-HMR base evaluator: {base_eval_func}')
+    if base_evaluator is evaluate_strong_hmr_robustness:
+        raise ValueError('base_eval_func cannot recursively evaluate variants.')
+
+    diagnostics = (
+        ('projected_support_iou', 'ProjectedSupportIoU', 100.0, '%'),
+        ('vertex_reprojection_error', 'VertexReprojectionError', 100.0, '% bbox height'),
+        ('pelvis_aligned_pve', 'PelvisAlignedPVE', 100.0, '% body height'),
+        ('projected_bbox_scale_ratio', 'ProjectedBBoxScaleRatio', 1.0, 'x'),
+    )
+    combined = {}
+    for variant in variants:
+        embedding_key = 'embeddings' if variant == 'clean' else f'embeddings_{variant}'
+        if embedding_key not in data:
+            raise KeyError(
+                f'Missing {embedding_key!r}; available keys: {sorted(data.keys())}'
+            )
+        variant_data = data.copy()
+        variant_data['embeddings'] = data[embedding_key]
+        msg_mgr.log_info('\n' + '=' * 72)
+        msg_mgr.log_info(
+            f'>>> strong_hmr variant: {variant} ({embedding_key}); '
+            'clean HMR is the reference geometry'
+        )
+        msg_mgr.log_info('=' * 72)
+        variant_results = base_evaluator(variant_data, dataset, metric=metric)
+        if variant_results:
+            for key, value in variant_results.items():
+                scalar_name = key.rsplit('/', 1)[-1]
+                combined[f'scalar/strong_hmr/{variant}/{scalar_name}'] = value
+
+        for prefix, display_name, multiplier, unit in diagnostics:
+            diagnostic_key = f'{prefix}_{variant}'
+            if diagnostic_key not in data:
+                raise KeyError(
+                    f'Missing {diagnostic_key!r}; available keys: {sorted(data.keys())}'
+                )
+            value = float(np.asarray(data[diagnostic_key]).mean() * multiplier)
+            combined[f'scalar/strong_hmr/{variant}/{display_name}'] = value
+            msg_mgr.log_info(f'{display_name}: {value:.4f} {unit}')
+
+    msg_mgr.log_info('\n' + '=' * 72)
+    msg_mgr.log_info('strong_hmr summary (single LVM/HMR traversal)')
+    msg_mgr.log_info(combined)
+    return combined
 
 
 def evaluate_CCGR_MINI_part_based(data, dataset, metric='euc'):
