@@ -240,6 +240,89 @@ class DataSet(tordata.Dataset):
             strategy = str(subset_cfg.get(
                 'strategy', 'ccgr_gallery_view')).lower()
 
+            if strategy == 'casiab_view_balanced':
+                seed = int(subset_cfg.get('seed', 7890))
+                num_pids = int(subset_cfg.get('num_pids', 8))
+                sequence_types = [str(value) for value in subset_cfg.get(
+                    'sequence_types', ['nm-05'])]
+                requested_views = [str(value) for value in subset_cfg.get(
+                    'views',
+                    ['000', '018', '036', '054', '072', '090',
+                     '108', '126', '144', '162', '180'])]
+                if num_pids <= 0 or not sequence_types or not requested_views:
+                    raise ValueError(
+                        'CASIA-B eval_subset requires positive num_pids and '
+                        'non-empty sequence_types/views.')
+
+                def normalize_casiab_view(raw_view):
+                    try:
+                        return '{:03d}'.format(int(float(str(raw_view))))
+                    except (TypeError, ValueError):
+                        return str(raw_view)
+
+                def sequence_key(seq_info):
+                    return '-'.join(seq_info[:3])
+
+                per_pid = {}
+                for seq_info in seqs_info_list:
+                    pid, seq_type, raw_view = seq_info[:3]
+                    if seq_type not in sequence_types:
+                        continue
+                    view = normalize_casiab_view(raw_view)
+                    if view not in requested_views:
+                        continue
+                    per_pid.setdefault(pid, {}).setdefault(
+                        seq_type, {}).setdefault(view, []).append(seq_info)
+
+                eligible_pids = []
+                for pid, type_map in per_pid.items():
+                    complete = all(
+                        seq_type in type_map
+                        and all(view in type_map[seq_type]
+                                for view in requested_views)
+                        for seq_type in sequence_types
+                    )
+                    if complete:
+                        eligible_pids.append(pid)
+                eligible_pids = sorted(eligible_pids)
+                if len(eligible_pids) < num_pids:
+                    raise ValueError(
+                        'CASIA-B eval_subset requested {} identities, but only '
+                        '{} contain every requested type/view.'.format(
+                            num_pids, len(eligible_pids)))
+
+                pid_rng = random.Random(seed)
+                pid_rng.shuffle(eligible_pids)
+                selected_pids = sorted(eligible_pids[:num_pids])
+                selected_keys = set()
+                for pid in selected_pids:
+                    for seq_type in sequence_types:
+                        for view in requested_views:
+                            candidates = sorted(
+                                per_pid[pid][seq_type][view],
+                                key=sequence_key)
+                            selected_keys.add(sequence_key(candidates[0]))
+
+                subset = [
+                    seq for seq in seqs_info_list
+                    if sequence_key(seq) in selected_keys]
+                expected_size = (
+                    num_pids * len(sequence_types) * len(requested_views)
+                )
+                if len(subset) != expected_size:
+                    raise RuntimeError(
+                        'CASIA-B view-balanced subset produced {} sequences; '
+                        'expected {}.'.format(len(subset), expected_size))
+                msg_mgr.log_info(
+                    '-------- CASIA-B View-Balanced Eval Subset --------')
+                msg_mgr.log_info(
+                    'Selected {} identities x {} types x {} views = {} '
+                    'sequences with seed {}.'.format(
+                        num_pids, len(sequence_types),
+                        len(requested_views), len(subset), seed))
+                log_pid_list(selected_pids)
+                return subset
+
             if strategy == 'ccpg_protocol_balanced':
                 seed = int(subset_cfg.get('seed', 7890))
                 num_pids = int(subset_cfg.get('num_pids', 99))
@@ -477,10 +560,13 @@ class DataSet(tordata.Dataset):
                 'probe_views',
                 ['0', '22_5', '45', '67_5', '90',
                  '112_5', '135', '157_5', '180', 'over'])]
+            allow_multiple_probes_per_view = bool(subset_cfg.get(
+                'allow_multiple_probes_per_view', False))
             if num_pids <= 0 or probes_per_pid <= 0 or gallery_per_pid <= 0:
                 raise ValueError(
                     'eval_subset counts must all be positive integers.')
-            if len(probe_views) < probes_per_pid:
+            if (not allow_multiple_probes_per_view
+                    and len(probe_views) < probes_per_pid):
                 raise ValueError(
                     'eval_subset.probe_views must contain at least as many '
                     'views as probes_per_pid.')
@@ -511,11 +597,17 @@ class DataSet(tordata.Dataset):
                     normalized_probe_view(seq[2])
                     for seq in pid_seqs
                     if sequence_key(seq) not in pid_gallery_keys}
+                available_probe_count = sum(
+                    normalized_probe_view(seq[2]) is not None
+                    for seq in pid_seqs
+                    if sequence_key(seq) not in pid_gallery_keys)
                 has_all_probe_views = all(
                     view in available_probe_views for view in probe_views)
                 if (len(pid_seqs) >= min_sequences_per_pid
                         and len(pid_gallery) >= gallery_per_pid
-                        and has_all_probe_views):
+                        and has_all_probe_views
+                        and (not allow_multiple_probes_per_view
+                             or available_probe_count >= probes_per_pid)):
                     eligible_pids.append(pid)
             eligible_pids = sorted(eligible_pids)
             if len(eligible_pids) < num_pids:
@@ -530,9 +622,10 @@ class DataSet(tordata.Dataset):
             selected_keys = set()
             selected_probe_view_counts = {view: 0 for view in probe_views}
 
-            # Rotate the five requested views across identities. With 150
-            # identities and ten CCGR views, every view contributes exactly
-            # 75 probes when all complete identities contain all ten views.
+            # Rotate requested views across identities for global view balance.
+            # The legacy path selects at most one probe from each view.  The
+            # opt-in repeated-view path supports larger subsets while still
+            # selecting distinct sequences and retaining every requested view.
             view_stride = max(1, len(probe_views) // probes_per_pid)
             for pid_index, pid in enumerate(selected_pids):
                 pid_seqs = per_pid[pid]
@@ -552,27 +645,58 @@ class DataSet(tordata.Dataset):
                     if view is not None:
                         probe_by_view[view].append(seq)
 
-                target_views = [
-                    probe_views[(pid_index + offset * view_stride)
-                                % len(probe_views)]
-                    for offset in range(probes_per_pid)]
-                if len(set(target_views)) != probes_per_pid:
-                    raise ValueError(
-                        'eval_subset view rotation produced duplicate views; '
-                        'adjust probe_views or probes_per_pid.')
-                for view in target_views:
-                    candidates = sorted(
-                        probe_by_view.get(view, []), key=sequence_key)
-                    if not candidates:
+                if allow_multiple_probes_per_view:
+                    # Shuffle candidates deterministically within each view,
+                    # then consume them in a rotating round-robin order.  If a
+                    # view is exhausted, move to the next available view.
+                    for view, candidates in probe_by_view.items():
+                        candidates.sort(key=sequence_key)
+                        random.Random('{}:{}:{}'.format(
+                            seed, pid, view)).shuffle(candidates)
+                    view_cursors = {view: 0 for view in probe_views}
+                    chosen_probe_count = 0
+                    while chosen_probe_count < probes_per_pid:
+                        preferred = (pid_index + chosen_probe_count) % len(probe_views)
+                        chosen_view = None
+                        for view_offset in range(len(probe_views)):
+                            view = probe_views[
+                                (preferred + view_offset) % len(probe_views)]
+                            if view_cursors[view] < len(probe_by_view[view]):
+                                chosen_view = view
+                                break
+                        if chosen_view is None:
+                            raise ValueError(
+                                'Identity {} has only {} usable non-gallery '
+                                'probes; requested {}.'.format(
+                                    pid, chosen_probe_count, probes_per_pid))
+                        cursor = view_cursors[chosen_view]
+                        chosen_probe = probe_by_view[chosen_view][cursor]
+                        view_cursors[chosen_view] += 1
+                        selected_keys.add(sequence_key(chosen_probe))
+                        selected_probe_view_counts[chosen_view] += 1
+                        chosen_probe_count += 1
+                else:
+                    target_views = [
+                        probe_views[(pid_index + offset * view_stride)
+                                    % len(probe_views)]
+                        for offset in range(probes_per_pid)]
+                    if len(set(target_views)) != probes_per_pid:
                         raise ValueError(
-                            'Identity {} has no non-gallery probe for requested '
-                            'view {}.'.format(pid, view))
-                    choice_rng = random.Random('{}:{}:{}'.format(
-                        seed, pid, view))
-                    chosen_probe = candidates[
-                        choice_rng.randrange(len(candidates))]
-                    selected_keys.add(sequence_key(chosen_probe))
-                    selected_probe_view_counts[view] += 1
+                            'eval_subset view rotation produced duplicate views; '
+                            'adjust probe_views or probes_per_pid.')
+                    for view in target_views:
+                        candidates = sorted(
+                            probe_by_view.get(view, []), key=sequence_key)
+                        if not candidates:
+                            raise ValueError(
+                                'Identity {} has no non-gallery probe for requested '
+                                'view {}.'.format(pid, view))
+                        choice_rng = random.Random('{}:{}:{}'.format(
+                            seed, pid, view))
+                        chosen_probe = candidates[
+                            choice_rng.randrange(len(candidates))]
+                        selected_keys.add(sequence_key(chosen_probe))
+                        selected_probe_view_counts[view] += 1
 
             subset = [
                 seq for seq in seqs_info_list

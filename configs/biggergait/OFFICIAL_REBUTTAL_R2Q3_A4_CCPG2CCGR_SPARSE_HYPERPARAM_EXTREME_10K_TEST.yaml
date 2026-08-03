@@ -1,0 +1,185 @@
+# Extreme Sparse-OT sensitivity: CCPG-trained A4 -> CCGR-MINI.
+# 346 complete identities x (2 gallery + 27 probes) = 10,034 sequences.
+# The cached model runs LVM/HMR/reduction/original branch and clean canonical
+# geometry once, then repeats only OT plus the canonical gait branch.
+data_cfg:
+  dataset_name: CCPG
+  dataset_root: /data1/CCGR/CCGR_MINI_RGB_CUT/CCGR-MINI-RGB-V1/
+  dataset_partition: ./datasets/CCGR-MINI/CCGR-MINI.json
+  data_in_use: [true]
+  num_workers: 8
+  remove_no_gallery: false
+  test_dataset_name: CCGR-MINI
+  eval_subset:
+    enabled: true
+    strategy: ccgr_gallery_view
+    seed: 7890
+    num_pids: 346
+    min_sequences_per_pid: 48
+    gallery_per_pid: 2
+    probes_per_pid: 27
+    allow_multiple_probes_per_view: true
+    probe_views: ["0", "22_5", "45", "67_5", "90", "112_5", "135", "157_5", "180", "over"]
+
+evaluator_cfg:
+  enable_float16: true
+  skip_ddp: true
+  restore_ckpt_strict: true
+  restore_hint: output/CCPG/BiggerGait__SAM3DBody__Projection_Mask_OT_Based_SparseTopK4_Gaitbase_Share/OFFICIAL_REBUTTAL_T2A4_T2B2_T2C3_T2D4_MAIN_CCPG/checkpoints/OFFICIAL_REBUTTAL_T2A4_T2B2_T2C3_T2D4_MAIN_CCPG-20000.pt
+  save_name: OFFICIAL_REBUTTAL_R2Q3_A4_CCPG2CCGR_SPARSE_HYPERPARAM_EXTREME_10K
+  eval_func: evaluate_embedding_variants
+  base_eval_func: evaluate_CCGR_MINI
+  result_group: sparse_sensitivity_extreme_10k
+  include_mesh_diagnostics: false
+  # "current" is the submitted default: top-k=4, distance=0.2,
+  # effective sparse normalization iterations=4, temperature=0.01.
+  variants:
+    - current
+    - topk_1
+    - topk_2
+    - topk_8
+    - distance_0p02
+    - distance_inf
+    - iterations_1
+    - iterations_2
+    - iterations_8
+    - temperature_0p001
+    - temperature_0p1
+  sampler:
+    batch_shuffle: false
+    batch_size: 8
+    sample_type: all_ordered
+    frames_all_limit: 250
+    type: InferenceSampler
+  metric: euc
+  transform:
+    - type: BaseRgbTransform
+
+loss_cfg:
+  - loss_term_weight: 1.0
+    margin: 0.2
+    type: TripletLoss
+    log_prefix: triplet
+  - loss_term_weight: 1.0
+    scale: 16
+    type: CrossEntropyLoss
+    log_prefix: softmax
+    log_accuracy: true
+
+model_cfg:
+  model: BiggerGait__SAM3DBody__Projection_Mask_OT_Based_SparseTopK4_CachedSparseSensitivity_Gaitbase_Share
+  # Large chunks amortize the one-off frozen LVM/HMR pass. OT uses its own
+  # smaller frame chunks because its token-distance matrix is quadratic.
+  chunk_size: 64
+  pretrained_lvm: pretrained_LVMs/sam-3d-body
+  pretrained_mask_branch: BYPASS
+  image_size: 256
+  sils_size: 32
+  source_dim: 1280
+  num_FPN: 4
+  debug_pca_vis: false
+  cached_sparse_sensitivity_eval:
+    enabled: true
+    variant_microbatch_size: 11
+    canonical_frame_chunk_size: 8
+    topk_values: [1, 2, 4, 8]
+    # .inf removes the hard radius entirely; foreground/target masks and
+    # target-wise Top-k remain active.
+    distance_values: [0.02, 0.2, .inf]
+    # In submitted SparseTopK, top-k is applied before normalization and only
+    # ot_sparse_rebalance_iters is effective. These are effective iteration
+    # counts, not a fictitious pre/post pair.
+    iteration_values: [1, 2, 4, 8]
+    temperature_values: [0.001, 0.01, 0.1]
+    variants:
+      - current
+      - topk_1
+      - topk_2
+      - topk_8
+      - distance_0p02
+      - distance_inf
+      - iterations_1
+      - iterations_2
+      - iterations_8
+      - temperature_0p001
+      - temperature_0p1
+  layer_config:
+    hook_mask:
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - false
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+      - true
+    hook_sample_type: chunk
+  num_unknown: 16
+  ot_temperature: 0.01
+  ot_dist_thresh: 0.2
+  ot_iters: 8
+  ot_topk_support: 4
+  ot_sparse_rebalance_iters: 4
+  branch_configs:
+    - use_apose: false
+      yaw: original
+    - use_apose: true
+      yaw: 0.0
+  Mask_Branch:
+    source_dim: 1280
+    target_dim: 2
+    p: 0.0
+    softmax: true
+    Relu: false
+    Up: true
+  backbone_cfg:
+    type: ResNet9
+    block: BasicBlock_Time
+    in_channel: 16
+    channels: [64, 128, 256, 512]
+    layers: [1, 1, 1, 1]
+    strides: [1, 2, 1, 1]
+    maxpool: false
+  SeparateFCs:
+    in_channels: 512
+    out_channels: 256
+    parts_num: 32
+  SeparateBNNecks:
+    class_num: 100
+    in_channels: 256
+    parts_num: 32
+  bin_num: [32]
+
+optimizer_cfg:
+  lr: 0.1
+  momentum: 0.9
+  solver: SGD
+  weight_decay: 0.0005
+
+scheduler_cfg:
+  gamma: 0.1
+  milestones: [10000, 20000]
