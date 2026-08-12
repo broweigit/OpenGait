@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import math
 import os
 import os.path as osp
 import pickle
@@ -77,6 +78,8 @@ def maybe_launch_distributed(args: argparse.Namespace) -> bool:
         str(nproc),
     ]
 
+    if args.save_canonical_apose:
+        cmd.append("--save-canonical-apose")
     if args.overwrite:
         cmd.append("--overwrite")
     if args.limit is not None:
@@ -389,6 +392,11 @@ def iter_ccgr_mini_sequences(dataset_root: Path) -> Iterable[SequenceRecord]:
                 yield SequenceRecord(pid=pid, seq_type=seq_type, view=view, seq_dir=seq_dir, rgb_path=rgb_candidates[0])
 
 
+def iter_ccgr3d_sequences(dataset_root: Path) -> Iterable[SequenceRecord]:
+    """Iterate the released CCGR-3D RGB pickle hierarchy."""
+    return iter_rgb_pickle_sequences(dataset_root, "*-rgbs.pkl")
+
+
 def detach_to_cpu(obj: Any) -> Any:
     if torch.is_tensor(obj):
         return obj.detach().cpu()
@@ -462,6 +470,7 @@ class SAM3DDecoderPreprocessor:
         vertices_dtype: np.dtype = np.float16,
         cam_t_dtype: np.dtype = np.float32,
         cam_int_dtype: np.dtype = np.float32,
+        save_canonical_apose: bool = False,
     ):
         self.pretrained_lvm_root = Path(pretrained_lvm_root)
         self.device = torch.device(device)
@@ -479,6 +488,7 @@ class SAM3DDecoderPreprocessor:
         self.vertices_dtype = np.dtype(vertices_dtype)
         self.cam_t_dtype = np.dtype(cam_t_dtype)
         self.cam_int_dtype = np.dtype(cam_int_dtype)
+        self.save_canonical_apose = bool(save_canonical_apose)
 
         if str(self.pretrained_lvm_root) not in sys.path:
             sys.path.insert(0, str(self.pretrained_lvm_root))
@@ -576,6 +586,45 @@ class SAM3DDecoderPreprocessor:
         sam_emb = sam_emb.transpose(1, 2).reshape(frames_tensor.shape[0], -1, self.h_feat, self.w_feat).contiguous()
         return sam_emb
 
+    def _generate_canonical_apose(self, pose_out: Dict[str, torch.Tensor]):
+        """Generate the same A-pose geometry used by the PuppetGait teacher."""
+        batch_size = pose_out["pred_vertices"].shape[0]
+        device = pose_out["pred_vertices"].device
+        apose_body = torch.zeros_like(pose_out["body_pose"], dtype=torch.float32)
+        angle_rad = math.radians(-20.0)
+        apose_body[:, 25] = angle_rad
+        apose_body[:, 35] = angle_rad
+        outputs = self.model.head_pose.mhr_forward(
+            global_trans=torch.zeros((batch_size, 3), device=device),
+            global_rot=torch.zeros_like(pose_out["global_rot"], dtype=torch.float32),
+            body_pose_params=apose_body,
+            hand_pose_params=torch.zeros_like(pose_out["hand"], dtype=torch.float32),
+            scale_params=pose_out["scale"].float(),
+            shape_params=pose_out["shape"].float(),
+            expr_params=pose_out["face"].float(),
+            return_keypoints=True,
+        )
+        vertices = outputs[0]
+        keypoints = outputs[1][:, :70]
+        vertices[..., [1, 2]] *= -1
+        keypoints[..., [1, 2]] *= -1
+        return vertices, keypoints
+
+    @staticmethod
+    def _projected_mask(vertices, cam_t, cam_int, height=32, width=16, image_h=512, image_w=256):
+        """Rasterize visible mesh support at the DINO patch-grid resolution."""
+        vertices_cam = vertices + cam_t.unsqueeze(1)
+        x, y, z = vertices_cam.unbind(-1)
+        z_safe = z.clamp(min=1e-3)
+        u = (x / z_safe) * cam_int[:, 0, 0].unsqueeze(1) + cam_int[:, 0, 2].unsqueeze(1)
+        v = (y / z_safe) * cam_int[:, 1, 1].unsqueeze(1) + cam_int[:, 1, 2].unsqueeze(1)
+        u = (u / image_w * width).long().clamp(0, width - 1)
+        v = (v / image_h * height).long().clamp(0, height - 1)
+        pixel = v * width + u
+        depth = torch.full((vertices.shape[0], height * width), 1e6, device=vertices.device)
+        depth.scatter_reduce_(1, pixel, z, reduce="amin", include_self=False)
+        return (depth < 1e5).reshape(vertices.shape[0], height, width).to(torch.uint8)
+
     def process_sequence(self, rgb_sequence: np.ndarray, chunk_size: int, debug_prefix: Optional[str] = None) -> List[Dict[str, Any]]:
         outputs: List[Dict[str, Any]] = []
         total_frames = rgb_sequence.shape[0]
@@ -610,6 +659,14 @@ class SAM3DDecoderPreprocessor:
                     )
 
                 final_pose_out = pose_outs[-1] if isinstance(pose_outs, (list, tuple)) else pose_outs
+                projected_mask = self._projected_mask(
+                    final_pose_out["pred_vertices"],
+                    final_pose_out["pred_cam_t"],
+                    dummy_batch["cam_int"],
+                )
+                canonical_vertices = canonical_keypoints = None
+                if self.save_canonical_apose:
+                    canonical_vertices, canonical_keypoints = self._generate_canonical_apose(final_pose_out)
                 if self.debug_vis and vis_chunk is not None and self.debug_vis_dir is not None:
                     pred_verts = final_pose_out["pred_vertices"]
                     pred_cam_t = final_pose_out["pred_cam_t"]
@@ -669,7 +726,15 @@ class SAM3DDecoderPreprocessor:
                             "pred_cam_t": pose_out["pred_cam_t"],
                             "cam_int": cam_int,
                             "pose_outs": pose_out,
+                            "projected_mask": projected_mask[batch_idx].cpu().numpy(),
                         }
+                        if canonical_vertices is not None:
+                            frame_dict["pose_outs"]["canonical_vertices"] = to_numpy_contiguous(
+                                canonical_vertices[batch_idx], self.vertices_dtype
+                            )
+                            frame_dict["pose_outs"]["canonical_keypoints"] = to_numpy_contiguous(
+                                canonical_keypoints[batch_idx], self.vertices_dtype
+                            )
                         outputs.append(frame_dict)
 
         if len(outputs) != total_frames:
@@ -684,7 +749,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dataset-type",
         required=True,
-        choices=["ccpg", "ccgr_mini", "casiab", "sustech1k"],
+        choices=["ccpg", "ccgr_mini", "ccgr3d", "casiab", "sustech1k"],
     )
     parser.add_argument("--input-root", required=True, help="Source RGB dataset root.")
     parser.add_argument("--output-root", required=True, help="Output dataset root.")
@@ -704,6 +769,11 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--debug-point-size", type=float, default=8.0)
     parser.add_argument("--gpus", type=int, default=8, help="Number of GPUs to use for single-node distributed preprocessing.")
     parser.add_argument("--master-port", type=int, default=29600, help="Master port for auto-launched distributed preprocessing.")
+    parser.add_argument(
+        "--save-canonical-apose",
+        action="store_true",
+        help="Cache canonical A-pose vertices/keypoints so teacher training does not load the SAM3D engine.",
+    )
     return parser
 
 
@@ -725,6 +795,8 @@ def main() -> None:
         records = list(iter_ccpg_sequences(input_root))
     elif args.dataset_type == "ccgr_mini":
         records = list(iter_ccgr_mini_sequences(input_root))
+    elif args.dataset_type == "ccgr3d":
+        records = list(iter_ccgr3d_sequences(input_root))
     elif args.dataset_type == "casiab":
         records = list(iter_casiab_sequences(input_root))
     else:
@@ -773,6 +845,7 @@ def main() -> None:
         vertices_dtype=np.dtype(args.vertices_dtype),
         cam_t_dtype=np.dtype(args.cam_t_dtype),
         cam_int_dtype=np.dtype(args.cam_int_dtype),
+        save_canonical_apose=args.save_canonical_apose,
     )
 
     try:
@@ -782,7 +855,8 @@ def main() -> None:
             ensure_dir(out_seq_dir)
 
             sam_out_path = out_seq_dir / "01-sam3d-body_decoder.pkl"
-            need_sam = args.overwrite or not sam_out_path.exists()
+            mask_out_path = out_seq_dir / "02-sam3d-projected-mask.pkl"
+            need_sam = args.overwrite or not sam_out_path.exists() or not mask_out_path.exists()
 
             if args.dataset_type != "ccgr_mini":
                 rgb_out_path = out_seq_dir / "00-rgb.pkl"
@@ -799,6 +873,10 @@ def main() -> None:
                     debug_prefix = f"{record.pid}_{record.seq_type}_{record.view}"
                     sam_sequence = processor.process_sequence(rgb_seq, chunk_size=args.chunk_size, debug_prefix=debug_prefix)
                     save_pickle(sam_out_path, sam_sequence)
+                    save_pickle(
+                        mask_out_path,
+                        np.stack([frame["projected_mask"] for frame in sam_sequence], axis=0).astype(np.uint8),
+                    )
             else:
                 rgb_out_path = out_seq_dir / "00-rgb.avi"
                 legacy_rgb_pkl_path = out_seq_dir / "00-rgb.pkl"
@@ -817,6 +895,10 @@ def main() -> None:
                     debug_prefix = f"{record.pid}_{record.seq_type}_{record.view}"
                     sam_sequence = processor.process_sequence(rgb_seq, chunk_size=args.chunk_size, debug_prefix=debug_prefix)
                     save_pickle(sam_out_path, sam_sequence)
+                    save_pickle(
+                        mask_out_path,
+                        np.stack([frame["projected_mask"] for frame in sam_sequence], axis=0).astype(np.uint8),
+                    )
 
     finally:
         processor.close()

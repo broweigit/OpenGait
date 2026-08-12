@@ -1,0 +1,14 @@
+{
+  "identities": 201,
+  "train_identities": 115,
+  "test_identities": 86,
+  "sequences": 9849,
+  "view_counts": {
+    "0_75": 1889,
+    "120_25": 1990,
+    "150_60": 1990,
+    "270_40": 1990,
+    "90_0": 1990
+  },
+  "complete_five_view_groups": 1889
+}

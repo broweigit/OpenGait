@@ -2222,6 +2222,91 @@ def evaluate_CCGR_MINI(data, dataset, metric='euc'):
     return results
 
 
+def evaluate_CCGR3D(data, dataset, metric='euc', gallery_condition='NM1'):
+    """CCGR-3D 2D-gallery protocol plus a strict cross-view diagnostic.
+
+    Following the paper, all NM1 sequences form the gallery and every other
+    condition is a probe.  The strict result removes same-view gallery samples
+    separately for each probe sequence.
+    """
+    msg_mgr = get_msg_mgr()
+    features = data['embeddings']
+    labels = np.asarray(data['labels'])
+    conditions = np.asarray(data['types'])
+    views = np.asarray(data['views'])
+    gallery_mask = conditions == gallery_condition
+    probe_mask = ~gallery_mask
+    if not gallery_mask.any() or not probe_mask.any():
+        raise ValueError(
+            f"CCGR-3D requires {gallery_condition} gallery and non-gallery probes; "
+            f"got conditions {sorted(np.unique(conditions))}."
+        )
+
+    probe_x, probe_y, probe_v = features[probe_mask], labels[probe_mask], views[probe_mask]
+    gallery_x, gallery_y, gallery_v = features[gallery_mask], labels[gallery_mask], views[gallery_mask]
+    dist = cuda_dist(probe_x, gallery_x, metric).cpu().numpy()
+    cmc, all_ap, all_inp = evaluate_rank(dist, probe_y, gallery_y)
+    results = {
+        'scalar/test_accuracy/Rank-1': cmc[0] * 100,
+        'scalar/test_accuracy/Rank-5': cmc[4] * 100,
+        'scalar/test_accuracy/mAP': np.mean(all_ap) * 100,
+        'scalar/test_accuracy/mINP': np.mean(all_inp) * 100,
+    }
+
+    strict_correct = []
+    per_view = {}
+    for probe_index, (feature, label, view) in enumerate(zip(probe_x, probe_y, probe_v)):
+        valid = gallery_v != view
+        if not valid.any():
+            continue
+        nearest = np.argmin(dist[probe_index, valid])
+        strict_correct.append(gallery_y[valid][nearest] == label)
+    results['scalar/test_accuracy/StrictCrossView-Rank-1'] = np.mean(strict_correct) * 100
+
+    for view in sorted(np.unique(probe_v)):
+        rows = probe_v == view
+        if not rows.any():
+            continue
+        correct = []
+        row_indices = np.flatnonzero(rows)
+        for row in row_indices:
+            valid = gallery_v != view
+            if valid.any():
+                nearest = np.argmin(dist[row, valid])
+                correct.append(gallery_y[valid][nearest] == probe_y[row])
+        if correct:
+            per_view[str(view)] = float(np.mean(correct) * 100)
+            results[f'scalar/test_accuracy/StrictCrossView/{view}'] = per_view[str(view)]
+    msg_mgr.log_info(f"CCGR-3D gallery={gallery_condition}; strict cross-view per probe view: {per_view}")
+    msg_mgr.log_info(results)
+    return results
+
+
+def cache_CCGR3D_features(data, dataset, metric='euc', cache_path='ccgr3d_features.npz'):
+    """Persist sequence-level embeddings with unambiguous sequence metadata."""
+    del metric
+    cache_path = os.path.abspath(os.path.expanduser(cache_path))
+    mkdir(os.path.dirname(cache_path))
+    arrays = {
+        key: value for key, value in data.items()
+        if key.startswith('embeddings')
+    }
+    arrays.update({
+        'labels': np.asarray(data['labels']),
+        'conditions': np.asarray(data['types']),
+        'views': np.asarray(data['views']),
+    })
+    # Sequence embeddings are floating-point and compress poorly.  Uncompressed
+    # NPZ keeps the one-time export and every later adapter epoch substantially faster.
+    np.savez(cache_path, **arrays)
+    result = {'scalar/cache/sequences': float(len(arrays['labels']))}
+    get_msg_mgr().log_info(
+        f"Cached {len(arrays['labels'])} {dataset} sequence features to {cache_path}; "
+        f"keys={sorted(arrays)}"
+    )
+    return result
+
+
 def evaluate_embedding_variants(
     data,
     dataset,
